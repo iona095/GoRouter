@@ -39,7 +39,7 @@ export const log = new Logger(
 // must still avoid placing secrets in these strings in the first place.
 // ---------------------------------------------------------------------------
 
-const SECRET_SCAN = /\b(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._~+/-]{12,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,})\b/g;
+const SECRET_SCAN = /\b(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._~+/-]{12,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,}|[A-Za-z0-9_-]{40,})\b/g;
 
 /** Replace credential-shaped fragments with a fixed marker. */
 export function redact(text: string): string {

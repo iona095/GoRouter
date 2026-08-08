@@ -25,26 +25,16 @@
  *   reset --yes                   remove accounts, secrets and the local credential
  *
  * Secrets never appear on argv, in shell history or in output.
+ *
+ * Command bodies delegate to src/domain.ts — the one authoritative set of
+ * domain operations shared with the desktop control service (V1.5).
  */
 import { resolvePaths, ensureStateDirs } from "./paths.ts";
-import { createSecretStore, generateLocalCredential, newRef } from "./secret-store.ts";
-import {
-  createStateStore,
-  defaultState,
-  findAccount,
-  accountUsedByRoute,
-  makeAccount,
-  validateAlias,
-  validateUpstreamUrl,
-  LANES,
-  DEFAULT_UPSTREAM_GO,
-  DEFAULT_UPSTREAM_ZEN,
-  type StateFile,
-  type Lane,
-} from "./state.ts";
+import { createSecretStore } from "./secret-store.ts";
+import { createDomain } from "./domain.ts";
 import { createJournal } from "./journal.ts";
 import { createServer } from "./server.ts";
-import { probeAccountKey } from "./probe.ts";
+import { createStateStore, validateUpstreamUrl, LANES, type Lane } from "./state.ts";
 import { log } from "./util.ts";
 
 const USAGE = `Usage: gorouter <command> [args]
@@ -67,7 +57,7 @@ function requireNoExtra(args: string[], usage: string): void {
   if (args.length > 0) throw new Error(usage);
 }
 
-function printStatus(state: StateFile): void {
+function printStatus(state: { routes: Record<Lane, { accountId: string | null }>; accounts: Array<{ id: string; alias: string }> }): void {
   const goId = state.routes.go.accountId;
   const zenId = state.routes.zen.accountId;
   const aliasOf = (id: string | null): string => {
@@ -91,28 +81,15 @@ async function main(argv: string[]): Promise<number> {
 
   const paths = resolvePaths();
   const secrets = createSecretStore(paths.secretsDir);
+  const domain = createDomain(paths, secrets);
 
   switch (cmd) {
     case "setup": {
-      ensureStateDirs(paths);
-      const state = createStateStore(paths, secrets);
-      let cred: string;
-      let created = false;
-      try {
-        cred = state.localCredential();
-      } catch {
-        cred = generateLocalCredential();
-        const ref = newRef();
-        secrets.put(ref, cred);
-        state.mutate((s) => {
-          s.localCredentialRef = ref;
-        });
-        created = true;
-      }
+      const { created, credential } = domain.setup();
       if (created) {
         console.log("GoRouter state initialized.");
         console.log("Local client credential (print once; used by OMP provider config):");
-        console.log(cred);
+        console.log(credential);
         console.log("WARNING: treat this like a password. OMP sends it only to 127.0.0.1:8787.");
       } else {
         console.log("GoRouter state already initialized (state dir: " + paths.state + ").");
@@ -121,9 +98,8 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     case "local-cred": {
-      const state = createStateStore(paths, secrets);
       try {
-        console.log(state.localCredential());
+        console.log(domain.localCredential());
       } catch (e) {
         console.error(e instanceof Error ? e.message : String(e));
         return 1;
@@ -131,101 +107,52 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     case "rotate-local-cred": {
-      const state = createStateStore(paths, secrets);
-      const oldRef = state.read().localCredentialRef;
-      const cred = generateLocalCredential();
-      const ref = newRef();
-      secrets.put(ref, cred);
-      state.mutate((s) => {
-        s.localCredentialRef = ref;
-      });
-      if (oldRef) secrets.delete(oldRef);
+      const credential = domain.rotateLocalCredential();
       console.log("Local client credential rotated. Update OMP provider configuration now:");
-      console.log(cred);
+      console.log(credential);
       return 0;
     }
     case "account": {
       const sub = args[0];
       const rest = args.slice(1);
-      const state = createStateStore(paths, secrets);
       switch (sub) {
         case "add": {
           if (rest.length !== 1) throw new Error("usage: gorouter account add <alias>");
-          const alias = rest[0]!;
-          const aliasErr = validateAlias(alias);
-          if (aliasErr) throw new Error(aliasErr);
-          if (findAccount(state.read(), alias)) throw new Error(`account '${alias}' already exists`);
           const secret = await readSecretFromStdin();
-          const ref = newRef();
-          secrets.put(ref, secret);
-          state.mutate((s) => {
-            s.accounts.push(makeAccount(alias, ref));
-          });
-          console.log(`account '${alias}' added (secret stored via DPAPI)`);
+          const account = domain.accountAdd(rest[0]!, secret);
+          console.log(`account '${account.alias}' added (secret stored via DPAPI)`);
           return 0;
         }
         case "update": {
           if (rest.length !== 1) throw new Error("usage: gorouter account update <alias>");
-          const account = findAccount(state.read(), rest[0]!);
-          if (!account) throw new Error(`account '${rest[0]}' not found`);
           const secret = await readSecretFromStdin();
-          secrets.put(account.secretRef, secret);
-          state.mutate((s) => {
-            const a = s.accounts.find((x) => x.id === account.id)!;
-            a.updatedAtUtc = new Date().toISOString();
-          });
+          const account = domain.accountUpdate(rest[0]!, secret);
           console.log(`account '${account.alias}' credential updated`);
           return 0;
         }
         case "list": {
-          const s = state.read();
-          if (s.accounts.length === 0) {
+          const accounts = domain.accountList();
+          if (accounts.length === 0) {
             console.log("no accounts configured");
           }
-          for (const a of s.accounts) {
-            const routed = LANES.filter((l) => s.routes[l].accountId === a.id).join(",");
+          for (const a of accounts) {
+            const routed = a.usedBy.join(",");
             console.log(`${a.alias}\tid=${a.id}\tsecret=DPAPI:${a.secretRef.slice(0, 12)}…${routed ? `\troutes=${routed}` : ""}`);
           }
           return 0;
         }
         case "rename": {
           if (rest.length !== 2) throw new Error("usage: gorouter account rename <old> <new>");
-          const account = findAccount(state.read(), rest[0]!);
-          if (!account) throw new Error(`account '${rest[0]}' not found`);
-          const newAlias = rest[1]!;
-          const aliasErr = validateAlias(newAlias);
-          if (aliasErr) throw new Error(aliasErr);
-          if (findAccount(state.read(), newAlias)) throw new Error(`account '${newAlias}' already exists`);
-          state.mutate((s) => {
-            const a = s.accounts.find((x) => x.id === account.id)!;
-            a.alias = newAlias;
-            a.updatedAtUtc = new Date().toISOString();
-          });
-          console.log(`account renamed '${account.alias}' -> '${newAlias}' (stable id preserved)`);
+          const { renamed, previousAlias } = domain.accountRename(rest[0]!, rest[1]!);
+          console.log(`account renamed '${previousAlias}' -> '${renamed.alias}' (stable id preserved)`);
           return 0;
         }
         case "remove": {
           const force = rest.includes("--force");
           const name = rest.find((x) => x !== "--force");
           if (!name) throw new Error("usage: gorouter account remove <alias> [--force]");
-          const account = findAccount(state.read(), name);
-          if (!account) throw new Error(`account '${name}' not found`);
-          const lane = accountUsedByRoute(state.read(), account.id);
-          if (lane && !force) {
-            throw new Error(
-              `account '${account.alias}' is the selected ${lane.toUpperCase()} account; remove with --force to clear the selection`,
-            );
-          }
-          state.mutate((s) => {
-            s.accounts = s.accounts.filter((x) => x.id !== account.id);
-            if (force) {
-              for (const l of LANES) {
-                if (s.routes[l].accountId === account.id) s.routes[l].accountId = null;
-              }
-            }
-          });
-          secrets.delete(account.secretRef);
-          console.log(`account '${account.alias}' removed (secret blob deleted)`);
+          const { removed } = domain.accountRemove(name, force);
+          console.log(`account '${removed.alias}' removed (secret blob deleted)`);
           return 0;
         }
         case "test": {
@@ -243,19 +170,14 @@ async function main(argv: string[]): Promise<number> {
             return true;
           });
           if (!name) throw new Error("usage: gorouter account test <alias> [--lane go|zen]");
-          const s = state.read();
-          const account = findAccount(s, name);
-          if (!account) throw new Error(`account '${name}' not found`);
-          const secret = secrets.get(account.secretRef);
-          for (const lane of lanes) {
-            const base = lane === "go" ? s.settings.upstreamGo : s.settings.upstreamZen;
-            const r = await probeAccountKey(lane, secret, base);
+          const results = await domain.accountTest(name, lanes);
+          for (const r of results) {
             const brief = r.errorMessageBrief ? ` (${r.errorMessageBrief})` : "";
             console.log(
-              `account '${account.alias}' lane=${lane} model=${r.model} => ${r.verdict} http=${r.httpStatus ?? "network-error"}${brief} ${r.tookMs}ms`,
+              `account '${name}' lane=${r.lane} model=${r.model} => ${r.verdict} http=${r.httpStatus ?? "network-error"}${brief} ${r.tookMs}ms`,
             );
             if (r.verdict === "AUTH_FAIL") {
-              console.log(`  NOTE: credential rejected by the ${lane.toUpperCase()} lane (401 AuthError)`);
+              console.log(`  NOTE: credential rejected by the ${r.lane.toUpperCase()} lane (401 AuthError)`);
             } else if (r.verdict === "AUTH_PASS_QUOTA_STATE") {
               console.log(`  NOTE: authentication accepted; quota state: ${r.errorType}${r.workspaceHint ? ` workspace=${r.workspaceHint}` : ""}`);
             } else if (r.verdict === "AUTH_PASS_UPSTREAM_STATE") {
@@ -271,17 +193,15 @@ async function main(argv: string[]): Promise<number> {
       }
     }
     case "route": {
-      const state = createStateStore(paths, secrets);
       if (args.length === 0) {
-        printStatus(state.read());
+        const st = domain.status();
+        printStatus({ routes: Object.fromEntries(st.routes.map((r) => [r.lane, { accountId: r.accountId }])) as Record<Lane, { accountId: string | null }>, accounts: st.accounts });
         return 0;
       }
       if (args[0] === "clear") {
         const lane = args[1]?.toLowerCase();
         if (lane !== "go" && lane !== "zen") throw new Error("usage: gorouter route clear <go|zen>");
-        state.mutate((s) => {
-          s.routes[lane].accountId = null;
-        });
+        domain.routeClear(lane);
         console.log(`route ${lane.toUpperCase()} cleared`);
         return 0;
       }
@@ -290,24 +210,19 @@ async function main(argv: string[]): Promise<number> {
       if ((lane !== "go" && lane !== "zen") || !alias) {
         throw new Error("usage: gorouter route <go|zen> <alias>");
       }
-      const account = findAccount(state.read(), alias);
-      if (!account) throw new Error(`account '${alias}' not found`);
-      state.mutate((s) => {
-        s.routes[lane].accountId = account.id;
-      });
-      printStatus(state.read());
+      domain.routeSet(lane, alias);
+      const st = domain.status();
+      printStatus({ routes: Object.fromEntries(st.routes.map((r) => [r.lane, { accountId: r.accountId }])) as Record<Lane, { accountId: string | null }>, accounts: st.accounts });
       return 0;
     }
     case "status": {
-      const state = createStateStore(paths, secrets);
-      const s = state.read();
-      printStatus(s);
+      const st = domain.status();
+      printStatus({ routes: Object.fromEntries(st.routes.map((r) => [r.lane, { accountId: r.accountId }])) as Record<Lane, { accountId: string | null }>, accounts: st.accounts });
       // status is read-only: don't create journal DB if absent
-      const journalExists = require("node:fs").existsSync(paths.journalDb);
-      if (!journalExists) {
+      if (!st.journalExists) {
         console.log("  Journal: schema v1, records=0 (no journal yet)");
       } else {
-        const journal = createJournal(paths.journalDb, s.settings.journalRetentionDays, s.settings.journalMaxRecords);
+        const journal = createJournal(paths.journalDb, st.settings.journalRetentionDays, st.settings.journalMaxRecords);
         console.log("  Journal: schema v" + journal.stats().schemaVersion + ", records=" + journal.stats().records +
           (journal.stats().degraded ? ", DEGRADED" : "") +
           (journal.stats().lastError ? `, lastError=${journal.stats().lastError}` : ""));
@@ -319,46 +234,21 @@ async function main(argv: string[]): Promise<number> {
     case "journal":
       if (args[0] !== "stats") throw new Error("usage: gorouter journal stats");
       {
-        const s = createStateStore(paths, secrets).read();
-        const journal = createJournal(paths.journalDb, s.settings.journalRetentionDays, s.settings.journalMaxRecords);
-        const st = journal.stats();
+        const st = domain.journalStats();
         console.log(JSON.stringify(st, null, 2));
-        journal.close();
         return 0;
       }
     case "config":
       if (args[0] === "show" || args.length === 0) {
-        const s = createStateStore(paths, secrets).read();
-        console.log(JSON.stringify(s.settings, null, 2));
+        const s = domain.configShow();
+        console.log(JSON.stringify(s, null, 2));
         return 0;
       }
       if (args[0] === "set") {
         const key = args[1];
         const value = args[2];
         if (!key || value === undefined) throw new Error("usage: gorouter config set <key> <value>");
-        const state = createStateStore(paths, secrets);
-        const s = state.read();
-        const settings = s.settings as unknown as Record<string, unknown>;
-        if (!(key in settings)) {
-          throw new Error(`unknown setting '${key}'; known: ${Object.keys(settings).join(", ")}`);
-        }
-        let parsed: unknown = value;
-        if (key === "port" || key === "journalRetentionDays" || key === "journalMaxRecords") {
-          parsed = Number(value);
-          if (!Number.isFinite(parsed) || (parsed as number) <= 0) throw new Error(`invalid numeric value '${value}'`);
-          if (key === "port" && (parsed as number) > 65535) throw new Error("port out of range");
-        }
-        if (key === "upstreamGo" || key === "upstreamZen") {
-          const v = validateUpstreamUrl(value);
-          if (!v.ok) throw new Error(v.reason);
-          parsed = v.url.toString().replace(/\/+$/, "");
-        }
-        if (key === "host" && value !== "127.0.0.1" && value !== "localhost" && value !== "::1") {
-          throw new Error("non-loopback binding requires explicit --host at serve time; refusing to persist");
-        }
-        state.mutate((s) => {
-          (s.settings as unknown as Record<string, unknown>)[key] = parsed;
-        });
+        domain.configSet(key, value);
         console.log(`setting '${key}' updated`);
         return 0;
       }
@@ -440,16 +330,7 @@ async function main(argv: string[]): Promise<number> {
     }
     case "reset": {
       if (!args.includes("--yes")) throw new Error("usage: gorouter reset --yes");
-      const state = createStateStore(paths, secrets);
-      const s = state.read();
-      for (const a of s.accounts) secrets.delete(a.secretRef);
-      if (s.localCredentialRef) secrets.delete(s.localCredentialRef);
-      state.mutate((x) => {
-        const fresh = defaultState();
-        x.accounts = fresh.accounts;
-        x.routes = fresh.routes;
-        x.localCredentialRef = null;
-      });
+      domain.reset();
       console.log("router state reset (secrets deleted); journal db left in place");
       return 0;
     }
@@ -458,6 +339,11 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
+/**
+ * Serve-time state store (ephemeral --port/--host overrides) and upstream
+ * validation are router-entry concerns, not domain mutations; keep them
+ * local to the CLI entrypoint with the same V1 semantics.
+ */
 main(Bun.argv.slice(2))
   .then((code) => process.exit(code))
   .catch((e) => {

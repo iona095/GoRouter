@@ -4,11 +4,21 @@ node_modules/
 docs/evidence/
 .test-state/
 
+# build outputs (V1.5 desktop)
+dist/
+src/desktop/shell/bin/
+src/desktop/shell/obj/
+
+# local governance/evidence (never staged; explicit-path staging is primary)
+handoffs/
+
 # runtime state / secret-bearing artifacts (defensive: never commit)
 *.db
 *.db-shm
 *.db-wal
 secrets/
 state.json
+desktop.json
+*.lock
 .env
 .env.*

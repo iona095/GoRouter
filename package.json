@@ -7,7 +7,10 @@
   "scripts": {
     "start": "bun src/cli.ts serve",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "desktop": "bun src/desktop/control-service.ts",
+    "desktop:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
+    "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-dev.ps1"
   },
   "devDependencies": {
     "typescript": "^5.5.0",

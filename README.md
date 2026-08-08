@@ -96,7 +96,7 @@ For a persistent router, run it under a supervisor that restarts on failure
 curl http://127.0.0.1:8787/healthz
 ```
 
-Stop: send Ctrl+C/SIGTERM, or kill the supervising job. Nothing is written
+Stop: press Ctrl+C in the console (or terminate the supervising job). Nothing is written
 into the repository at runtime.
 
 ## OMP integration
@@ -151,6 +151,14 @@ selected account's key at the upstream boundary.
 | `serve [--port N] [--host H]` | run the router |
 | `reset --yes` | remove all accounts, secrets and the local credential (settings and the journal are retained) |
 
+> V1.5 CLI behavior notes: `account rename` now prints the truthful
+> `account renamed 'OLD' -> 'NEW'` message (V1 printed the new alias on both
+> sides — a pre-existing message bug, corrected deliberately; the stable
+> account id is preserved either way). All other V1 command messages, exit
+> codes and semantics are byte-identical to V1. Secret redaction was
+> additionally hardened to mask bare 40+ character base64url runs (local
+> credential / admin-token shaped values) in logs and output.
+
 ## Request journal (routing provenance)
 
 Every accepted request gets a stable opaque `router_request_id` before
@@ -198,6 +206,99 @@ bun test          # full deterministic suite (mock upstream; DPAPI round-trip in
 bun run scripts/validate-live.ts   # live account/lane matrix (requires env keys)
 bun run scripts/omp-e2e.ts         # OMP end-to-end (requires router + OMP override)
 ```
+
+## V1.5 Desktop (tray + control center)
+
+GoRouter V1.5 is a native Windows desktop operator layer over the unchanged
+V1 router: a system-tray presence, a compact control center, router
+supervision and an optional per-user start-at-login mode. **The V1 CLI
+remains fully supported and authoritative** — every GUI action executes the
+same shared domain operations the CLI uses, so both surfaces always agree
+on state, validation and destructive-operation rules.
+
+V1.5 adds:
+
+- **System tray** — router state (running / degraded / stopped), current Go
+  and Zen accounts, direct lane switching, open control center, router
+  lifecycle actions, exit. No per-request notification spam.
+- **Control center** — account lifecycle, independent Go/Zen route
+  selection, request-journal browsing (safe fields only), health and
+  settings.
+- **One control domain** — `src/domain.ts` is the single authoritative
+  implementation of every state/secret/journal mutation, used by both the
+  CLI and the desktop control service, with a cross-process mutation lock
+  (`src/lock.ts`) so concurrent CLI and GUI writers serialize.
+- **Supervision** — the control service attaches to an already-running
+  healthy router, otherwise spawns and supervises one with bounded restart
+  backoff; it never kills a router it did not start.
+- **Coherence** — CLI-side changes appear in the GUI within ~1 second
+  (state mtime watch + event push); GUI changes are authoritative for the
+  next request with no restart, and in-flight requests keep their original
+  route snapshot (unchanged V1 invariant).
+
+The proxy data plane (server, journal, safety model, upstream pinning) is
+not modified by V1.5.
+
+### Quick start (development)
+
+```powershell
+bun install
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-dev.ps1
+```
+
+This builds the shell, starts the control service
+(`bun src/desktop/control-service.ts`) and launches the tray app. In dev
+mode the service spawns the router as `bun src/cli.ts serve`.
+
+### Quick start (packaged)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+# dist/ now contains GoRouterDesktop.exe (shell),
+# gorouter-control.exe (control service) and gorouter-router.exe (router).
+# Copy the dist/ folder anywhere (per-user) and run:
+.\dist\GoRouterDesktop.exe
+```
+
+No Administrator rights are required to build, install or run the desktop
+app. Runtime state always stays under `%LOCALAPPDATA%\GoRouter` (or
+`GOROUTER_STATE_DIR`) — never in the repository or the app folder.
+
+### First run
+
+Fresh state: welcome → local client credential shown once (copy button) →
+add the first account (Go or Zen) → choose which account serves the GO and
+Zen lanes → note on OMP configuration → done.
+Existing V1 state is adopted as-is: accounts, routes, local credential,
+journal and settings are used directly — nothing is re-entered or migrated
+into a parallel store.
+
+### Start at login
+
+Opt-in per-user toggle in the control center (HKCU `Run` value
+`GoRouterDesktop` pointing at the shell executable). Reversible from the
+same toggle, applies only to the current Windows user, no Administrator
+rights.
+
+### Uninstall / rollback
+
+1. Exit the app (tray → Exit).
+2. Turn off start-at-login (removes the `GoRouterDesktop` HKCU Run value).
+3. Delete the dist folder.
+4. Optionally remove runtime state: `bun src/cli.ts reset --yes`, then
+   delete `%LOCALAPPDATA%\GoRouter`.
+
+The CLI is untouched by the desktop install; deleting the desktop folder
+fully rolls back to V1 CLI-only operation.
+
+### Documentation
+
+- `docs/desktop-architecture.md` — process topology, control-plane
+  authorization, supervision, coherence, failure isolation.
+- `docs/desktop-packaging.md` — reproducible build, dist layout, install,
+  uninstall, third-party notices.
+- `docs/desktop-security.md` — attack-surface analysis mapped to the
+  contract security classes.
 
 ## V2/later (explicitly deferred)
 
