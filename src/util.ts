@@ -1,0 +1,176 @@
+/**
+ * GoRouter V1 — shared utilities: redaction, logging, atomic file writes,
+ * monotonic timing, safe header handling.
+ */
+
+// ---------------------------------------------------------------------------
+// Logging — never contains credentials. All log lines are redacted through
+// this helper so a future call site cannot accidentally add a secret.
+// ---------------------------------------------------------------------------
+
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+const LEVEL_ORDER: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
+export class Logger {
+  private minLevel: number;
+  constructor(minLevel: LogLevel = "info") {
+    this.minLevel = LEVEL_ORDER[minLevel];
+  }
+  log(level: LogLevel, msg: string): void {
+    if (LEVEL_ORDER[level] < this.minLevel) return;
+    const line = `${new Date().toISOString()} [${level.toUpperCase()}] ${redact(msg)}`;
+    if (level === "error") console.error(line);
+    else console.log(line);
+  }
+  debug(msg: string): void { this.log("debug", msg); }
+  info(msg: string): void { this.log("info", msg); }
+  warn(msg: string): void { this.log("warn", msg); }
+  error(msg: string): void { this.log("error", msg); }
+}
+
+export const log = new Logger(
+  process.env.GOROUTER_LOG_LEVEL === "debug" ? "debug" : "info",
+);
+
+// ---------------------------------------------------------------------------
+// Secret redaction — applied to every string that may reach logs, CLI output,
+// journal or handoff surfaces. This is a defense-in-depth guard: call sites
+// must still avoid placing secrets in these strings in the first place.
+// ---------------------------------------------------------------------------
+
+const SECRET_SCAN = /\b(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._~+/-]{12,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,})\b/g;
+
+/** Replace credential-shaped fragments with a fixed marker. */
+export function redact(text: string): string {
+  return text.replace(SECRET_SCAN, "[REDACTED]");
+}
+
+// ---------------------------------------------------------------------------
+// Atomic file writes (temp + fsync + rename) so concurrent readers never see
+// a half-written state file.
+// ---------------------------------------------------------------------------
+
+import { writeFileSync, renameSync, openSync, closeSync, fsyncSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+
+export function atomicWriteJson(file: string, value: unknown): void {
+  const dir = dirname(file);
+  const tmp = join(dir, `.${randomUUID()}.tmp`);
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(value, null, 2) + "\n", "utf8");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, file);
+}
+
+export function atomicWriteBytes(file: string, bytes: Uint8Array): void {
+  const dir = dirname(file);
+  const tmp = join(dir, `.${randomUUID()}.tmp`);
+  const fd = openSync(tmp, "w", 0o600);
+  try {
+    writeFileSync(fd, bytes);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, file);
+}
+
+export function tryUnlink(file: string): void {
+  try { unlinkSync(file); } catch { /* already gone */ }
+}
+
+// ---------------------------------------------------------------------------
+// Timing
+// ---------------------------------------------------------------------------
+
+/** Monotonic milliseconds (process-lifetime reference). */
+export function monotonicMs(): number {
+  return performance.now();
+}
+
+/** UTC ISO-8601 timestamp with millisecond precision, 'Z' suffix. */
+export function utcNow(): string {
+  return new Date().toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Headers
+// ---------------------------------------------------------------------------
+
+/** Hop-by-hop + proxy-hop headers that must never be forwarded. */
+export const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+/** Local-only headers consumed by GoRouter and never forwarded upstream. */
+export const LOCAL_HEADERS = new Set([
+  "x-gorouter-correlation-id",
+  // per-family client-auth headers: the local credential may arrive in any of
+  // these (OpenAI-style Bearer, Anthropic x-api-key, Gemini x-goog-api-key);
+  // none of them may be forwarded — the account key is injected per family.
+  "authorization",
+  "x-api-key",
+  "x-goog-api-key",
+]);
+
+export function sanitizeForwardHeaders(headers: Headers): Headers {
+  const out = new Headers();
+  for (const [name, value] of headers) {
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP.has(lower)) continue;
+    if (lower === "host") continue; // set explicitly to the upstream authority
+    if (LOCAL_HEADERS.has(lower)) continue;
+    out.set(name, value);
+  }
+  return out;
+}
+
+/**
+ * Bounded validation for the optional client correlation id header.
+ * The value must be a short, printable, non-secret identifier.
+ */
+export function validateCorrelationId(value: string | null): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  const v = value.trim();
+  if (v.length === 0 || v.length > 128) return undefined;
+  if (!/^[A-Za-z0-9._~-]+$/.test(v)) return undefined;
+  return v;
+}
+
+/** Narrow allowlist of upstream response headers archived as request ids. */
+export const UPSTREAM_REQUEST_ID_HEADERS = ["x-request-id", "x-amzn-requestid"] as const;
+
+export function extractUpstreamRequestIds(headers: Headers): string[] {
+  const ids: string[] = [];
+  for (const name of UPSTREAM_REQUEST_ID_HEADERS) {
+    const value = headers.get(name);
+    if (value && value.length > 0 && value.length <= 256 && /^[\x20-\x7E]+$/.test(value)) {
+      ids.push(`${name}: ${value}`);
+    }
+  }
+  return ids;
+}
+
+/** Endpoint-family classification from the forwarded path suffix — bounded vocabulary so an arbitrary path cannot store arbitrary strings in the journal. */
+export function classifyEndpointFamily(suffix: string): string {
+  if (suffix.startsWith("/chat/completions")) return "chat/completions";
+  if (suffix.startsWith("/responses")) return "responses";
+  if (suffix.startsWith("/messages")) return "messages";
+  if (suffix.startsWith("/models")) return "models";
+  if (suffix === "/" || suffix.length === 0) return "root";
+  return "other";
+}

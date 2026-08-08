@@ -1,0 +1,14 @@
+node_modules/
+*.log
+.omp/
+docs/evidence/
+.test-state/
+
+# runtime state / secret-bearing artifacts (defensive: never commit)
+*.db
+*.db-shm
+*.db-wal
+secrets/
+state.json
+.env
+.env.*

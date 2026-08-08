@@ -1,0 +1,16 @@
+{
+  "name": "gorouter-v1",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode GoRouter V1 — localhost credential/lane router for OpenCode Go + Zen (account identity + service lane)",
+  "scripts": {
+    "start": "bun src/cli.ts serve",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/bun": "^1.1.0"
+  }
+}
