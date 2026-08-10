@@ -1,4 +1,4 @@
-using System.Drawing.Imaging;
+﻿using System.Drawing.Imaging;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -45,6 +45,7 @@ internal static class Selftest
         var state = "empty";
         string? snapshotFile = null;
         (int Width, int Height)? requestedSize = null;
+        (int Width, int Height)? requestedClientSize = null;
         float? dpiScale = null;
         var positional = new List<string>();
 
@@ -79,6 +80,23 @@ internal static class Selftest
                 continue;
             }
 
+            if (args[i] == "--client-size")
+            {
+                if (i + 1 >= args.Length)
+                {
+                    return Fail("Invalid --client-size: expected <width>x<height> with positive integers.", args);
+                }
+
+                var sizeArg = args[++i];
+                if (!TryParseSize(sizeArg, out var width, out var height))
+                {
+                    return Fail($"Invalid --client-size '{sizeArg}': expected <width>x<height> with positive integers.", args);
+                }
+
+                requestedClientSize = (width, height);
+                continue;
+            }
+
             if (args[i] == "--dpi-scale")
             {
                 if (i + 1 >= args.Length)
@@ -102,6 +120,11 @@ internal static class Selftest
                 continue;
             }
 
+            if (args[i] == "--transition-test")
+            {
+                // Handled after form creation
+                continue;
+            }
             if (args[i].StartsWith("--", StringComparison.Ordinal))
             {
                 return Fail($"Unknown option: {args[i]}", args);
@@ -174,21 +197,31 @@ internal static class Selftest
             form.Refresh();
             Pump();
 
+            // Client-area size is applied after Show: the responsive reflow is
+            // Resize/Shown-driven and a pre-Show size assignment does not reach
+            // the layout pass, so resizing the visible form is the deterministic
+            // path (identical to the in-process transition test).
+            if (requestedClientSize is { } clientSize)
+            {
+                form.ClientSize = new Size(clientSize.Width, clientSize.Height);
+                Pump();
+            }
+
             // Settle: async snapshot application must finish before capture, and
             // the rendered state badge must match the requested state — a
             // capture race fails loudly instead of producing stale evidence.
-            if (form is ControlCenterForm ccf)
+            if (form is ControlCenterForm ccfForm)
             {
-                for (var i = 0; i < 20 && !ccf.RenderedStateMatches(snapshot); i++)
+                for (var i = 0; i < 20 && !ccfForm.RenderedStateMatches(snapshot); i++)
                 {
                     Application.DoEvents();
                     Thread.Sleep(50);
                 }
 
-                if (!ccf.RenderedStateMatches(snapshot))
+                if (!ccfForm.RenderedStateMatches(snapshot))
                 {
                     return Fail(
-                        $"selftest render mismatch: badge '{ccf.StateBadgeText}' vs expected '{RouterStateText(snapshot)}'",
+                        $"selftest render mismatch: badge '{ccfForm.StateBadgeText}' vs expected '{RouterStateText(snapshot)}'",
                         args);
                 }
 
@@ -197,10 +230,15 @@ internal static class Selftest
                     // Offline evidence: render the exact post-success wording
                     // via the test-only helper — no channel call, no runtime
                     // state mutation, no provider traffic.
-                    ccf.SetSelftestRouteConfirmation("go", snapshot.Routes.Go.Alias ?? "alpha");
+                    ccfForm.SetSelftestRouteConfirmation("go", snapshot.Routes.Go.Alias ?? "alpha");
                     form.Refresh();
                     Pump();
                 }
+            }
+
+            if (args.Contains("--transition-test") && form is ControlCenterForm ccf)
+            {
+                return RunTransitionTest(outDir, ccf);
             }
 
             using var bitmap = CaptureWindow(form);
@@ -459,6 +497,183 @@ internal static class Selftest
         {
             DumpAccessibility(child, sb, depth + 1);
         }
+    }
+
+    private static int RunTransitionTest(string outDir, ControlCenterForm ccfForm)
+    {
+        var results = new List<string>();
+        var failures = new List<string>();
+
+        void Check(bool condition, string message)
+        {
+            if (!condition)
+                failures.Add(message);
+            results.Add(condition ? "  PASS: " + message : "  FAIL: " + message);
+        }
+
+        void Log(string msg) => results.Add("  " + msg);
+
+        var form = ccfForm.FindForm() ?? throw new InvalidOperationException("Form not found");
+
+        // Wide/narrow/wide/narrow/wide alternation plus the exact 899/900/901
+        // boundary — all in client pixels (the width the reflow reads).
+        var sequence = new[] { 920, 880, 920, 880, 920, 899, 900, 901, 920 };
+
+        results.Add("=== TRANSITION TEST ===");
+        results.Add("");
+
+        for (var step = 0; step < sequence.Length; step++)
+        {
+            var clientWidth = sequence[step];
+            var expectNarrow = clientWidth < 900;
+            var mode = expectNarrow ? "narrow" : "wide";
+
+            results.Add($"--- Step {step + 1}: client={clientWidth}px expect={mode} ---");
+
+            form.ClientSize = new Size(clientWidth, 660);
+            Application.DoEvents();
+            Pump();
+
+            // Status band: present, visible, non-collapsed, and the mode must
+            // actually have switched (band.Height 72 narrow / 52 wide).
+            var band = FindAllControls(ccfForm, "Status bar").FirstOrDefault();
+            Check(band != null, "Status bar found");
+            if (band != null)
+            {
+                Check(band.Visible, "Status bar visible");
+                Check(band.Height > 0, $"Status bar height={band.Height} (non-zero)");
+                Check(band.Height == (expectNarrow ? 72 : 52), $"Status bar height={band.Height} matches {mode} mode");
+            }
+
+            // Required identity/status/lifecycle controls: exactly one each,
+            // parented, visible, with accessible text.
+            var required = new[]
+            {
+                "GoRouter Desktop",
+                "Router state indicator",
+                "Router state",
+                "Router port",
+                "Desktop version",
+                "Stop router",
+                "Start router",
+            };
+            foreach (var name in required)
+            {
+                var all = FindAllControls(ccfForm, name);
+                Check(all.Count == 1, $"{name} present exactly once ({all.Count})");
+                var ctrl = all.FirstOrDefault();
+                if (ctrl != null)
+                {
+                    Check(ctrl.Parent != null, $"{name} has parent");
+                    Check(ctrl.Visible, $"{name} visible");
+                    Check(!string.IsNullOrEmpty(ctrl.AccessibleName), $"{name} has accessible name");
+                    Log($"  {name}: Parent={ctrl.Parent?.GetType().Name} Bounds={ctrl.Bounds} TabIndex={ctrl.TabIndex}");
+                }
+            }
+
+            // No duplicates by identity text anywhere in the tree.
+            var identityLabels = FindAllControls(ccfForm, "GoRouter Desktop");
+            Check(identityLabels.Count == 1, $"identity label count={identityLabels.Count}");
+
+            // No orphans: every reachable non-root control has a parent, and
+            // every required control lives inside this form's tree.
+            var unparented = 0;
+            void Walk(Control c)
+            {
+                if (c != ccfForm && c.Parent == null) unparented++;
+                foreach (Control child in c.Controls) Walk(child);
+            }
+            Walk(ccfForm);
+            Check(unparented == 0, $"unparented controls={unparented}");
+            foreach (var name in required)
+            {
+                var ctrl = FindAllControls(ccfForm, name).FirstOrDefault();
+                if (ctrl != null)
+                    Check(ctrl.FindForm() == form, $"{name} inside form tree");
+            }
+
+            // No overlap among the status controls (screen-space pairwise check;
+            // Bounds are parent-relative so RectangleToScreen is required).
+            var statusControls = required
+                .Select(n => FindAllControls(ccfForm, n).FirstOrDefault())
+                .Where(c => c != null)
+                .ToList();
+            var screenRects = statusControls
+                .Select(c => c!.RectangleToScreen(c.ClientRectangle))
+                .ToList();
+            var overlaps = 0;
+            for (var a = 0; a < screenRects.Count; a++)
+            {
+                for (var b = a + 1; b < screenRects.Count; b++)
+                {
+                    if (screenRects[a].IntersectsWith(screenRects[b]))
+                        overlaps++;
+                }
+            }
+            Check(overlaps == 0, $"overlapping status controls={overlaps}");
+
+            // No clipping: port label fully inside the band (screen space).
+            if (band != null)
+            {
+                var port = FindAllControls(ccfForm, "Router port").FirstOrDefault();
+                if (port != null)
+                {
+                    var portRect = port.RectangleToScreen(port.ClientRectangle);
+                    var bandRect = band.RectangleToScreen(band.ClientRectangle);
+                    Check(portRect.Width > 0 && portRect.Height > 0, "port label has non-zero size");
+                    Check(portRect.Left >= bandRect.Left && portRect.Right <= bandRect.Right + 1
+                        && portRect.Top >= bandRect.Top && portRect.Bottom <= bandRect.Bottom + 1,
+                        $"port label inside band (port={portRect} band={bandRect})");
+                }
+            }
+
+            Log("");
+        }
+
+        // Keyboard accessibility: declared focus order for focusable controls.
+        results.Add("--- Keyboard Accessibility ---");
+        var focusable = FindAllControls(ccfForm, null)
+            .Where(c => c.TabStop && c.Visible && c.Enabled)
+            .OrderBy(c => c.TabIndex)
+            .ToList();
+        foreach (var c in focusable)
+            results.Add($"  TabIndex={c.TabIndex} {c.AccessibleName ?? c.GetType().Name}");
+        var startBtn = FindAllControls(ccfForm, "Start router").FirstOrDefault();
+        var stopBtn = FindAllControls(ccfForm, "Stop router").FirstOrDefault();
+        if (startBtn != null && stopBtn != null)
+        {
+            Check(startBtn.TabStop && stopBtn.TabStop, "Start/Stop buttons are TabStop");
+            Check(startBtn.TabIndex < stopBtn.TabIndex, $"Start (Tab={startBtn.TabIndex}) precedes Stop (Tab={stopBtn.TabIndex})");
+        }
+        var identityCtrl = FindAllControls(ccfForm, "GoRouter Desktop").FirstOrDefault();
+        var portCtrl = FindAllControls(ccfForm, "Router port").FirstOrDefault();
+        Check(identityCtrl != null && !string.IsNullOrEmpty(identityCtrl.AccessibleName), "identity accessible name present");
+        Check(portCtrl != null && !string.IsNullOrEmpty(portCtrl.AccessibleName), "port accessible name present");
+
+        results.Add("");
+        if (failures.Count == 0)
+            results.Add("=== ALL CHECKS PASSED ===");
+        else
+        {
+            results.Add($"=== {failures.Count} FAILURES ===");
+            foreach (var f in failures)
+                results.Add("  FAILURE: " + f);
+        }
+
+        var summaryFile = Path.Combine(outDir, "transition-summary.txt");
+        File.WriteAllText(summaryFile, string.Join("\n", results));
+        Console.WriteLine(string.Join("\n", results));
+        return failures.Count == 0 ? 0 : 1;
+    }
+
+    private static List<Control> FindAllControls(Control root, string? accessibleName)
+    {
+        var result = new List<Control>();
+        if (accessibleName is null || root.AccessibleName == accessibleName)
+            result.Add(root);
+        foreach (Control child in root.Controls)
+            result.AddRange(FindAllControls(child, accessibleName));
+        return result;
     }
 
     /// <summary>Offline channel for selftest rendering; no pipe, no tokens.</summary>

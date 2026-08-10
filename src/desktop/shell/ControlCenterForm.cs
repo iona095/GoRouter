@@ -1,4 +1,4 @@
-using System.ComponentModel;
+﻿using System.ComponentModel;
 using System.Text;
 
 namespace GoRouterDesktop;
@@ -235,6 +235,10 @@ public sealed class ControlCenterForm : Form
         // White application band with a 1px bottom hairline: the top-level
         // chrome carries the identity, live router state and lifecycle
         // actions as one coherent surface.
+        //
+        // Two-row layout at narrow widths: row 0 = identity + state badge,
+        // row 1 = port + version.  At wide widths the original single-row
+        // arrangement is restored (52px height, all items in one row).
         var band = new Panel
         {
             Dock = DockStyle.Top,
@@ -250,26 +254,23 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Status bar separator",
         };
 
+        // Stable 7-column grid: identity, dot, badge, port, version, spacer, right
         var bar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            ColumnCount = 7,
             RowCount = 1,
             Padding = new Padding(14, 8, 14, 8),
             BackColor = VisualTheme.SurfaceWhite,
         };
-        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 0 identity
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 1 dot
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 2 badge
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 3 port
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 4 version
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); // 5 spacer
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 6 right
 
-        var left = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Padding = new Padding(0, 2, 0, 0),
-            BackColor = VisualTheme.SurfaceWhite,
-            AccessibleName = "Router status summary",
-        };
         _lblIdentity = new Label
         {
             AutoSize = true,
@@ -310,7 +311,6 @@ public sealed class ControlCenterForm : Form
             ForeColor = VisualTheme.SecondaryText,
             AccessibleName = "Desktop version",
         };
-        left.Controls.AddRange(new Control[] { _lblIdentity, _statusDot, _lblStateBadge, _lblPort, _lblVersion });
 
         var right = new FlowLayoutPanel
         {
@@ -339,13 +339,75 @@ public sealed class ControlCenterForm : Form
         _btnStartRouter.Click += OnStartRouterClicked;
         _btnStopRouter.Click += OnStopRouterClicked;
 
-        bar.Controls.Add(left, 0, 0);
-        bar.Controls.Add(right, 1, 0);
+        // Wide layout: all controls in one row at separate cells.
+        bar.Controls.Add(_lblIdentity, 0, 0);
+        bar.Controls.Add(_statusDot, 1, 0);
+        bar.Controls.Add(_lblStateBadge, 2, 0);
+        bar.Controls.Add(_lblPort, 3, 0);
+        bar.Controls.Add(_lblVersion, 4, 0);
+        bar.Controls.Add(right, 6, 0);
+
         band.Controls.Add(bar);
         band.Controls.Add(separator); // docked last so it owns the top strip
+
+        // Responsive two-row layout at narrow widths.
+        // All controls remain direct children of bar at all times;
+        // only cell positions change via SetRow/SetColumn/SetRowSpan.
+        // Reflow is driven by the form Resize event — never from bar.Layout —
+        // so the grid is never mutated mid-layout. A width guard makes the
+        // transition idempotent: the same width always yields the same mode.
+        int _lastReflowClientWidth = -1;
+        void ApplyResponsiveReflow()
+        {
+            var form = FindForm();
+            if (form == null) return;
+            var clientWidth = form.ClientSize.Width;
+            if (clientWidth == _lastReflowClientWidth) return;
+            _lastReflowClientWidth = clientWidth;
+            bool narrow = clientWidth < 900;
+            if (narrow && bar.RowCount == 1)
+            {
+                // Narrow: two rows.
+                // Row 0: identity, dot, badge
+                // Row 1: port, version (cols 3-4), right buttons (spanning rows)
+                band.Height = 72;
+                bar.RowCount = 2;
+                bar.RowStyles.Clear();
+                bar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                bar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                bar.SetRow(_lblIdentity, 0); bar.SetColumn(_lblIdentity, 0);
+                bar.SetRow(_statusDot, 0);   bar.SetColumn(_statusDot, 1);
+                bar.SetRow(_lblStateBadge, 0); bar.SetColumn(_lblStateBadge, 2);
+                bar.SetRow(_lblPort, 1);     bar.SetColumn(_lblPort, 3);
+                bar.SetRow(_lblVersion, 1);  bar.SetColumn(_lblVersion, 4);
+                bar.SetRow(right, 0);
+                bar.SetColumn(right, 6);
+                bar.SetRowSpan(right, 2);
+            }
+            else if (!narrow && bar.RowCount == 2)
+            {
+                // Wide: single row.
+                band.Height = 52;
+                bar.RowCount = 1;
+                bar.RowStyles.Clear();
+                bar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                bar.SetRow(_lblIdentity, 0); bar.SetColumn(_lblIdentity, 0);
+                bar.SetRow(_statusDot, 0);   bar.SetColumn(_statusDot, 1);
+                bar.SetRow(_lblStateBadge, 0); bar.SetColumn(_lblStateBadge, 2);
+                bar.SetRow(_lblPort, 0);     bar.SetColumn(_lblPort, 3);
+                bar.SetRow(_lblVersion, 0);  bar.SetColumn(_lblVersion, 4);
+                bar.SetRow(right, 0);
+                bar.SetColumn(right, 6);
+                bar.SetRowSpan(right, 1);
+            }
+        }
+        Resize += (s, e) => ApplyResponsiveReflow();
+        Shown += (s, e) => ApplyResponsiveReflow();
+
         return band;
     }
-
     private Control BuildBanner()
     {
         _banner = new Panel
