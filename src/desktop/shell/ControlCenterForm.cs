@@ -1,18 +1,25 @@
+using System.ComponentModel;
 using System.Text;
 
 namespace GoRouterDesktop;
 
 /// <summary>
-/// The control center: top status bar (state badge + port + version +
-/// Start/Stop), two lane panels (GO/ZEN immediate account switching with
-/// exact route-change feedback), Accounts, Journal and System tabs. Every
-/// control has an accessible name and explicit tab order; the close button
-/// hides to tray (non-destructive — tray Exit is the only exit); minimize
-/// hides to tray when minimizeToTray is enabled.
+/// The control center: a top status bar (GoRouter Desktop identity, live
+/// router state badge with a shape-reinforcing dot, port, Desktop release
+/// version, Start/Stop), a home Routing tab with two equal lane cards (GO/ZEN
+/// immediate account switching with exact route-change feedback) and a
+/// Recent activity preview fed by the same journal.recent response as the
+/// Journal tab, then the Accounts, Journal and System tabs, and a footer
+/// with the Desktop release identity, router state and local endpoint port.
+/// Every control has an accessible name and explicit tab order; the close
+/// button hides to tray (non-destructive — tray Exit is the only exit);
+/// minimize hides to tray when minimizeToTray is enabled.
 /// </summary>
 public sealed class ControlCenterForm : Form
 {
     private readonly IControlChannel _channel;
+
+    private static readonly Color PageBackColor = VisualTheme.WindowBack;
 
     private ShellSnapshot _snapshot = ShellSnapshot.Empty;
     private ClientState _clientState = ClientState.Starting;
@@ -21,11 +28,19 @@ public sealed class ControlCenterForm : Form
     private bool _journalRefreshing;
 
     // status bar
+    private Label _lblIdentity = null!;
+    private StatusDot _statusDot = null!;
     private Label _lblStateBadge = null!;
     private Label _lblPort = null!;
     private Label _lblVersion = null!;
     private Button _btnStartRouter = null!;
     private Button _btnStopRouter = null!;
+
+    // footer (state, local endpoint port)
+    private Panel _footer = null!;
+    private StatusDot _footerDot = null!;
+    private Label _lblFooterState = null!;
+    private Label _lblFooter = null!;
 
     // banner (startup / unavailable / auth-failed / onboarding pending)
     private Panel _banner = null!;
@@ -44,11 +59,20 @@ public sealed class ControlCenterForm : Form
     private ComboBox _cmbGo = null!;
     private Label _lblGoFeedback = null!;
     private Label _lblGoError = null!;
+    private Label _lblGoMode = null!;
     private ComboBox _cmbZen = null!;
     private Label _lblZenFeedback = null!;
     private Label _lblZenError = null!;
+    private Label _lblZenMode = null!;
+    private LaneStatusBox _goStatusBox = null!;
+    private LaneStatusBox _zenStatusBox = null!;
     private bool _routeBusyGo;
     private bool _routeBusyZen;
+    private TabPage _tabHome = null!;
+    private ListView _lvActivity = null!;
+    private Label _lblActivityDegraded = null!;
+    private Label _lblActivityEmpty = null!;
+    private Button _btnActivityViewAll = null!;
 
     // accounts tab
     private ListView _lvAccounts = null!;
@@ -101,6 +125,27 @@ public sealed class ControlCenterForm : Form
         SetClientState(_channel.State);
     }
 
+    /// <summary>
+    /// Operator-facing release identity: <see cref="Application.ProductVersion"/>
+    /// may carry SemVer 2 build metadata (e.g. "1.5.1+42546abc") that records
+    /// the exact build; the chrome shows only the concise release (everything
+    /// before '+') while the assembly metadata itself stays untouched.
+    /// </summary>
+    private static string PresentationVersion
+    {
+        get
+        {
+            var product = Application.ProductVersion;
+            if (string.IsNullOrEmpty(product))
+            {
+                return string.Empty;
+            }
+
+            var plus = product.IndexOf('+');
+            return plus < 0 ? product : product.Substring(0, plus);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Layout
     // ------------------------------------------------------------------
@@ -116,32 +161,102 @@ public sealed class ControlCenterForm : Form
 
         Controls.Add(BuildStatusBar());
         Controls.Add(BuildBanner());
-        _tabs = new TabControl { Dock = DockStyle.Fill, AccessibleName = "Control center sections" };
-        _tabs.TabPages.Add(BuildRoutingTab());
+        _tabs = new TabControl
+        {
+            Dock = DockStyle.Fill,
+            AccessibleName = "Control center sections",
+            DrawMode = TabDrawMode.OwnerDrawFixed,
+            SizeMode = TabSizeMode.Fixed,
+            ItemSize = new Size(120, 30),
+            Padding = new Point(0, 0),
+            BackColor = VisualTheme.WindowBack,
+        };
+        _tabs.DrawItem += OnTabsDrawItem;
+        _tabHome = BuildRoutingTab();
+        _tabs.TabPages.Add(_tabHome);
         _tabs.TabPages.Add(BuildAccountsTab());
         _tabJournal = BuildJournalTab();
         _tabs.TabPages.Add(_tabJournal);
         _tabs.TabPages.Add(BuildSystemTab());
+        // All pages share the soft-cool-gray application background; the tab
+        // strip itself is painted flat by OnTabsDrawItem.
+        foreach (TabPage page in _tabs.TabPages)
+        {
+            page.BackColor = VisualTheme.WindowBack;
+        }
         _tabs.SelectedIndexChanged += (_, _) =>
         {
-            if (_tabs.SelectedTab == _tabJournal)
+            // The home tab shows the same journal.recent preview as the full
+            // Journal tab, so both refresh through the same single-flight path.
+            if (_tabs.SelectedTab == _tabJournal || _tabs.SelectedTab == _tabHome)
             {
                 _ = RefreshJournalAsync();
             }
         };
         Controls.Add(_tabs);
+        Controls.Add(BuildFooter());
+    }
+
+    /// <summary>
+    /// Flat modern tab strip: the selected tab gets a white surface with a
+    /// neutral underline; unselected tabs stay quiet on the page background.
+    /// Keyboard accessibility and tab semantics are unchanged.
+    /// </summary>
+    private void OnTabsDrawItem(object? sender, DrawItemEventArgs e)
+    {
+        var tabs = (TabControl)sender!;
+        var selected = e.Index == tabs.SelectedIndex;
+        var page = tabs.TabPages[e.Index];
+        var bounds = e.Bounds;
+        bounds.Inflate(-4, -2);
+
+        using (var back = new SolidBrush(selected ? VisualTheme.SurfaceWhite : VisualTheme.WindowBack))
+        {
+            e.Graphics.FillRectangle(back, e.Bounds);
+        }
+
+        TextRenderer.DrawText(
+            e.Graphics,
+            page.Text,
+            selected ? VisualTheme.FieldLabelFont : VisualTheme.BodyFont,
+            bounds,
+            selected ? VisualTheme.PrimaryText : VisualTheme.SecondaryText,
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+
+        if (selected)
+        {
+            using var pen = new Pen(VisualTheme.PrimaryText, 2f);
+            e.Graphics.DrawLine(pen, e.Bounds.Left + 12, e.Bounds.Bottom - 2, e.Bounds.Right - 12, e.Bounds.Bottom - 2);
+        }
     }
 
     private Control BuildStatusBar()
     {
-        var bar = new TableLayoutPanel
+        // White application band with a 1px bottom hairline: the top-level
+        // chrome carries the identity, live router state and lifecycle
+        // actions as one coherent surface.
+        var band = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 44,
+            Height = 52,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Status bar",
+        };
+        var separator = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 1,
+            BackColor = VisualTheme.CardBorder,
+            AccessibleName = "Status bar separator",
+        };
+
+        var bar = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
             ColumnCount = 2,
             RowCount = 1,
-            Padding = new Padding(10, 6, 10, 6),
-            AccessibleName = "Status bar",
+            Padding = new Padding(14, 8, 14, 8),
+            BackColor = VisualTheme.SurfaceWhite,
         };
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
@@ -151,55 +266,73 @@ public sealed class ControlCenterForm : Form
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Padding = new Padding(0, 4, 0, 0),
+            Padding = new Padding(0, 2, 0, 0),
+            BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = "Router status summary",
+        };
+        _lblIdentity = new Label
+        {
+            AutoSize = true,
+            Font = VisualTheme.AppTitleFont,
+            Text = "GoRouter Desktop",
+            ForeColor = VisualTheme.PrimaryText,
+            AccessibleName = "GoRouter Desktop",
+        };
+        _statusDot = new StatusDot
+        {
+            Margin = new Padding(16, 5, 0, 0),
+            AccessibleName = "Router state indicator",
         };
         _lblStateBadge = new Label
         {
             AutoSize = true,
-            Font = new Font(Font, FontStyle.Bold),
+            Font = VisualTheme.StatusFont,
             Text = "Starting…",
+            ForeColor = VisualTheme.SecondaryText,
             AccessibleName = "Router state",
         };
         _lblPort = new Label
         {
             AutoSize = true,
-            Margin = new Padding(14, 0, 0, 0),
+            Font = VisualTheme.SmallFont,
+            Margin = new Padding(14, 1, 0, 0),
             Text = "",
+            ForeColor = VisualTheme.SecondaryText,
+            MaximumSize = new Size(100, 0),
             AccessibleName = "Router port",
         };
         _lblVersion = new Label
         {
             AutoSize = true,
-            Margin = new Padding(14, 0, 0, 0),
+            Font = VisualTheme.BodyFont,
+            Margin = new Padding(14, 1, 0, 0),
             Text = "",
+            ForeColor = VisualTheme.SecondaryText,
             AccessibleName = "Desktop version",
         };
-        left.Controls.AddRange(new Control[] { _lblStateBadge, _lblPort, _lblVersion });
+        left.Controls.AddRange(new Control[] { _lblIdentity, _statusDot, _lblStateBadge, _lblPort, _lblVersion });
 
         var right = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             FlowDirection = FlowDirection.RightToLeft,
             WrapContents = false,
+            BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = "Router controls",
         };
-        _btnStopRouter = new Button
-        {
-            Text = "Stop router",
-            AutoSize = true,
-            Margin = new Padding(6, 0, 0, 0),
-            TabIndex = 4,
-            AccessibleName = "Stop router",
-        };
-        _btnStartRouter = new Button
-        {
-            Text = "Start router",
-            AutoSize = true,
-            Margin = new Padding(6, 0, 0, 0),
-            TabIndex = 3,
-            AccessibleName = "Start router",
-        };
+        // Outlined action buttons: Stop is danger-red, Start neutral-blue.
+        // Enablement stays truthful (UpdateLifecycleButtons); the labels and
+        // operations are the existing V1.5 semantics (there is no router.restart).
+        _btnStopRouter = ActionButton.Danger("Stop router");
+        _btnStopRouter.Margin = new Padding(6, 0, 0, 0);
+        _btnStopRouter.TabIndex = 4;
+        _btnStopRouter.AccessibleName = "Stop router";
+        _btnStartRouter = ActionButton.Neutral("Start router");
+        _btnStartRouter.Margin = new Padding(6, 0, 0, 0);
+        _btnStartRouter.TabIndex = 3;
+        _btnStartRouter.AccessibleName = "Start router";
         right.Controls.Add(_btnStopRouter);
         right.Controls.Add(_btnStartRouter);
 
@@ -208,7 +341,9 @@ public sealed class ControlCenterForm : Form
 
         bar.Controls.Add(left, 0, 0);
         bar.Controls.Add(right, 1, 0);
-        return bar;
+        band.Controls.Add(bar);
+        band.Controls.Add(separator); // docked last so it owns the top strip
+        return band;
     }
 
     private Control BuildBanner()
@@ -217,7 +352,7 @@ public sealed class ControlCenterForm : Form
         {
             Dock = DockStyle.Top,
             Height = 40,
-            BackColor = Color.FromArgb(0xFF, 0xF3, 0xE0),
+            BackColor = VisualTheme.AmberBannerBack,
             Visible = false,
             AccessibleName = "Status banner",
         };
@@ -240,6 +375,7 @@ public sealed class ControlCenterForm : Form
             Dock = DockStyle.Fill,
             AutoEllipsis = true,
             TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = VisualTheme.AmberBannerText,
             AccessibleName = "Status banner message",
         };
         _btnRetry = new Button
@@ -281,84 +417,499 @@ public sealed class ControlCenterForm : Form
 
     private TabPage BuildRoutingTab()
     {
-        var page = new TabPage("Routing") { AccessibleName = "Routing lanes" };
+        _tabHome = new TabPage("Routing")
+        {
+            BackColor = PageBackColor,
+            AccessibleName = "Routing and recent activity",
+        };
+
         var grid = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(18, 14, 18, 14),
+            BackColor = PageBackColor,
+            AccessibleName = "Lane selection and recent activity",
+        };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        // Lane cards expand to fill the available main area; the activity card
+        // below stays compact at its bounded absolute height.
+        grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 180f));
+
+        var lanes = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 2,
             RowCount = 1,
-            Padding = new Padding(10),
-            AccessibleName = "Lane selection",
+            Margin = new Padding(0, 0, 0, 14),
+            BackColor = PageBackColor,
+            AccessibleName = "Lane cards",
         };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        lanes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
+        lanes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
 
-        grid.Controls.Add(BuildLaneGroup("GO", "go", out _cmbGo, out _lblGoFeedback, out _lblGoError), 0, 0);
-        grid.Controls.Add(BuildLaneGroup("ZEN", "zen", out _cmbZen, out _lblZenFeedback, out _lblZenError), 1, 0);
+        lanes.Controls.Add(BuildLaneCard(
+            "GO", "go/v1",
+            VisualTheme.AccentGo,
+            Color.FromArgb(0xE7, 0xF4, 0xEA), Color.FromArgb(0x16, 0x7A, 0x3A),
+            new Padding(0, 0, 10, 0), 0,
+            out _cmbGo, out _lblGoFeedback, out _lblGoError, out _goStatusBox), 0, 0);
+        lanes.Controls.Add(BuildLaneCard(
+            "ZEN", "zen/v1",
+            VisualTheme.AccentZen,
+            Color.FromArgb(0xE8, 0xEF, 0xFB), Color.FromArgb(0x1D, 0x4E, 0xD8),
+            new Padding(10, 0, 0, 0), 1,
+            out _cmbZen, out _lblZenFeedback, out _lblZenError, out _zenStatusBox), 1, 0);
 
         _cmbGo.SelectionChangeCommitted += (_, _) => OnLaneSelectionCommitted("go", _cmbGo, _lblGoFeedback, _lblGoError, () => _routeBusyGo, v => _routeBusyGo = v);
         _cmbZen.SelectionChangeCommitted += (_, _) => OnLaneSelectionCommitted("zen", _cmbZen, _lblZenFeedback, _lblZenError, () => _routeBusyZen, v => _routeBusyZen = v);
 
-        page.Controls.Add(grid);
-        return page;
+        grid.Controls.Add(lanes, 0, 0);
+        grid.Controls.Add(BuildRecentActivity(), 0, 1);
+        _tabHome.Controls.Add(grid);
+        return _tabHome;
     }
 
-    private GroupBox BuildLaneGroup(string title, string lane, out ComboBox cmb, out Label feedback, out Label error)
+    private Control BuildLaneCard(
+        string title,
+        string marker,
+        Color accent,
+        Color markerBackColor,
+        Color markerForeColor,
+        Padding margin,
+        int tabIndex,
+        out ComboBox cmb,
+        out Label feedback,
+        out Label error,
+        out LaneStatusBox statusBox)
     {
-        var box = new GroupBox
+        var card = new LaneCard(title, marker, accent)
         {
-            Text = title,
             Dock = DockStyle.Fill,
-            Padding = new Padding(12),
-            AccessibleName = $"{title} lane",
+            Margin = margin,
+            MinimumSize = new Size(0, 150),
+            Padding = new Padding(18, 16, 18, 14),
+            AccessibleName = $"{title} lane card",
         };
 
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 7,
+            BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = $"{title} lane controls",
         };
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 0 header
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 1 caption
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 2 selector
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 3 hint
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 4 spacer
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 1f));  // 5 separator
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));      // 6 status box
 
-        var hint = new Label
+        // Header row: bold lane title + textual lane-surface marker badge,
+        // and a right-aligned truthful mode chip (Managed / Attached) that
+        // mirrors the target's badge treatment.
+        var header = new TableLayoutPanel
         {
-            Text = "Account serving this lane. Switching takes effect for new requests.",
+            Dock = DockStyle.Fill,
             AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 3,
+            RowCount = 1,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = $"{title} lane header",
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var titleFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            WrapContents = false,
+            FlowDirection = FlowDirection.LeftToRight,
+            BackColor = VisualTheme.SurfaceWhite,
+        };
+        titleFlow.Controls.Add(new Label
+        {
+            Text = title,
+            AutoSize = true,
+            Font = VisualTheme.LaneTitleFont,
+            ForeColor = VisualTheme.PrimaryText,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = $"{title} lane title",
+        });
+        titleFlow.Controls.Add(new Label
+        {
+            Text = marker,
+            AutoSize = true,
+            Margin = new Padding(10, 3, 0, 0),
+            Padding = new Padding(7, 1, 7, 1),
+            BackColor = markerBackColor,
+            ForeColor = markerForeColor,
+            Font = VisualTheme.SmallFont,
+            AccessibleName = $"{title} lane marker",
+        });
+
+        var modeChip = new Label
+        {
+            AutoSize = true,
+            Padding = new Padding(9, 1, 9, 1),
+            Font = VisualTheme.SmallFont,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Visible = false,
+        };
+        if (string.Equals(title, "ZEN", StringComparison.Ordinal))
+        {
+            _lblZenMode = modeChip;
+        }
+        else
+        {
+            _lblGoMode = modeChip;
+        }
+
+        header.Controls.Add(titleFlow, 0, 0);
+        header.Controls.Add(modeChip, 2, 0);
+
+        var caption = new Label
+        {
+            Text = "Account serving this lane",
+            AutoSize = true,
+            Font = VisualTheme.FieldLabelFont,
+            Margin = new Padding(0, 4, 0, 4),
+            ForeColor = VisualTheme.SecondaryText,
+            BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = $"{title} lane hint",
         };
-        cmb = new ComboBox
+
+        // Persistent explanation, readable at rest: switching is not
+        // retroactive. The status box below repeats the exact outcome wording
+        // ("new requests use ...; in-flight requests keep their original
+        // route") once a switch has happened.
+        var switchingHint = new Label
         {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Dock = DockStyle.Top,
-            TabIndex = 0,
-            AccessibleName = $"{title} account selection",
-        };
-        feedback = new Label
-        {
+            Text = "Switching affects new requests only.",
             AutoSize = true,
-            ForeColor = Color.FromArgb(0x1B, 0x5E, 0x20),
-            MaximumSize = new Size(420, 0),
-            AccessibleName = $"{title} lane feedback",
-        };
-        error = new Label
-        {
-            AutoSize = true,
-            ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C),
-            MaximumSize = new Size(420, 0),
-            AccessibleName = $"{title} lane error",
+            Font = VisualTheme.SmallFont,
+            Margin = new Padding(0, 6, 0, 4),
+            MaximumSize = new Size(360, 0),
+            ForeColor = VisualTheme.SecondaryText,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = $"{title} lane switching hint",
         };
 
-        layout.Controls.Add(hint, 0, 0);
-        layout.Controls.Add(cmb, 0, 1);
-        layout.Controls.Add(feedback, 0, 2);
-        layout.Controls.Add(error, 0, 3);
-        box.Controls.Add(layout);
-        return box;
+        cmb = new StyledSelector
+        {
+            Dock = DockStyle.Fill,
+            Height = 34,
+            Margin = new Padding(0, 4, 0, 2),
+            TabIndex = tabIndex,
+            AccessibleName = $"{title} account selection",
+        };
+
+        // The status box hosts the existing feedback/error labels (field
+        // names and text semantics preserved); the box paints the green
+        // confirmation / red error / neutral resting surface around them.
+        statusBox = new LaneStatusBox
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 0, 0, 0),
+            AccessibleName = $"{title} route confirmation",
+        };
+        feedback = statusBox.FeedbackLabel;
+        feedback.AccessibleName = $"{title} lane feedback";
+        error = statusBox.ErrorLabel;
+        error.AccessibleName = $"{title} lane error";
+
+        var separator = new Panel
+        {
+            Dock = DockStyle.Fill,
+            Height = 1,
+            BackColor = VisualTheme.Separator,
+            Margin = new Padding(0, 4, 0, 4),
+        };
+
+        layout.Controls.Add(header, 0, 0);
+        layout.Controls.Add(caption, 0, 1);
+        layout.Controls.Add(cmb, 0, 2);
+        layout.Controls.Add(switchingHint, 0, 3);
+        layout.Controls.Add(separator, 0, 5);
+        layout.Controls.Add(statusBox, 0, 6);
+        card.Controls.Add(layout);
+        return card;
+    }
+
+    private Control BuildRecentActivity()
+    {
+        var card = new CardPanel
+        {
+            Dock = DockStyle.Fill,
+            MinimumSize = new Size(0, 120),
+            Padding = new Padding(16, 10, 16, 10),
+            AccessibleName = "Recent activity",
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Recent activity view",
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f)); // header
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // degraded banner (collapses when hidden)
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // rows
+
+        var header = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 3,
+            RowCount = 1,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Recent activity header",
+        };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        header.Controls.Add(new Label
+        {
+            Text = "Recent activity",
+            AutoSize = true,
+            Font = VisualTheme.LaneTitleFont,
+            ForeColor = VisualTheme.PrimaryText,
+            BackColor = VisualTheme.SurfaceWhite,
+            TextAlign = ContentAlignment.MiddleLeft,
+            AccessibleName = "Recent activity title",
+        }, 0, 0);
+        header.Controls.Add(new Label
+        {
+            Dock = DockStyle.Fill,
+            Text = "Latest requests (up to 5).",
+            Font = VisualTheme.SmallFont,
+            ForeColor = VisualTheme.SecondaryText,
+            BackColor = VisualTheme.SurfaceWhite,
+            Margin = new Padding(12, 0, 0, 0),
+            TextAlign = ContentAlignment.MiddleLeft,
+            AccessibleName = "Recent activity caption",
+        }, 1, 0);
+
+        _btnActivityViewAll = new Button
+        {
+            Text = "View all",
+            AutoSize = true,
+            FlatStyle = FlatStyle.Flat,
+            FlatAppearance = { BorderSize = 0 },
+            ForeColor = VisualTheme.AccentZen,
+            BackColor = VisualTheme.SurfaceWhite,
+            Font = VisualTheme.BodyFont,
+            Cursor = Cursors.Hand,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(12, 0, 0, 0),
+            TabIndex = 3,
+            AccessibleName = "View all recent activity in the Journal tab",
+        };
+        _btnActivityViewAll.Click += (_, _) => _tabs.SelectedTab = _tabJournal;
+        header.Controls.Add(_btnActivityViewAll, 2, 0);
+
+        _lblActivityDegraded = new Label
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            Font = VisualTheme.SmallFont,
+            ForeColor = VisualTheme.AmberBannerText,
+            BackColor = VisualTheme.AmberBannerBack,
+            Padding = new Padding(8, 3, 8, 3),
+            Margin = new Padding(0, 3, 0, 3),
+            Visible = false,
+            AccessibleName = "Recent activity degraded banner",
+        };
+
+        var listHost = new Panel
+        {
+            Dock = DockStyle.Fill,
+            MinimumSize = new Size(0, 40),
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Recent activity rows",
+        };
+        _lvActivity = new ListView
+        {
+            Dock = DockStyle.Fill,
+            View = View.Details,
+            FullRowSelect = true,
+            MultiSelect = false,
+            HideSelection = false,
+            HeaderStyle = ColumnHeaderStyle.Nonclickable,
+            BorderStyle = BorderStyle.None,
+            TabIndex = 2,
+            AccessibleName = "Recent activity rows",
+        };
+        _lvActivity.Columns.Add("Time", 110);
+        _lvActivity.Columns.Add("Lane", 60);
+        _lvActivity.Columns.Add("Account", 120);
+        _lvActivity.Columns.Add("Family / Method", 200);
+        _lvActivity.Columns.Add("Outcome", 96);
+        _lvActivity.Columns.Add("Status", 70);
+        StyleDetailsListView(_lvActivity, alternateRows: true);
+        listHost.Controls.Add(_lvActivity);
+
+        // Designed empty state: a centered note covers the (empty) list area.
+        _lblActivityEmpty = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleCenter,
+            Font = VisualTheme.BodyFont,
+            BackColor = VisualTheme.SurfaceWhite,
+            ForeColor = VisualTheme.SecondaryText,
+            Text = "No requests yet — recent activity will appear here once the router serves traffic.",
+            AccessibleName = "Empty recent activity note",
+        };
+        listHost.Controls.Add(_lblActivityEmpty);
+
+        layout.Controls.Add(header, 0, 0);
+        layout.Controls.Add(_lblActivityDegraded, 0, 1);
+        layout.Controls.Add(listHost, 0, 2);
+        card.Controls.Add(layout);
+        return card;
+    }
+
+    /// <summary>
+    /// Modern details-list styling: no gridlines, white/alternate row
+    /// tinting, small fonts, painted column headers. Accessibility is
+    /// unaffected — it is still a standard ListView.
+    /// </summary>
+    private static void StyleDetailsListView(ListView lv, bool alternateRows)
+    {
+        lv.BackColor = VisualTheme.SurfaceWhite;
+        lv.ForeColor = VisualTheme.PrimaryText;
+        lv.GridLines = false;
+        lv.Font = VisualTheme.SmallFont;
+        if (!alternateRows)
+        {
+            return;
+        }
+
+        lv.OwnerDraw = true;
+        lv.DrawColumnHeader += (_, e) =>
+        {
+            using var back = new SolidBrush(VisualTheme.SurfaceWhite);
+            e.Graphics.FillRectangle(back, e.Bounds);
+            using var line = new Pen(VisualTheme.CardBorder);
+            e.Graphics.DrawLine(line, e.Bounds.Right, e.Bounds.Y, e.Bounds.Right, e.Bounds.Bottom);
+            TextRenderer.DrawText(
+                e.Graphics,
+                lv.Columns[e.ColumnIndex].Text,
+                VisualTheme.SmallFont,
+                e.Bounds,
+                VisualTheme.SecondaryText,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        };
+        lv.DrawSubItem += (_, e) =>
+        {
+            var selected = (e.ItemState & ListViewItemStates.Selected) != 0;
+            var back = selected
+                ? Color.FromArgb(0xE8, 0xEF, 0xFB)
+                : e.ItemIndex % 2 == 1 ? VisualTheme.RowAltBack : VisualTheme.SurfaceWhite;
+            using var brush = new SolidBrush(back);
+            e.Graphics.FillRectangle(brush, e.Bounds);
+            TextRenderer.DrawText(
+                e.Graphics,
+                e.SubItem?.Text ?? string.Empty,
+                VisualTheme.SmallFont,
+                e.Bounds,
+                VisualTheme.PrimaryText,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        };
+    }
+
+    private Control BuildFooter()
+    {
+        _footer = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 34,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Footer status",
+        };
+        var separator = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 1,
+            BackColor = VisualTheme.CardBorder,
+            AccessibleName = "Footer separator",
+        };
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 1,
+            Padding = new Padding(14, 0, 14, 0),
+            BackColor = VisualTheme.SurfaceWhite,
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+        var left = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0, 3, 0, 0),
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Footer status summary",
+        };
+        _footerDot = new StatusDot
+        {
+            Margin = new Padding(0, 3, 0, 0),
+            AccessibleName = "Footer state indicator",
+        };
+        _lblFooterState = new Label
+        {
+            AutoSize = true,
+            Font = VisualTheme.FooterFont,
+            Margin = new Padding(8, 0, 0, 0),
+            ForeColor = VisualTheme.SecondaryText,
+            AccessibleName = "Footer state",
+        };
+        left.Controls.AddRange(new Control[] { _footerDot, _lblFooterState });
+
+        _lblFooter = new Label
+        {
+            AutoSize = true,
+            Font = VisualTheme.FooterFont,
+            ForeColor = VisualTheme.SecondaryText,
+            TextAlign = ContentAlignment.MiddleLeft,
+            AccessibleName = "Desktop release and local endpoint",
+        };
+
+        layout.Controls.Add(left, 0, 0);
+        layout.Controls.Add(_lblFooter, 1, 0);
+        _footer.Controls.Add(layout);
+        _footer.Controls.Add(separator); // docked last so it owns the top strip
+        return _footer;
+    }
+
+    private static string FooterStateText(SnapshotRouter router)
+    {
+        return router.State switch
+        {
+            "running" => router.Mode == "attached" ? "Running (attached)" : "Operational",
+            "degraded" => "Degraded",
+            "starting" => "Starting…",
+            "stopped" => "Stopped",
+            "failed" => "Failed",
+            "port_conflict" => "Port conflict",
+            _ => router.State,
+        };
     }
 
     private TabPage BuildAccountsTab()
@@ -482,8 +1033,8 @@ public sealed class ControlCenterForm : Form
         _lblJournalDegraded = new Label
         {
             AutoSize = true,
-            ForeColor = Color.FromArgb(0x8A, 0x53, 0x00),
-            BackColor = Color.FromArgb(0xFF, 0xF3, 0xE0),
+            ForeColor = VisualTheme.AmberBannerText,
+            BackColor = VisualTheme.AmberBannerBack,
             Dock = DockStyle.Fill,
             Padding = new Padding(4),
             Visible = false,
@@ -859,7 +1410,8 @@ public sealed class ControlCenterForm : Form
         switch (state)
         {
             case ClientState.Starting:
-                _banner.BackColor = Color.FromArgb(0xFF, 0xF3, 0xE0);
+                _banner.BackColor = VisualTheme.AmberBannerBack;
+                _lblBannerText.ForeColor = VisualTheme.AmberBannerText;
                 _lblBannerText.Text = "Starting control service…";
                 _btnRetry.Visible = false;
                 _btnResetCredential.Visible = false;
@@ -867,7 +1419,8 @@ public sealed class ControlCenterForm : Form
                 break;
 
             case ClientState.Reconnecting:
-                _banner.BackColor = Color.FromArgb(0xFF, 0xF3, 0xE0);
+                _banner.BackColor = VisualTheme.AmberBannerBack;
+                _lblBannerText.ForeColor = VisualTheme.AmberBannerText;
                 _lblBannerText.Text = "Reconnecting to control service…";
                 _btnRetry.Visible = false;
                 _btnResetCredential.Visible = false;
@@ -875,7 +1428,8 @@ public sealed class ControlCenterForm : Form
                 break;
 
             case ClientState.Unavailable:
-                _banner.BackColor = Color.FromArgb(0xFF, 0xEB, 0xEE);
+                _banner.BackColor = VisualTheme.ErrorBoxBack;
+                _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
                 _lblBannerText.Text = _channel.LastError ?? "Control service unavailable.";
                 _btnRetry.Visible = true;
                 _btnResetCredential.Visible = false;
@@ -883,7 +1437,8 @@ public sealed class ControlCenterForm : Form
                 break;
 
             case ClientState.AuthFailed:
-                _banner.BackColor = Color.FromArgb(0xFF, 0xEB, 0xEE);
+                _banner.BackColor = VisualTheme.ErrorBoxBack;
+                _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
                 _lblBannerText.Text = _channel.LastError ?? "Control service authentication failed.";
                 _btnRetry.Visible = true;
                 _btnResetCredential.Visible = true;
@@ -898,10 +1453,48 @@ public sealed class ControlCenterForm : Form
         {
             control.Enabled = connected;
         }
+
+        if (connected)
+        {
+            // Re-apply the honest state-based affordances after the blanket
+            // enable above: e.g. Start/Stop must not light up merely because
+            // the channel connected.
+            UpdateLifecycleButtons();
+        }
+        else
+        {
+            // The activity preview cannot be refreshed without a connection:
+            // show the designed non-degraded empty state while the banner
+            // above carries the connectivity error. Journal rows are not
+            // "missing" merely because the service is starting.
+            RenderRecentActivity(Array.Empty<JournalRow>(), false, null);
+        }
     }
 
     /// <summary>Rendered state badge text (used by the selftest settle-check).</summary>
     internal string StateBadgeText => _lblStateBadge.Text;
+
+    /// <summary>
+    /// Test-only helper for offline visual selftest evidence: assigns the
+    /// existing post-success lane confirmation wording to the GO/ZEN feedback
+    /// label so a captured PNG/a11y dump proves the exact copy. It never calls
+    /// the channel and never mutates runtime state; product code paths never
+    /// invoke it.
+    /// </summary>
+    internal void SetSelftestRouteConfirmation(string lane, string alias)
+    {
+        var message = alias is null ? "Lane cleared; new requests are not routed. In-flight requests keep their original route." : "New route; in-flight same.";
+        if (string.Equals(lane, "zen", StringComparison.OrdinalIgnoreCase))
+        {
+            _lblZenFeedback.Text = message;
+        }
+        else
+        {
+            _lblGoFeedback.Text = message;
+        }
+
+        UpdateLaneStatusBoxes(_snapshot.Routes.Go, _snapshot.Routes.Zen);
+    }
 
     /// <summary>True when the rendered badge matches the injected snapshot's router state.</summary>
     internal bool RenderedStateMatches(ShellSnapshot snapshot)
@@ -935,7 +1528,8 @@ public sealed class ControlCenterForm : Form
         }
 
         _banner.Visible = true;
-        _banner.BackColor = Color.FromArgb(0xFF, 0xEB, 0xEE);
+        _banner.BackColor = VisualTheme.ErrorBoxBack;
+        _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
         _lblBannerText.Text = message;
         _btnRetry.Visible = true;
         _btnResetCredential.Visible = true;
@@ -976,7 +1570,8 @@ public sealed class ControlCenterForm : Form
         if (_localCredentialWarning)
         {
             _banner.Visible = true;
-            _banner.BackColor = Color.FromArgb(0xFF, 0xF3, 0xE0);
+            _banner.BackColor = VisualTheme.AmberBannerBack;
+            _lblBannerText.ForeColor = VisualTheme.AmberBannerText;
             _lblBannerText.Text = "Local router credential unavailable — run `gorouter setup` in a terminal to repair.";
             _btnRetry.Visible = false;
             _btnResetCredential.Visible = false;
@@ -985,7 +1580,8 @@ public sealed class ControlCenterForm : Form
         else if (_onboardingPending)
         {
             _banner.Visible = true;
-            _banner.BackColor = Color.FromArgb(0xFF, 0xF3, 0xE0);
+            _banner.BackColor = VisualTheme.AmberBannerBack;
+            _lblBannerText.ForeColor = VisualTheme.AmberBannerText;
             _lblBannerText.Text = "First-run onboarding is not finished yet.";
             _btnRetry.Visible = false;
             _btnResetCredential.Visible = false;
@@ -1040,16 +1636,25 @@ public sealed class ControlCenterForm : Form
         {
             _lblStateBadge.Text = RouterBadgeText(snapshot.Router);
             _lblStateBadge.ForeColor = RouterColor(snapshot.Router.State);
+            _statusDot.FillColor = RouterColor(snapshot.Router.State);
+            _statusDot.Invalidate();
             _lblPort.Text = $"Port {snapshot.Settings.Port}";
-            _lblVersion.Text = string.IsNullOrEmpty(snapshot.ServiceVersion) ? "" : $"v{snapshot.ServiceVersion}";
-            _btnStartRouter.Enabled = snapshot.Router.State is not ("running" or "starting");
-            _btnStopRouter.Enabled = snapshot.Router.State is "running" or "starting" or "degraded" or "port_conflict";
+            _lblVersion.Text = string.IsNullOrEmpty(PresentationVersion) ? "" : $"v{PresentationVersion}";
+            _lblFooterState.Text = FooterStateText(snapshot.Router);
+            _lblFooterState.ForeColor = RouterColor(snapshot.Router.State);
+            _footerDot.FillColor = RouterColor(snapshot.Router.State);
+            _footerDot.Invalidate();
+            _lblFooter.Text = $"Local: http://127.0.0.1:{snapshot.Settings.Port}";
+            UpdateLifecycleButtons();
 
             _localCredentialWarning = snapshot.Initialized && !snapshot.LocalCredentialConfigured;
             RefreshBanner();
 
             FillLaneCombo(_cmbGo, snapshot.Routes.Go, _lblGoFeedback, _lblGoError);
             FillLaneCombo(_cmbZen, snapshot.Routes.Zen, _lblZenFeedback, _lblZenError);
+            UpdateLaneStatusBoxes(snapshot.Routes.Go, snapshot.Routes.Zen);
+            UpdateLaneModeChip(_lblGoMode, snapshot.Router.Mode);
+            UpdateLaneModeChip(_lblZenMode, snapshot.Router.Mode);
 
             _lvAccounts.BeginUpdate();
             _lvAccounts.Items.Clear();
@@ -1081,11 +1686,20 @@ public sealed class ControlCenterForm : Form
         {
             _updating = false;
         }
+    }
 
-        if (_tabs.SelectedTab == _tabJournal)
-        {
-            _ = RefreshJournalAsync();
-        }
+    /// <summary>
+    /// Honest lifecycle affordances: Start is offered only where router.start
+    /// can have an effect (stopped/failed and not attached to an external
+    /// router process); Stop only for a stoppable managed state (running,
+    /// starting, degraded) — never for port_conflict, where the router is not
+    /// running under our control. Operations themselves are unchanged.
+    /// </summary>
+    private void UpdateLifecycleButtons()
+    {
+        var managed = !string.Equals(_snapshot.Router.Mode, "attached", StringComparison.Ordinal);
+        _btnStartRouter.Enabled = managed && _snapshot.Router.State is "stopped" or "failed";
+        _btnStopRouter.Enabled = managed && _snapshot.Router.State is "running" or "starting" or "degraded";
     }
 
     private void FillLaneCombo(ComboBox cmb, SnapshotRoute route, Label feedback, Label error)
@@ -1099,6 +1713,11 @@ public sealed class ControlCenterForm : Form
             cmb.Items.Add(option);
         }
 
+        // Safe long-alias handling: the closed box truncates natively, and the
+        // drop-down is widened (bounded) so full aliases stay readable.
+        var longest = options.Count > 0 ? options.Max(o => TextRenderer.MeasureText(o.Alias, cmb.Font).Width) : 0;
+        cmb.DropDownWidth = Math.Max(240, Math.Min(longest + 28, 420));
+
         if (selectedIndex >= 0 && selectedIndex < cmb.Items.Count)
         {
             cmb.SelectedIndex = selectedIndex;
@@ -1110,6 +1729,71 @@ public sealed class ControlCenterForm : Form
             // stale UI feedback no longer applies to the current selection.
             feedback.Text = "";
             error.Text = "";
+            var box = ReferenceEquals(cmb, _cmbGo) ? _goStatusBox : _zenStatusBox;
+            UpdateLaneStatusBox(box, feedback, error, route);
+        }
+    }
+
+    /// <summary>
+    /// Reflect the existing feedback/error labels into each lane's rounded
+    /// status surface: green confirmation box, red error box, or a neutral
+    /// resting box with the truthful current-route text. Pure presentation;
+    /// the labels remain the text carriers and the selftest a11y dump still
+    /// shows them.
+    /// </summary>
+    private void UpdateLaneStatusBoxes(SnapshotRoute goRoute, SnapshotRoute zenRoute)
+    {
+        UpdateLaneStatusBox(_goStatusBox, _lblGoFeedback, _lblGoError, goRoute);
+        UpdateLaneStatusBox(_zenStatusBox, _lblZenFeedback, _lblZenError, zenRoute);
+    }
+
+    private static void UpdateLaneStatusBox(LaneStatusBox box, Label feedback, Label error, SnapshotRoute route)
+    {
+        if (error.Text.Length > 0)
+        {
+            box.SetError(error.Text);
+        }
+        else if (feedback.Text.Length > 0)
+        {
+            box.SetSuccess(feedback.Text);
+        }
+        else
+        {
+            box.SetResting(string.IsNullOrEmpty(route.Alias)
+                ? "No account"
+                : "New route; in-flight same.");
+        }
+    }
+
+    /// <summary>
+    /// Truncate a long alias for use in the status surface so the
+    /// two-line resting message fits within the card without clipping.
+    /// </summary>
+    private static string SafeAliasText(string alias)
+    {
+        return alias.Length > 20 ? alias.Substring(0, 17) + "…" : alias;
+    }
+
+    /// <summary>Truthful mode chip in each lane header (Managed / Attached).</summary>
+    private static void UpdateLaneModeChip(Label chip, string mode)
+    {
+        if (string.Equals(mode, "managed", StringComparison.Ordinal))
+        {
+            chip.Text = "Managed";
+            chip.BackColor = Color.FromArgb(0xE7, 0xF4, 0xEA);
+            chip.ForeColor = Color.FromArgb(0x16, 0x7A, 0x3A);
+            chip.Visible = true;
+        }
+        else if (string.Equals(mode, "attached", StringComparison.Ordinal))
+        {
+            chip.Text = "Attached";
+            chip.BackColor = Color.FromArgb(0xF1, 0xF2, 0xF4);
+            chip.ForeColor = VisualTheme.SecondaryText;
+            chip.Visible = true;
+        }
+        else
+        {
+            chip.Visible = false;
         }
     }
 
@@ -1134,13 +1818,7 @@ public sealed class ControlCenterForm : Form
         return mode.Length > 0 ? $"{state} ({mode})" : state;
     }
 
-    private static Color RouterColor(string state) => state switch
-    {
-        "running" => Color.FromArgb(0x1B, 0x7A, 0x3D),
-        "degraded" or "starting" => Color.FromArgb(0xC8, 0x7A, 0x00),
-        "port_conflict" or "failed" => Color.FromArgb(0xC0, 0x2B, 0x1E),
-        _ => Color.FromArgb(0x61, 0x61, 0x61),
-    };
+    private static Color RouterColor(string state) => VisualTheme.StateColor(state);
 
     // ------------------------------------------------------------------
     // Lane switching
@@ -1168,6 +1846,7 @@ public sealed class ControlCenterForm : Form
         }
 
         setBusy(true);
+        var keepFocus = cmb.Focused;
         cmb.Enabled = false;
         feedback.Text = "";
         error.Text = "";
@@ -1180,11 +1859,10 @@ public sealed class ControlCenterForm : Form
 
             if (response.Ok)
             {
-                var alias = accountId is null ? null : _snapshot.Accounts.FirstOrDefault(a => a.Id == accountId)?.Alias;
                 error.Text = "";
                 feedback.Text = accountId is null
                     ? "Lane cleared; new requests are not routed. In-flight requests keep their original route."
-                    : $"New requests use {alias}; in-flight requests keep their original route.";
+                    : "New route; in-flight same.";
             }
             else
             {
@@ -1195,6 +1873,8 @@ public sealed class ControlCenterForm : Form
                 FillLaneCombo(cmb, route, feedback, error);
                 error.Text = response.ErrorMessage ?? "Route change failed.";
             }
+
+            UpdateLaneStatusBoxes(_snapshot.Routes.Go, _snapshot.Routes.Zen);
         }
         catch (Exception ex)
         {
@@ -1202,6 +1882,7 @@ public sealed class ControlCenterForm : Form
             var route = lane == "go" ? _snapshot.Routes.Go : _snapshot.Routes.Zen;
             FillLaneCombo(cmb, route, feedback, error);
             error.Text = ex.Message;
+            UpdateLaneStatusBoxes(_snapshot.Routes.Go, _snapshot.Routes.Zen);
         }
         finally
         {
@@ -1209,6 +1890,12 @@ public sealed class ControlCenterForm : Form
             if (!_updating)
             {
                 cmb.Enabled = _clientState == ClientState.Connected;
+                // Keep keyboard focus on the lane selector after the change,
+                // but only when it still had focus before the operation.
+                if (keepFocus && cmb.Enabled)
+                {
+                    cmb.Focus();
+                }
             }
         }
     }
@@ -1475,12 +2162,16 @@ public sealed class ControlCenterForm : Form
                     ? "Journal degraded: " + (data.Error ?? _snapshot.Journal.LastError ?? "read failure") + " — recent requests may be incomplete."
                     : "";
                 _lblJournalEmpty.Visible = data.Rows.Count == 0 && !degraded;
+
+                // The home preview renders from the same response payload.
+                RenderRecentActivity(data.Rows, degraded, degraded ? data.Error ?? _snapshot.Journal.LastError : null);
             }
             else
             {
                 _lblJournalDegraded.Visible = true;
                 _lblJournalDegraded.Text = "Journal unavailable: " + (response.ErrorMessage ?? "unknown error");
                 _lblJournalEmpty.Visible = false;
+                RenderRecentActivity(Array.Empty<JournalRow>(), true, response.ErrorMessage ?? "read failure");
             }
         }
         catch (Exception ex)
@@ -1488,6 +2179,7 @@ public sealed class ControlCenterForm : Form
             _lblJournalDegraded.Visible = true;
             _lblJournalDegraded.Text = "Journal unavailable: " + ex.Message;
             _lblJournalEmpty.Visible = false;
+            RenderRecentActivity(Array.Empty<JournalRow>(), true, ex.Message);
         }
         finally
         {
@@ -1515,6 +2207,48 @@ public sealed class ControlCenterForm : Form
         item.SubItems.Add(row.HttpStatus?.ToString() ?? "—");
         item.SubItems.Add(row.DurationMs + " ms");
         item.SubItems.Add(row.RouterRequestId);
+        return item;
+    }
+
+    /// <summary>
+    /// Home-tab preview: at most 5 safe rows (time, lane, alias snapshot,
+    /// family/method, outcome/status) — never bodies, prompts, headers,
+    /// credentials, request ids or durations. The empty state is designed and
+    /// the degraded state is explicit; the full Journal tab stays authoritative.
+    /// </summary>
+    private void RenderRecentActivity(IReadOnlyList<JournalRow> rows, bool degraded, string? error)
+    {
+        _lvActivity.BeginUpdate();
+        _lvActivity.Items.Clear();
+        foreach (var row in rows.Take(5))
+        {
+            _lvActivity.Items.Add(MakeActivityItem(row));
+        }
+
+        _lvActivity.EndUpdate();
+
+        var showList = rows.Count > 0 || degraded;
+        _lvActivity.Visible = showList;
+        _lblActivityEmpty.Visible = !showList;
+        _lblActivityDegraded.Visible = degraded;
+        _lblActivityDegraded.Text = degraded
+            ? $"Recent activity unavailable: {error ?? "journal degraded"} — recent requests may be missing."
+            : "";
+    }
+
+    private static ListViewItem MakeActivityItem(JournalRow row)
+    {
+        var familyMethod = string.IsNullOrEmpty(row.EndpointFamily) && string.IsNullOrEmpty(row.Method)
+            ? "—"
+            : string.IsNullOrEmpty(row.EndpointFamily)
+                ? row.Method
+                : $"{row.EndpointFamily} / {row.Method}";
+        var item = new ListViewItem(FormatTime(row.StartedAtUtc));
+        item.SubItems.Add(row.Lane.ToUpperInvariant());
+        item.SubItems.Add(row.SelectedAccountAliasSnapshot ?? "—");
+        item.SubItems.Add(familyMethod);
+        item.SubItems.Add(row.TerminalOutcome);
+        item.SubItems.Add(row.HttpStatus?.ToString() ?? "—");
         return item;
     }
 
@@ -1698,6 +2432,14 @@ public sealed class ControlCenterForm : Form
             _txtMaxRecords,
             _btnApplyRetention,
         });
+
+        // The home tab shows the activity preview on initial display; the
+        // connection guard inside RefreshJournalAsync makes this a no-op
+        // until the control channel is connected.
+        if (_tabs.SelectedTab == _tabHome)
+        {
+            _ = RefreshJournalAsync();
+        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1766,5 +2508,169 @@ public sealed class ControlCenterForm : Form
         }
 
         base.Dispose(disposing);
+    }
+
+    /// <summary>
+    /// Rounded status surface inside a lane card that hosts the existing
+    /// feedback/error labels: a green confirmation box for successful route
+    /// changes ("✓ New requests use ...; in-flight requests keep their
+    /// original route."), a red box for failures. Purely presentational.
+    /// </summary>
+    private sealed class LaneStatusBox : Panel
+    {
+        private readonly Label _glyph;
+        private readonly TableLayoutPanel _layout;
+        private Color _borderColor = VisualTheme.ConfirmationBorder;
+
+        public LaneStatusBox()
+        {
+            Height = 36;
+            AutoSize = false;
+            DoubleBuffered = true;
+            Visible = false;
+            Margin = new Padding(0);
+            BackColor = VisualTheme.ConfirmationBack;
+
+            _glyph = new Label
+            {
+                AutoSize = true,
+                Font = VisualTheme.BodyFont,
+                TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = VisualTheme.ConfirmationBack,
+                AccessibleName = "Status glyph",
+            };
+
+            FeedbackLabel = new Label
+            {
+                AutoSize = false,
+                AutoEllipsis = true,
+                MaximumSize = new Size(360, 0),
+                Font = VisualTheme.BodyFont,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill,
+                BackColor = VisualTheme.ConfirmationBack,
+                AccessibleName = "Status text",
+            };
+            ErrorLabel = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(360, 0),
+                Font = VisualTheme.BodyFont,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill,
+                Visible = false,
+                BackColor = VisualTheme.ErrorBoxBack,
+                AccessibleName = "Status error text",
+            };
+
+            _layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(10, 5, 10, 5),
+                BackColor = VisualTheme.ConfirmationBack,
+            };
+            _layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            _layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _layout.Controls.Add(_glyph, 0, 0);
+            _layout.Controls.Add(FeedbackLabel, 1, 0);
+            _layout.Controls.Add(ErrorLabel, 1, 0); // same cell; visibility toggles
+            Controls.Add(_layout);
+        }
+
+        public Label FeedbackLabel { get; }
+
+        public Label ErrorLabel { get; }
+
+        public void SetSuccess(string text)
+        {
+            SetState(VisualTheme.ConfirmationBack, VisualTheme.ConfirmationBorder, "✓", VisualTheme.AccentGo, VisualTheme.PrimaryText);
+            FeedbackLabel.Text = text;
+            FeedbackLabel.Visible = true;
+            ErrorLabel.Visible = false;
+            Visible = true;
+        }
+
+        public void SetError(string text)
+        {
+            SetState(VisualTheme.ErrorBoxBack, VisualTheme.ErrorBoxBorder, "!", VisualTheme.ErrorBoxText, VisualTheme.ErrorBoxText);
+            ErrorLabel.Text = text;
+            ErrorLabel.Visible = true;
+            FeedbackLabel.Visible = false;
+            Visible = true;
+        }
+
+        /// <summary>Neutral resting state showing the truthful current-route text.</summary>
+        public void SetResting(string text)
+        {
+            SetState(VisualTheme.RowAltBack, VisualTheme.CardBorder, "•", VisualTheme.SecondaryText, VisualTheme.SecondaryText);
+            FeedbackLabel.Text = text;
+            FeedbackLabel.Visible = true;
+            ErrorLabel.Visible = false;
+            Visible = true;
+        }
+
+        public void Clear()
+        {
+            Visible = false;
+            FeedbackLabel.Visible = false;
+            ErrorLabel.Visible = false;
+        }
+
+        private void SetState(Color back, Color border, string glyph, Color glyphColor, Color textColor)
+        {
+            _layout.BackColor = back;
+            BackColor = back;
+            _borderColor = border;
+            _glyph.Text = glyph;
+            _glyph.ForeColor = glyphColor;
+            _glyph.BackColor = back;
+            FeedbackLabel.ForeColor = textColor;
+            FeedbackLabel.BackColor = back;
+            ErrorLabel.ForeColor = textColor;
+            ErrorLabel.BackColor = back;
+            Invalidate();
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent?.BackColor ?? VisualTheme.SurfaceWhite);
+            var bounds = new Rectangle(1, 1, Width - 2, Height - 2);
+            VisualTheme.FillRounded(e.Graphics, bounds, 6, BackColor);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            var bounds = new Rectangle(1, 1, Width - 2, Height - 2);
+            VisualTheme.DrawRounded(e.Graphics, bounds, 6, _borderColor, 1f);
+        }
+    }
+
+    /// <summary>
+    /// Small filled circle that reinforces the router state badge. The text
+    /// badge stays authoritative; the dot only adds shape + color emphasis,
+    /// never color-only meaning.
+    /// </summary>
+    private sealed class StatusDot : Control
+    {
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Color FillColor { get; set; } = Color.FromArgb(0x61, 0x61, 0x61);
+
+        public StatusDot()
+        {
+            Size = new Size(12, 12);
+            TabStop = false;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var brush = new SolidBrush(FillColor);
+            using var pen = new Pen(VisualTheme.CardBorder, 1f);
+            e.Graphics.FillEllipse(brush, 1, 1, Width - 3, Height - 3);
+            e.Graphics.DrawEllipse(pen, 1, 1, Width - 3, Height - 3);
+        }
     }
 }

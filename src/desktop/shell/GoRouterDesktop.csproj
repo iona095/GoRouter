@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <AssemblyName>GoRouterDesktop</AssemblyName>
-    <Version>1.5.0</Version>
+    <Version>1.5.1</Version>
     <RootNamespace>GoRouterDesktop</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
