@@ -1,4 +1,4 @@
-﻿using System.Drawing.Imaging;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -19,6 +19,13 @@ internal static class Selftest
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    private const uint WM_KEYDOWN = 0x0100;
+    private const int VK_ESCAPE = 0x1B;
 
     /// <summary>Captures the real rendered window content (children included).</summary>
     private static Bitmap CaptureWindow(Form form)
@@ -125,6 +132,11 @@ internal static class Selftest
                 // Handled after form creation
                 continue;
             }
+            if (args[i] == "--nav-test")
+            {
+                // Handled after form creation
+                continue;
+            }
             if (args[i].StartsWith("--", StringComparison.Ordinal))
             {
                 return Fail($"Unknown option: {args[i]}", args);
@@ -136,7 +148,7 @@ internal static class Selftest
         if (positional.Count != 1)
         {
             return Fail(
-                "Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>]",
+                "Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--client-size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>] [--transition-test] [--nav-test]",
                 args);
         }
 
@@ -165,12 +177,24 @@ internal static class Selftest
         var pngPath = Path.Combine(outDir, outputName + ".png");
         var a11yPath = Path.Combine(outDir, outputName + ".a11y.txt");
 
+        var stub = new StubChannel(snapshot, state);
         Form form = state switch
         {
             "confirm" => new ConfirmDialog("Remove account", "Remove account 'demo' and its stored credential? The lane selection will be cleared.", "Remove account"),
-            "firstrun" => new FirstRunFlow(new StubChannel(snapshot, state), snapshot),
-            _ => new ControlCenterForm(new StubChannel(snapshot, state)),
+            "firstrun" => new FirstRunFlow(stub, snapshot),
+            _ => new ControlCenterForm(stub),
         };
+
+        var screenCapture = Environment.GetEnvironmentVariable("GOROUTER_SELFTEST_SCREEN_CAPTURE") == "1";
+        if (screenCapture)
+        {
+            // Ground-truth evidence path: place the window deterministically in
+            // the primary work area BEFORE Show, so CopyFromScreen can grab the
+            // real composited pixels (PrintWindow renders owner-drawn tab
+            // strips and nested table layouts unreliably).
+            form.StartPosition = FormStartPosition.Manual;
+            form.Location = new Point(40, 40);
+        }
 
         if (requestedSize is { } size)
         {
@@ -236,6 +260,11 @@ internal static class Selftest
                 }
             }
 
+            if (args.Contains("--nav-test") && form is ControlCenterForm navCcf)
+            {
+                return RunNavigationTest(outDir, navCcf, stub, dpiScale is not null);
+            }
+
             if (args.Contains("--transition-test") && form is ControlCenterForm ccf)
             {
                 return RunTransitionTest(outDir, ccf);
@@ -294,7 +323,7 @@ internal static class Selftest
     private static int Fail(string message, string[] args)
     {
         Console.Error.WriteLine(message);
-        Console.Error.WriteLine("Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>]");
+        Console.Error.WriteLine("Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--client-size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>] [--transition-test] [--nav-test]");
         return 1;
     }
 
@@ -666,6 +695,379 @@ internal static class Selftest
         return failures.Count == 0 ? 0 : 1;
     }
 
+    /// <summary>
+    /// Durable regression for the V1.5.2 journal Back-navigation defect:
+    /// Dashboard → View All → Back cycles (including the Refresh leg and a
+    /// narrow-width leg), GO/ZEN selection and router-state preservation,
+    /// zero control-channel calls on Back, Escape keyboard navigation
+    /// (without closing the window), and duplicate/orphan control checks.
+    /// Writes nav-summary.txt plus the canonical visual evidence captures
+    /// (dashboard-before / journal-view / dashboard-after-back /
+    /// journal-narrow; under --dpi-scale, journal-dpi150 instead).
+    /// </summary>
+    private static int RunNavigationTest(string outDir, ControlCenterForm ccfForm, StubChannel channel, bool dpiOnly)
+    {
+        var results = new List<string>();
+        var failures = new List<string>();
+
+        void Check(bool condition, string message)
+        {
+            if (!condition)
+                failures.Add(message);
+            results.Add(condition ? "  PASS: " + message : "  FAIL: " + message);
+        }
+
+        void Log(string msg) => results.Add("  " + msg);
+
+        var form = ccfForm.FindForm() ?? throw new InvalidOperationException("Form not found");
+        results.Add(dpiOnly ? "=== NAVIGATION TEST (150% DPI) ===" : "=== NAVIGATION TEST ===");
+        results.Add("");
+
+        Control? ByName(string name) => FindAllControls(ccfForm, name).FirstOrDefault();
+        List<Control> AllByName(string name) => FindAllControls(ccfForm, name);
+        bool DashboardActive() => ccfForm.CurrentView == ControlCenterForm.ViewTarget.Dashboard;
+        bool JournalActive() => ccfForm.CurrentView == ControlCenterForm.ViewTarget.Journal;
+
+        string? GoAlias() => (ByName("GO account selection") as ComboBox)?.SelectedItem is AccountOption go ? go.Alias : null;
+        string? ZenAlias() => (ByName("ZEN account selection") as ComboBox)?.SelectedItem is AccountOption zen ? zen.Alias : null;
+        string RouterBadge() => ByName("Router state")?.Text ?? "";
+        string PortText() => ByName("Router port")?.Text ?? "";
+
+        void PumpSettle()
+        {
+            Application.DoEvents();
+            Thread.Sleep(40);
+            Application.DoEvents();
+        }
+
+        // Layout passes in WinForms are lazy and can take several pump cycles
+        // after a resize/tab switch; captures before the layout settles render
+        // half-laid-out controls (e.g. a header row whose buttons have not
+        // been positioned yet). Always settle a few cycles before capturing.
+        void SettleLayout()
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                PumpSettle();
+            }
+        }
+
+        void WaitForJournalRows()
+        {
+            // Always pump at least one full cycle even when rows already exist,
+            // so the journal page layout settles after the tab switch.
+            PumpSettle();
+            for (var i = 0; i < 60; i++)
+            {
+                if (ByName("Recent requests") is ListView lv && lv.Items.Count > 0)
+                {
+                    return;
+                }
+
+                Application.DoEvents();
+                Thread.Sleep(50);
+            }
+        }
+
+        void Click(string accessibleName)
+        {
+            var ctrl = ByName(accessibleName);
+            if (ctrl is Button b)
+            {
+                b.PerformClick();
+            }
+            else
+            {
+                failures.Add($"cannot click '{accessibleName}': control not found or not a Button");
+                results.Add("  FAIL: cannot click '" + accessibleName + "'");
+            }
+
+            PumpSettle();
+        }
+
+        void Capture(string name)
+        {
+            SettleLayout();
+            form.Refresh();
+            PumpSettle();
+            // Capture-time layout state: the render must match these bounds.
+            var hdrAt = ByName("Journal header");
+            var backAt = ByName("Back to account selection");
+            var listAt = ByName("Recent requests");
+            if (hdrAt != null || backAt != null || listAt != null)
+            {
+                Log($"capture-state: header={hdrAt?.Bounds.ToString() ?? "-"} back={backAt?.Bounds.ToString() ?? "-"} list={listAt?.Bounds.ToString() ?? "-"}");
+            }
+
+            using var bitmap = CaptureEvidenceBitmap(form);
+            bitmap.Save(Path.Combine(outDir, name + ".png"), ImageFormat.Png);
+            var sb = new StringBuilder();
+            DumpAccessibility(form, sb, 0);
+            File.WriteAllText(Path.Combine(outDir, name + ".a11y.txt"), sb.ToString(), new UTF8Encoding(false));
+            Log($"captured {name}.png");
+        }
+
+        /// <summary>
+        /// Default evidence path: PrintWindow(PW_RENDERFULLCONTENT) like all
+        /// other selftest states. When GOROUTER_SELFTEST_SCREEN_CAPTURE=1,
+        /// capture the REAL composited screen pixels instead: the window is
+        /// activated and its client area is copied from the screen.
+        /// PrintWindow's WM_PRINT pass renders owner-drawn tab strips and
+        /// nested table layouts unreliably (missing strip, shifted/missing
+        /// header rows), so the screen path is the ground-truth render used
+        /// for navigation evidence.
+        /// </summary>
+        static Bitmap CaptureEvidenceBitmap(Form f)
+        {
+            if (Environment.GetEnvironmentVariable("GOROUTER_SELFTEST_SCREEN_CAPTURE") != "1")
+            {
+                return CaptureWindow(f);
+            }
+
+            f.BringToFront();
+            f.Activate();
+            Application.DoEvents();
+            Thread.Sleep(120);
+            Application.DoEvents();
+
+            var origin = f.PointToScreen(Point.Empty);
+            var bmp = new Bitmap(f.ClientSize.Width, f.ClientSize.Height);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.CopyFromScreen(origin, Point.Empty, f.ClientSize);
+            }
+
+            return bmp;
+        }
+
+        void AssertInventory()
+        {
+            var required = new[]
+            {
+                "GO account selection",
+                "ZEN account selection",
+                "View all recent activity in the Journal tab",
+                "Back to account selection",
+                "Refresh journal",
+                "Recent requests",
+                "Routing and recent activity",
+                "Request journal",
+            };
+            foreach (var name in required)
+            {
+                var all = AllByName(name);
+                Check(all.Count == 1, $"{name} present exactly once ({all.Count})");
+                var ctrl = all.FirstOrDefault();
+                if (ctrl != null)
+                {
+                    Check(ctrl.Parent != null, $"{name} has parent");
+                    Check(!string.IsNullOrEmpty(ctrl.AccessibleName), $"{name} has accessible name");
+                }
+            }
+
+            var unparented = 0;
+            void Walk(Control c)
+            {
+                if (c != ccfForm && c.Parent == null) unparented++;
+                foreach (Control child in c.Controls) Walk(child);
+            }
+            Walk(ccfForm);
+            Check(unparented == 0, $"unparented controls={unparented}");
+        }
+
+        var goBefore = GoAlias();
+        var zenBefore = ZenAlias();
+        var badgeBefore = RouterBadge();
+        var portBefore = PortText();
+
+        void AssertDashboard(string label)
+        {
+            Check(DashboardActive(), $"{label}: dashboard view active");
+            Check(!JournalActive(), $"{label}: journal view not active");
+            Check(ByName("Routing and recent activity") is { Visible: true }, $"{label}: dashboard page visible");
+            Check(ByName("Request journal") is { Visible: false }, $"{label}: journal page not visible");
+            Check(ByName("Back to account selection") is not { Visible: true }, $"{label}: Back not visible on dashboard");
+            Check(ByName("GO account selection") is { Visible: true }, $"{label}: GO selector visible");
+            Check(ByName("ZEN account selection") is { Visible: true }, $"{label}: ZEN selector visible");
+            Check(string.Equals(GoAlias(), goBefore, StringComparison.Ordinal), $"{label}: GO selection preserved ('{GoAlias()}')");
+            Check(string.Equals(ZenAlias(), zenBefore, StringComparison.Ordinal), $"{label}: ZEN selection preserved ('{ZenAlias()}')");
+            Check(string.Equals(RouterBadge(), badgeBefore, StringComparison.Ordinal), $"{label}: router state badge unchanged ('{RouterBadge()}')");
+            Check(string.Equals(PortText(), portBefore, StringComparison.Ordinal), $"{label}: port label unchanged ('{PortText()}')");
+        }
+
+        void AssertJournal(string label)
+        {
+            Check(JournalActive(), $"{label}: journal view active");
+            Check(!DashboardActive(), $"{label}: dashboard view not active");
+            Check(ByName("Request journal") is { Visible: true }, $"{label}: journal page visible");
+            Check(ByName("Routing and recent activity") is { Visible: false }, $"{label}: dashboard page not visible (account cards not active)");
+            Check(ByName("Back to account selection") is { Visible: true, Enabled: true }, $"{label}: Back visible and enabled");
+            Check(ByName("GO account selection") is not { Visible: true }, $"{label}: GO card not active in journal view");
+            Check(ByName("ZEN account selection") is not { Visible: true }, $"{label}: ZEN card not active in journal view");
+
+            // Layout containment: the buttons must FIT inside the journal
+            // header (an overflowing header row clips the labels under the
+            // list view — the AutoSize/Dock circular-sizing trap).
+            if (ByName("Journal header") is { } hdr && ByName("Back to account selection") is Button bBtn && ByName("Refresh journal") is Button rBtn)
+            {
+                Check(hdr.Height > 0 && bBtn.Bounds.Height > 0 && bBtn.Bounds.Height <= hdr.Height,
+                    $"{label}: Back height {bBtn.Bounds.Height} fits within journal header height {hdr.Height}");
+                Check(rBtn.Bounds.Height <= hdr.Height,
+                    $"{label}: Refresh height {rBtn.Bounds.Height} fits within journal header height {hdr.Height}");
+                var stats = FindAllControls(ccfForm, "Journal statistics").FirstOrDefault(c => ReferenceEquals(c.Parent, hdr));
+                Log($"  header={hdr.Bounds} back={bBtn.Bounds} refresh={rBtn.Bounds} stats={(stats?.Bounds.ToString() ?? "?")} list={(ByName("Recent requests") as Control)?.Bounds.ToString() ?? "?"}");
+            }
+            else
+            {
+                failures.Add($"{label}: journal header/Back/Refresh not found for containment check");
+            }
+        }
+
+        // One full View All → Back round trip with state assertions. Back must
+        // issue ZERO control-channel calls (pure navigation).
+        void RunBackCycle(string label)
+        {
+            Click("View all recent activity in the Journal tab");
+            WaitForJournalRows();
+            AssertJournal(label + " journal");
+
+            var callsAtBack = channel.CallLog.Count;
+            Click("Back to account selection");
+            Check(channel.CallLog.Count == callsAtBack, $"{label}: Back issued zero control-channel calls");
+            AssertDashboard(label + " dashboard");
+        }
+
+        AssertInventory();
+        Check(DashboardActive(), "initial: dashboard view active");
+        AssertDashboard("initial");
+
+        // ---- Cycle 1: Dashboard → View All → Back (canonical captures) ----
+        if (!dpiOnly)
+        {
+            Capture("dashboard-before");
+        }
+
+        Click("View all recent activity in the Journal tab");
+        WaitForJournalRows();
+        AssertJournal("cycle-1");
+        if (!dpiOnly)
+        {
+            Capture("journal-view");
+        }
+        else
+        {
+            Capture("journal-dpi150");
+        }
+
+        var callsAtBack = channel.CallLog.Count;
+        Click("Back to account selection");
+        Check(channel.CallLog.Count == callsAtBack, "cycle-1: Back issued zero control-channel calls");
+        AssertDashboard("cycle-1");
+        if (!dpiOnly)
+        {
+            Capture("dashboard-after-back");
+        }
+
+        // ---- Cycle 2: repeated navigation (idempotency) ----
+        RunBackCycle("cycle-2");
+        RunBackCycle("cycle-3");
+
+        // ---- View All → Refresh → Back ----
+        Click("View all recent activity in the Journal tab");
+        WaitForJournalRows();
+        AssertJournal("refresh-leg");
+        Click("Refresh journal");
+        WaitForJournalRows();
+        Check(ByName("Recent requests") is ListView lv && lv.Items.Count > 0, "refresh-leg: journal rows present after Refresh");
+        Check(ByName("Journal statistics") is { Text.Length: > 0 }, "refresh-leg: journal statistics populated");
+        callsAtBack = channel.CallLog.Count;
+        Click("Back to account selection");
+        Check(channel.CallLog.Count == callsAtBack, "refresh-leg: Back issued zero control-channel calls");
+        AssertDashboard("refresh-leg");
+
+        // ---- Resize while in journal, then Back (layout + navigation safety) ----
+        if (!dpiOnly)
+        {
+            form.ClientSize = new Size(880, 660);
+            PumpSettle();
+            Click("View all recent activity in the Journal tab");
+            WaitForJournalRows();
+            AssertJournal("narrow");
+            var backBtn = ByName("Back to account selection");
+            var refreshBtn = ByName("Refresh journal");
+            if (backBtn != null && refreshBtn != null)
+            {
+                var backRect = backBtn.RectangleToScreen(backBtn.ClientRectangle);
+                var refreshRect = refreshBtn.RectangleToScreen(refreshBtn.ClientRectangle);
+                Check(backRect.Width > 0 && backRect.Height > 0, "narrow: Back has non-zero size");
+                Check(!backRect.IntersectsWith(refreshRect), $"narrow: Back does not overlap Refresh (back={backRect} refresh={refreshRect})");
+            }
+
+            Capture("journal-narrow");
+            callsAtBack = channel.CallLog.Count;
+            Click("Back to account selection");
+            Check(channel.CallLog.Count == callsAtBack, "narrow: Back issued zero control-channel calls");
+            AssertDashboard("narrow");
+            form.ClientSize = new Size(960, 660);
+            PumpSettle();
+        }
+
+        // ---- Keyboard accessibility ----
+        if (ByName("Back to account selection") is Button bb && ByName("Refresh journal") is Button rb)
+        {
+            Check(bb.TabStop, "Back is keyboard focusable (TabStop)");
+            Check(bb.TabIndex < rb.TabIndex, $"Tab traversal reaches Back before Refresh (Back Tab={bb.TabIndex}, Refresh Tab={rb.TabIndex})");
+            Check(!string.IsNullOrEmpty(bb.AccessibleName), "Back has an accessible name");
+            Check(bb.Enabled, "Back enabled");
+            Check(rb.TabStop, "Refresh remains keyboard focusable");
+        }
+        else
+        {
+            failures.Add("Back/Refresh buttons not found for keyboard checks");
+        }
+
+        // ---- Escape: returns to dashboard, never closes the window ----
+        Click("View all recent activity in the Journal tab");
+        WaitForJournalRows();
+        PostMessage(form.Handle, WM_KEYDOWN, (IntPtr)VK_ESCAPE, IntPtr.Zero);
+        PumpSettle();
+        Check(DashboardActive(), "Escape returns to dashboard from journal");
+        Check(form.Visible, "Escape does not close the window (close semantics preserved)");
+        AssertDashboard("escape");
+
+        // ---- No mutation/provider control ops anywhere in the run ----
+        var forbidden = new[]
+        {
+            "router.start", "router.stop", "route.set", "route.clear",
+            "account.add", "account.update", "account.rename", "account.remove", "account.test",
+            "config.set", "app.exit",
+        };
+        var violations = channel.CallLog.Where(op => forbidden.Contains(op, StringComparer.Ordinal)).ToList();
+        Check(violations.Count == 0, $"no router/route/account/config/app control calls issued during navigation ({violations.Count})");
+
+        AssertInventory();
+
+        results.Add("");
+        if (failures.Count == 0)
+        {
+            results.Add("=== ALL CHECKS PASSED ===");
+        }
+        else
+        {
+            results.Add($"=== {failures.Count} FAILURES ===");
+            foreach (var f in failures)
+            {
+                results.Add("  FAILURE: " + f);
+            }
+        }
+
+        var summaryName = dpiOnly ? "nav-dpi150-summary.txt" : "nav-summary.txt";
+        var summaryFile = Path.Combine(outDir, summaryName);
+        File.WriteAllText(summaryFile, string.Join("\n", results));
+        Console.WriteLine(string.Join("\n", results));
+        return failures.Count == 0 ? 0 : 1;
+    }
+
     private static List<Control> FindAllControls(Control root, string? accessibleName)
     {
         var result = new List<Control>();
@@ -693,11 +1095,15 @@ internal static class Selftest
         public ClientState State => ClientState.Connected;
         public string? LastError => null;
 
+        /// <summary>Every control op the shell issued during the run (navigation tests assert Back issues none).</summary>
+        public readonly List<string> CallLog = new();
+
         public event Action<ShellSnapshot>? SnapshotReceived;
         public event Action<ClientState>? StateChanged;
 
         public Task<ControlResponse> CallAsync(string op, object? parameters = null, int timeoutMs = 60_000, CancellationToken ct = default)
         {
+            CallLog.Add(op);
             var data = op switch
             {
                 "localCred.once" => "{\"credential\":\"selftest-local-credential-not-a-real-secret\"}",

@@ -1,4 +1,4 @@
-﻿using System.ComponentModel;
+using System.ComponentModel;
 using System.Text;
 
 namespace GoRouterDesktop;
@@ -11,9 +11,14 @@ namespace GoRouterDesktop;
 /// Recent activity preview fed by the same journal.recent response as the
 /// Journal tab, then the Accounts, Journal and System tabs, and a footer
 /// with the Desktop release identity, router state and local endpoint port.
-/// Every control has an accessible name and explicit tab order; the close
-/// button hides to tray (non-destructive — tray Exit is the only exit);
-/// minimize hides to tray when minimizeToTray is enabled.
+/// Navigation between the dashboard and the full journal view is explicit:
+/// "View all" enters the journal and the journal header's ← Back (or Escape)
+/// returns to the dashboard through one deterministic transition
+/// (<see cref="NavigateTo"/>) that never closes the window, restarts
+/// anything or issues control calls. Every control has an accessible name
+/// and explicit tab order; the close button hides to tray
+/// (non-destructive — tray Exit is the only exit); minimize hides to tray
+/// when minimizeToTray is enabled.
 /// </summary>
 public sealed class ControlCenterForm : Form
 {
@@ -89,6 +94,11 @@ public sealed class ControlCenterForm : Form
     private Label _lblJournalDegraded = null!;
     private Label _lblJournalEmpty = null!;
     private Button _btnJournalRefresh = null!;
+    private Button _btnJournalBack = null!;
+
+    // navigation (View All / Back): last selected tab drives the journal
+    // refresh gate so Back is pure navigation with zero control calls
+    private TabPage? _lastSelectedTab;
 
     // system tab
     private Label _lblStateDirValue = null!;
@@ -126,6 +136,39 @@ public sealed class ControlCenterForm : Form
     }
 
     /// <summary>
+    /// Top-level views reachable through the View All / Back navigation flow.
+    /// The visible view is always a pure function of <see cref="CurrentView"/>;
+    /// every transition funnels through <see cref="NavigateTo"/>, so the UI
+    /// can never drift into a view state that an accidental sequence of
+    /// Control.Add/Remove operations produced.
+    /// </summary>
+    internal enum ViewTarget
+    {
+        /// <summary>Home dashboard with the GO/ZEN account-selection cards.</summary>
+        Dashboard,
+
+        /// <summary>Full journal view (Journal tab).</summary>
+        Journal,
+    }
+
+    /// <summary>
+    /// The single authoritative navigation transition (View All, Back,
+    /// Escape). Navigation is selection-only: the TabPages remain direct
+    /// children of the TabControl and are never added, removed or reparented,
+    /// so repeated cycles are idempotent and no duplicate/orphan controls can
+    /// accumulate. Back performs no control-channel calls, restarts nothing,
+    /// closes nothing and rewrites no state — GO/ZEN selections, router state
+    /// and journal data are simply left where they are.
+    /// </summary>
+    private void NavigateTo(ViewTarget target)
+    {
+        _tabs.SelectedTab = target == ViewTarget.Journal ? _tabJournal : _tabHome;
+    }
+
+    /// <summary>Current navigation state (journal when the Journal tab is active, else dashboard).</summary>
+    internal ViewTarget CurrentView => _tabs.SelectedTab == _tabJournal ? ViewTarget.Journal : ViewTarget.Dashboard;
+
+    /// <summary>
     /// Operator-facing release identity: <see cref="Application.ProductVersion"/>
     /// may carry SemVer 2 build metadata (e.g. "1.5.1+42546abc") that records
     /// the exact build; the chrome shows only the concise release (everything
@@ -159,8 +202,26 @@ public sealed class ControlCenterForm : Form
         ShowInTaskbar = true;
         KeyPreview = true;
 
-        Controls.Add(BuildStatusBar());
-        Controls.Add(BuildBanner());
+        // Explicit root grid: status bar (AutoSize), banner (AutoSize),
+        // tabs (Percent), footer (AutoSize). Sibling Dock composition with a
+        // hidden banner left the owner-drawn TabControl strip and page
+        // headers vulnerable to overlay/mis-measurement; explicit rows make
+        // the top-level geometry deterministic at every width/DPI.
+        var root = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            BackColor = VisualTheme.WindowBack,
+            AccessibleName = "Control center layout",
+        };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0 status bar
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1 banner
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 2 tabs
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3 footer
+
+        root.Controls.Add(BuildStatusBar(), 0, 0);
+        root.Controls.Add(BuildBanner(), 0, 1);
         _tabs = new TabControl
         {
             Dock = DockStyle.Fill,
@@ -187,14 +248,23 @@ public sealed class ControlCenterForm : Form
         _tabs.SelectedIndexChanged += (_, _) =>
         {
             // The home tab shows the same journal.recent preview as the full
-            // Journal tab, so both refresh through the same single-flight path.
-            if (_tabs.SelectedTab == _tabJournal || _tabs.SelectedTab == _tabHome)
+            // Journal tab, so both refresh through the same single-flight
+            // path — EXCEPT when the home tab is re-entered from the journal
+            // via Back: Back is pure navigation and must not issue any
+            // control-channel call. The preview is already fresh there,
+            // because it renders from the same payload as the journal view
+            // the user just left.
+            var nowJournal = _tabs.SelectedTab == _tabJournal;
+            var fromJournal = ReferenceEquals(_lastSelectedTab, _tabJournal);
+            _lastSelectedTab = _tabs.SelectedTab;
+            if (nowJournal || (_tabs.SelectedTab == _tabHome && !fromJournal))
             {
                 _ = RefreshJournalAsync();
             }
         };
-        Controls.Add(_tabs);
-        Controls.Add(BuildFooter());
+        Controls.Add(root);
+        root.Controls.Add(_tabs, 0, 2);
+        root.Controls.Add(BuildFooter(), 0, 3);
     }
 
     /// <summary>
@@ -780,7 +850,7 @@ public sealed class ControlCenterForm : Form
             TabIndex = 3,
             AccessibleName = "View all recent activity in the Journal tab",
         };
-        _btnActivityViewAll.Click += (_, _) => _tabs.SelectedTab = _tabJournal;
+        _btnActivityViewAll.Click += (_, _) => NavigateTo(ViewTarget.Journal);
         header.Controls.Add(_btnActivityViewAll, 2, 0);
 
         _lblActivityDegraded = new Label
@@ -1068,29 +1138,49 @@ public sealed class ControlCenterForm : Form
 
         var header = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            // Independent vertical constraint: the header sizes itself to its
+            // content (AutoSize) instead of Dock.Fill inside an AutoSize row —
+            // the AutoSize+Dock.Fill combination is a circular sizing
+            // dependency that collapses the row at narrow widths / high DPI
+            // and clips the Back/Refresh buttons under the list view.
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 3,
             RowCount = 1,
             AccessibleName = "Journal header",
         };
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        // Preferred header arrangement: [ ← Back ] [ stats ] [ Refresh ].
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 0 Back
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); // 1 stats
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 2 Refresh
+        header.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         _lblJournalStats = new Label
         {
             Dock = DockStyle.Fill,
             TextAlign = ContentAlignment.MiddleLeft,
             AccessibleName = "Journal statistics",
         };
+        _btnJournalBack = new Button
+        {
+            Text = "← Back",
+            AutoSize = true,
+            Margin = new Padding(0, 0, 10, 0),
+            TabIndex = 0,
+            AccessibleName = "Back to account selection",
+        };
+        _btnJournalBack.Click += (_, _) => NavigateTo(ViewTarget.Dashboard);
         _btnJournalRefresh = new Button
         {
             Text = "Refresh",
             AutoSize = true,
-            TabIndex = 0,
+            TabIndex = 1,
             AccessibleName = "Refresh journal",
         };
         _btnJournalRefresh.Click += (_, _) => _ = RefreshJournalAsync();
-        header.Controls.Add(_lblJournalStats, 0, 0);
-        header.Controls.Add(_btnJournalRefresh, 1, 0);
+        header.Controls.Add(_btnJournalBack, 0, 0);
+        header.Controls.Add(_lblJournalStats, 1, 0);
+        header.Controls.Add(_btnJournalRefresh, 2, 0);
 
         _lblJournalDegraded = new Label
         {
@@ -2501,6 +2591,23 @@ public sealed class ControlCenterForm : Form
         if (_tabs.SelectedTab == _tabHome)
         {
             _ = RefreshJournalAsync();
+        }
+    }
+
+    /// <summary>
+    /// Escape while the journal view is active returns to the dashboard. It is
+    /// an additional keyboard shortcut — the visible ← Back button remains the
+    /// primary navigation affordance — and it NEVER closes the window:
+    /// close-to-tray semantics (and Back/Close separation) are unchanged.
+    /// </summary>
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        base.OnKeyDown(e);
+        if (e.KeyCode == Keys.Escape && _tabs.SelectedTab == _tabJournal)
+        {
+            NavigateTo(ViewTarget.Dashboard);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
         }
     }
 

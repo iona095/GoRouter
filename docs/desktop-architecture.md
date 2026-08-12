@@ -154,6 +154,24 @@ deterministic committed result is observable after races (contract §8).
 - Multiple open GUI surfaces all receive the same event push; no surface
   needs a manual restart to see another surface's change.
 
+## Control-center navigation (V1.5.2)
+
+The control center is a single shell instance; the dashboard (Routing tab
+with the GO/ZEN account-selection cards) and the full journal view (Journal
+tab) are two views of the same form. "View all" on the Recent activity card
+enters the journal; `← Back` in the journal header — and Escape while the
+journal is active — returns to the dashboard. All transitions funnel through
+one navigation method (`ControlCenterForm.NavigateTo`) that only selects the
+target tab. Navigation is selection-only: TabPages are never added, removed
+or reparented, so the visible view is a pure function of the current
+navigation state and repeated Dashboard → View All → Back cycles are
+idempotent with no duplicate or orphan controls. Back never issues a
+control-channel call (the journal refresh gate skips the Back re-entry),
+never restarts anything, never closes the window (close-to-tray semantics
+unchanged) and rewrites no state — GO/ZEN selections, router state and the
+journal are left untouched, so live status keeps reflecting the
+authoritative snapshot.
+
 ## Router supervision
 
 The service probes `GET http://127.0.0.1:<port>/healthz` every 2s. The

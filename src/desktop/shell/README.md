@@ -14,7 +14,7 @@ no external NuGet packages (DPAPI via P/Invoke `CryptUnprotectData`).
 | `ControlClient.cs` | Named-pipe JSON-lines client: request/response by id, snapshot events, 1s/2s/4s reconnect |
 | `ShellSnapshot.cs` | Immutable snapshot/journal/probe models (protocol-exact) |
 | `TrayIcon.cs` | NotifyIcon, runtime-generated state icon, lane submenus, exit |
-| `ControlCenterForm.cs` | Status bar, GO/ZEN lanes, Accounts, Journal, System tabs |
+| `ControlCenterForm.cs` | Status bar, GO/ZEN lanes, Accounts, Journal (with ← Back navigation), System tabs |
 | `FirstRunFlow.cs` | 5-step onboarding (local credential once, first account, lanes, OMP note) |
 | `StartupManager.cs` | HKCU `...\CurrentVersion\Run` value `GoRouterDesktop` |
 | `Selftest.cs` | Test-only `--selftest` evidence driver |
@@ -52,9 +52,21 @@ names, roles, tab order, control types) to the output directory:
 ```powershell
 GoRouterDesktop.exe --selftest <outDir> --state empty
 GoRouterDesktop.exe --selftest <outDir> --state configured
-# states: empty|configured|degraded|stopped|error|confirm|firstrun
+# states: empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict
 GoRouterDesktop.exe --selftest <outDir> --snapshot <snapshot.json>   # custom snapshot
+# interactive regression harnesses (offline, one form):
+GoRouterDesktop.exe --selftest <outDir> --state configured --transition-test   # resize matrix
+GoRouterDesktop.exe --selftest <outDir> --state configured --nav-test          # View All / Back cycles
+GoRouterDesktop.exe --selftest <outDir> --state configured --nav-test --dpi-scale 1.5
 ```
+
+`--nav-test` drives the real View All / ← Back controls through repeated
+Dashboard → View All → Back cycles (including Refresh and narrow-width legs),
+asserts GO/ZEN selection, router-state and port preservation, zero
+control-channel calls on Back, Escape keyboard navigation, and no duplicate
+or orphan controls; it also writes the canonical navigation screenshots
+(`dashboard-before.png`, `journal-view.png`, `dashboard-after-back.png`,
+`journal-narrow.png`, or `journal-dpi150.png` under `--dpi-scale`).
 
 Exit code 0 on success. Never connects to a real control service.
 
