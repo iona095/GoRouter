@@ -139,6 +139,21 @@ describe("protocol transparency", () => {
     upstream.stop();
   });
 
+  test("malformed percent-encoding in the query is transparent (no 400, forwarded)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
+    const { rawGet } = await import("./harness.ts");
+    const res = await rawGet(router.server.port(), "/go/v1/models?x=%zz");
+    // path-only validation: a malformed percent-escape in the QUERY is not
+    // rejected (narrowing #6) — the request dispatches normally
+    expect(res.status).toBe(200);
+    const req = upstream.requests[0]!;
+    // the query is preserved semantically; URLSearchParams canonicalization
+    // (invalid %zz -> %25zz) is pre-existing behavior
+    expect(new URL(req.url).search).toBe("?x=%25zz");
+    upstream.stop();
+  });
+
   test("hop-by-hop and local headers stripped from upstream", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
@@ -221,11 +236,11 @@ describe("protocol transparency", () => {
       // the invariant is that nothing can leave the fixed authority
       expect([200, 400, 404].includes(res.status), `${suffix} -> ${res.status}`).toBe(true);
     }
-    // whatever reached upstream stayed on the fixed mock authority
-    expect(upstream.requests.length).toBeGreaterThan(0);
-    for (const r of upstream.requests) {
-      expect(new URL(r.url).host).toBe(`127.0.0.1:${upstream.port}`);
-    }
+    // F-01 lane-namespace enforcement: every hostile traversal suffix is
+    // rejected before dispatch, so nothing reaches the upstream at all (the
+    // pinned-host proxying invariant for in-namespace paths is covered by
+    // path-namespace.test.ts's control cases).
+    expect(upstream.requests.length).toBe(0);
     upstream.stop();
   });
 });
@@ -256,6 +271,78 @@ describe("streaming", () => {
     // progressive: first chunk observed well before the stream ends
     expect(firstChunkAt).toBeLessThan(200);
     expect(seen.join("")).toBe(chunks.join(""));
+    upstream.stop();
+  });
+
+  test("normal POST completes with journal ok (message completion is not a client abort)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders({ "content-type": "application/json" }),
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 500));
+    const rows = readJournalRows(router.paths.journalDb);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.terminal_outcome).toBe("ok");
+    expect(rows[0]!.terminal_outcome).not.toBe("client_abort");
+    expect(rows[0]!.http_status).toBe(200);
+    upstream.stop();
+  });
+
+  test("GET with a declared request body is rejected 400 (not forwarded with a dangling length)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
+    const { connect } = await import("node:net");
+    const port = router.server.port();
+    const sock = connect(port, "127.0.0.1", () => {
+      sock.write(
+        `GET /go/v1/models HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Length: 3\r\n\r\nabc`,
+      );
+    });
+    sock.setEncoding("utf8");
+    let buf = "";
+    sock.on("data", (d) => { buf += d; });
+    await new Promise((r) => setTimeout(r, 800));
+    sock.destroy();
+    // The web Request model forbids GET/HEAD bodies; a declared length with a
+    // body is rejected pre-dispatch rather than forwarded (forwarding the
+    // length without the bytes would hang the upstream).
+    expect(buf.startsWith("HTTP/1.1 400")).toBe(true);
+    const rows = readJournalRows(router.paths.journalDb);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.terminal_outcome).toBe("local_error");
+    expect(rows[0]!.http_status).toBe(400);
+    expect(upstream.requests.length).toBe(0);
+    upstream.stop();
+  });
+
+  test("HEAD with a declared request body is rejected 400 (not forwarded)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
+    const { connect } = await import("node:net");
+    const port = router.server.port();
+    const sock = connect(port, "127.0.0.1", () => {
+      sock.write(
+        `HEAD /go/v1/models HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Length: 3\r\n\r\nabc`,
+      );
+    });
+    sock.setEncoding("utf8");
+    let buf = "";
+    sock.on("data", (d) => { buf += d; });
+    await new Promise((r) => setTimeout(r, 800));
+    sock.destroy();
+    // The web Request model forbids GET/HEAD bodies; the HEAD variant shares
+    // the GET/HEAD rejection branch (claim 3) and must journal local_error/400.
+    expect(buf.startsWith("HTTP/1.1 400")).toBe(true);
+    const rows = readJournalRows(router.paths.journalDb);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.terminal_outcome).toBe("local_error");
+    expect(rows[0]!.http_status).toBe(400);
+    expect(rows[0]!.lane).toBe("go");
+    expect(upstream.requests.length).toBe(0);
     upstream.stop();
   });
 

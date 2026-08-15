@@ -110,6 +110,51 @@ export function resolveBunExecutable(): string | null {
   return null
 }
 
+/**
+ * Decode an HTTP/1.1 chunked-transfer-encoded body from RAW bytes. The
+ * node:http adapter (and any standards-compliant server) may frame the
+ * /healthz response with Transfer-Encoding: chunked when no Content-Length is
+ * known; the raw probe must accept that framing, not just Content-Length.
+ *
+ * Chunk sizes are BYTE counts; multi-byte UTF-8 characters must not be split
+ * by code-unit slicing, so the framing is parsed on the Buffer and the
+ * assembled body is UTF-8-decoded once at the end.
+ */
+function decodeChunkedBody(body: Buffer): string {
+  const parts: Buffer[] = []
+  let offset = 0
+  for (;;) {
+    const lineEnd = body.indexOf('\r\n', offset)
+    if (lineEnd === -1) return '' // size line truncated
+    const rawLine = body.subarray(offset, lineEnd).toString('latin1')
+    // chunk-size is 1*HEXDIG followed by optional chunk-extensions of the form
+    // ;token[=token|quoted-string]; the whole line must be well-formed (a
+    // malformed extension like ;=bad must not classify a foreign body as ours)
+    const TOKEN = "[!#$%&'*+\\-.^_`|~0-9A-Za-z]+"
+    const sizeLineRe = new RegExp(`^[0-9a-f]+(?:;${TOKEN}(?:=${TOKEN}|="(?:[^\\x00-\\x1f\\x7f"\\\\]|\\\\.)*")?)*$`, "i")
+    if (!sizeLineRe.test(rawLine)) return ''
+    const sizePart = rawLine.split(';')[0]!
+    const size = parseInt(sizePart, 16)
+    offset = lineEnd + 2
+    if (size === 0) {
+      // terminal chunk: a valid trailer section must follow — either the
+      // empty CRLF terminator (0\r\n\r\n) or (field-line CRLF)* + final CRLF
+      // (0\r\nX-Trace: yes\r\n\r\n). Anything else (junk, truncated) is not a
+      // clean chunked response.
+      const tail = body.subarray(offset).toString('latin1')
+      // trailer field names must be RFC 7230 tokens (no spaces/control chars)
+      if (!/^(?:[!#$%&'*+\-.^_`|~0-9A-Za-z]+:[^\x00-\x1f\x7f\r\n]*\r\n)*\r\n$/.test(tail)) return ''
+      return Buffer.concat(parts).toString('utf8')
+    }
+    const dataEnd = offset + size
+    if (dataEnd > body.length) return '' // chunk data truncated
+    parts.push(body.subarray(offset, dataEnd))
+    offset = dataEnd
+    if (body.subarray(offset, offset + 2).toString('latin1') !== '\r\n') return '' // missing chunk CRLF
+    offset += 2
+  }
+}
+
 /** Probe the router port: ok = our healthz signature; busy = something is listening. */
 export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: boolean }> {
   return new Promise((resolve) => {
@@ -122,9 +167,12 @@ export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: bo
     const socket = net.connect({ host: '127.0.0.1', port, timeout: PROBE_TIMEOUT_MS })
     socket.once('connect', () => {
       socket.write(`GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
-      let buf = ''
+      const parts: Buffer[] = []
       socket.on('data', (c) => {
-        buf += c.toString('utf8')
+        // accumulate RAW bytes: chunked sizes are byte counts, and multi-byte
+        // UTF-8 characters may split across TCP segments, so decoding per
+        // chunk and slicing strings by code units would corrupt the framing
+        parts.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
       })
       socket.once('timeout', () => {
         socket.destroy()
@@ -132,7 +180,22 @@ export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: bo
       })
       socket.once('error', () => done(false, true))
       socket.once('close', () => {
-        const body = buf.slice(buf.indexOf('\r\n\r\n') + 4).trim()
+        const raw = Buffer.concat(parts)
+        const headerEnd = raw.indexOf('\r\n\r\n')
+        if (headerEnd === -1) { done(false, true); return }
+        const headerSection = raw.toString('utf8', 0, headerEnd)
+        const rawBody = raw.subarray(headerEnd + 4)
+        // unfold obsolete line folding first: a continuation line (leading
+        // space/tab) extends the PREVIOUS field, so 'Transfer-Encoding:
+        // chunked' + ' transfer-encoding: gzip' combines to a non-chunked value
+        const unfolded = headerSection.replace(/\r\n[ \t]+/g, " ")
+        const teValues = [...unfolded.matchAll(/^transfer-encoding:\s*(.*)$/gim)].map((m) => m[1]!.trim())
+        // exactly one Transfer-Encoding field whose value is the exact
+        // 'chunked' token: duplicate fields (e.g. gzip + chunked combine to
+        // 'gzip, chunked'), prefixed codings (chunkedness), parameters
+        // (chunked;foo), and X-Transfer-Encoding must NOT classify as chunked
+        const isChunked = teValues.length === 1 && teValues[0] === 'chunked'
+        const body = isChunked ? decodeChunkedBody(rawBody) : rawBody.toString('utf8').trim()
         let ok = false
         try {
           const j = JSON.parse(body) as { status?: unknown; version?: unknown }

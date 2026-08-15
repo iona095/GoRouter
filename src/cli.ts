@@ -35,7 +35,7 @@ import { createDomain } from "./domain.ts";
 import { createJournal } from "./journal.ts";
 import { createServer } from "./server.ts";
 import { createStateStore, validateUpstreamUrl, LANES, type Lane } from "./state.ts";
-import { log } from "./util.ts";
+import { log, redact } from "./util.ts";
 
 const USAGE = `Usage: gorouter <command> [args]
 Commands:
@@ -172,16 +172,16 @@ async function main(argv: string[]): Promise<number> {
           if (!name) throw new Error("usage: gorouter account test <alias> [--lane go|zen]");
           const results = await domain.accountTest(name, lanes);
           for (const r of results) {
-            const brief = r.errorMessageBrief ? ` (${r.errorMessageBrief})` : "";
+            const brief = r.errorMessageBrief !== null ? ` (${redact(r.errorMessageBrief)})` : "";
             console.log(
               `account '${name}' lane=${r.lane} model=${r.model} => ${r.verdict} http=${r.httpStatus ?? "network-error"}${brief} ${r.tookMs}ms`,
             );
             if (r.verdict === "AUTH_FAIL") {
               console.log(`  NOTE: credential rejected by the ${r.lane.toUpperCase()} lane (401 AuthError)`);
             } else if (r.verdict === "AUTH_PASS_QUOTA_STATE") {
-              console.log(`  NOTE: authentication accepted; quota state: ${r.errorType}${r.workspaceHint ? ` workspace=${r.workspaceHint}` : ""}`);
+              console.log(`  NOTE: authentication accepted; quota state: ${r.errorType !== null ? redact(r.errorType) : ""}${r.workspaceHint !== null ? ` workspace=${redact(r.workspaceHint)}` : ""}`);
             } else if (r.verdict === "AUTH_PASS_UPSTREAM_STATE") {
-              console.log(`  NOTE: authentication accepted; upstream state: ${r.errorType}`);
+              console.log(`  NOTE: authentication accepted; upstream state: ${r.errorType !== null ? redact(r.errorType) : ""}`);
             } else if (r.verdict === "UNKNOWN") {
               console.log(`  NOTE: ambiguous result; cannot prove authentication`);
             }

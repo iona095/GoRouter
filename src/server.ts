@@ -19,6 +19,8 @@
  *  - journal writes degrade observably and never block routing.
  */
 import { timingSafeEqual } from "node:crypto";
+import type { Server } from "node:http";
+import { createInboundHttpServer } from "./inbound-http.ts";
 import {
   sanitizeForwardHeaders,
   validateCorrelationId,
@@ -27,6 +29,7 @@ import {
   monotonicMs,
   utcNow,
   log,
+  redact,
 } from "./util.ts";
 import type { StateStore, Lane } from "./state.ts";
 import type { Journal, TerminalOutcome } from "./journal.ts";
@@ -114,7 +117,48 @@ function validateLocalAuth(req: Request, localCred: string): boolean {
   return false;
 }
 
-function wrapBodyWithFinalize(
+/**
+ * Path-namespace enforcement for forwarded suffixes. The upstream URL is
+ * pinned to a lane base path (e.g. /zen/go/v1); an encoded payload such as
+ * %2e%2e (dot-dot) must never escape that namespace once an upstream decodes
+ * and resolves it. Percent-decodes up to 3 passes (fail closed on malformed
+ * escapes) and rejects any decoded traversal form ('\\', '//', '.'/'..'
+ * segments) or a final path that is not equal-or-descendant of the base.
+ *
+ * The 3-pass bound is a deliberate defense-in-depth limit, NOT a decoding
+ * guarantee: no standard HTTP server decodes a request-target more than once,
+ * so encodings nested deeper than 3 levels (N>3) are out of scope by design
+ * and are not chased further. The bound is intentionally not raised.
+ */
+export function isPathWithinLaneBase(finalPathname: string, basePathname: string): boolean {
+  let decoded = finalPathname;
+  for (let i = 0; i < 3; i++) {
+    // stop when no valid percent-encoding remains (a literal '%' from %25 is
+    // legal and must not be re-decoded)
+    if (!/%[0-9a-f]{2}/i.test(decoded)) break;
+    try {
+      decoded = decodeURIComponent(decoded);
+    } catch {
+      return false;
+    }
+  }
+  if (decoded.includes("\\") || decoded.includes("//")) return false;
+  // Defense-in-depth: encodings nested deeper than the 3-pass bound still
+  // leave percent-encodings (any depth) — reject rather than forward.
+  if (/%[0-9a-f]{2}/i.test(decoded)) return false;
+  const segments = decoded.split("/").filter((s) => s.length > 0);
+  // Semicolon-parameter dot segments (e.g. ..;foo) are traversal-capable on
+  // matrix-parameter-aware backends; reject any dot-core segment.
+  if (segments.some((s) => { const core = s.split(";")[0]; return core === "." || core === ".."; })) return false;
+  const baseSegments = basePathname.split("/").filter((s) => s.length > 0);
+  if (segments.length < baseSegments.length) return false;
+  for (let i = 0; i < baseSegments.length; i++) {
+    if (segments[i] !== baseSegments[i]) return false;
+  }
+  return true;
+}
+
+export function wrapBodyWithFinalize(
   body: ReadableStream<Uint8Array> | null,
   onEnd: (mode: "completed" | "aborted" | "error") => void,
   clientSignal?: AbortSignal | null,
@@ -127,32 +171,54 @@ function wrapBodyWithFinalize(
     done = true;
     onEnd(mode);
   };
+  // Client abort is inferred ONLY from the client signal or an AbortError;
+  // never from error message text: genuine upstream mid-stream failures
+  // mention "closed"/"terminated" but are upstream errors, not client aborts.
   const isClientGone = (e: unknown): boolean => {
     if (clientSignal?.aborted) return true;
-    if (e instanceof Error) {
-      const msg = e.message.toLowerCase();
-      return e.name === "AbortError" || msg.includes("abort") || msg.includes("closed");
-    }
-    return false;
+    return e instanceof Error && e.name === "AbortError";
   };
+  // One-shot client-abort subscription: when the client disconnects, the
+  // transport aborts the request signal. Cancel the upstream read and
+  // finalize the journal as "aborted" even when no pull is in flight
+  // (e.g. the consumer is stalled on backpressure).
+  const onClientAbort = () => {
+    void reader.cancel().catch(() => {});
+    finish("aborted");
+  };
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      onClientAbort();
+    } else {
+      clientSignal.addEventListener("abort", onClientAbort, { once: true });
+    }
+  }
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
+    // pull-driven: read exactly one upstream chunk per consumer pull so the
+    // router never buffers the whole upstream response ahead of the client
+    async pull(controller) {
       try {
-        for (;;) {
-          const { done: readerDone, value } = await reader.read();
-          if (readerDone) break;
-          controller.enqueue(value);
+        const { done: readerDone, value } = await reader.read();
+        if (readerDone) {
+          controller.close();
+          finish("completed");
+          return;
         }
-        controller.close();
-        finish("completed");
+        controller.enqueue(value);
       } catch (e) {
-        // upstream stream failure mid-flight, or client disconnect surfaced
-        // through a closed sink / aborted upstream reader
-        await Promise.resolve(); // let a disconnect signal settle if pending
-        try { await reader.cancel(); } catch { /* ignore */ }
         if (isClientGone(e)) {
+          // Client is gone, or the upstream read failed with an AbortError-named
+          // error while the client is still connected. Stop reading upstream and
+          // settle the consumer stream: if the client really did abort, the sink
+          // is already closed and close() throws (swallowed); if the client is
+          // still alive (an upstream error merely named AbortError), the guarded
+          // close() lets the surviving consumer settle promptly instead of
+          // hanging forever on a pending read.
+          try { await reader.cancel(); } catch { /* ignore */ }
+          try { controller.close(); } catch { /* sink already closed */ }
           finish("aborted");
         } else {
+          try { await reader.cancel(); } catch { /* ignore */ }
           controller.error(e);
           finish("error");
         }
@@ -167,7 +233,7 @@ function wrapBodyWithFinalize(
 }
 
 export function createServer(deps: ServerDeps): { serve: () => void; stop: () => void; port: () => number } {
-  let server: ReturnType<typeof Bun.serve> | null = null;
+  let server: Server | null = null;
 
   async function dispatch(lane: Lane, suffix: string, search: string, req: Request): Promise<Response> {
     // --- local client auth -------------------------------------------------
@@ -245,9 +311,35 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
 
     // --- upstream dispatch ----------------------------------------------------
     const started = monotonicMs();
+    // Exactly-once finalization: the FIRST completion wins; later calls (an
+    // async fetch rejection after the synchronous stop() abort completer, or a
+    // wrapper finalize racing a client abort) are idempotent no-ops so the
+    // journal row is never double-written and never written after close.
+    let entryCompleted = false;
+    const completeEntry = (
+      terminalOutcome: TerminalOutcome,
+      httpStatus: number | null,
+      upstreamRequestIds: string[],
+      durationMs: number,
+    ): void => {
+      if (entryCompleted) return;
+      entryCompleted = true;
+      deps.journal.complete(entry, {
+        completedAtUtc: utcNow(),
+        durationMs: Math.max(0, Math.round(durationMs)),
+        terminalOutcome,
+        httpStatus,
+        upstreamRequestIds,
+      });
+    };
     const base = lane === "go" ? deps.state.read().settings.upstreamGo : deps.state.read().settings.upstreamZen;
     const upstreamUrl = new URL(base);
-    upstreamUrl.pathname = upstreamUrl.pathname + suffix;
+    const basePathname = new URL(base).pathname;
+    // join base + suffix without a leading-slash artifact (root base "/" joined
+    // with "/models" must stay "/models", never "//models")
+    upstreamUrl.pathname = basePathname.endsWith("/")
+      ? basePathname.slice(0, -1) + suffix
+      : basePathname + suffix;
     // strip the local credential from query params if present (client misplacement)
     const searchParams = new URLSearchParams(search);
     let stripped = false;
@@ -261,14 +353,18 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     upstreamUrl.search = searchParams.toString() ? "?" + searchParams.toString() : "";
     if (upstreamUrl.origin !== new URL(base).origin) {
       log.error(`refusing upstream URL outside fixed authority (lane=${lane})`);
-      deps.journal.complete(entry, {
-        completedAtUtc: utcNow(),
-        durationMs: monotonicMs() - started,
-        terminalOutcome: "local_error",
-        httpStatus: 500,
-        upstreamRequestIds: [],
-      });
+      completeEntry("local_error", 500, [], monotonicMs() - started);
       const res = localError(500, "GoRouterRouteError", "upstream authority mismatch");
+      res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      return res;
+    }
+
+    // path namespace check: encoded traversal payloads (e.g. %2e%2e, %2f, %5c)
+    // survive URL parsing verbatim but would escape the lane base once an
+    // upstream decodes them; reject before any upstream bytes are sent
+    if (!isPathWithinLaneBase(upstreamUrl.pathname, basePathname)) {
+      completeEntry("local_error", 400, [], monotonicMs() - started);
+      const res = localError(400, "GoRouterRouteError", "upstream path outside lane namespace");
       res.headers.set("x-gorouter-request-id", entry.routerRequestId);
       return res;
     }
@@ -290,6 +386,19 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     );
     forwardHeaders.set("host", upstreamUrl.host);
 
+    const reqSignal = (req as Request & { signal?: AbortSignal }).signal;
+    // Finalize the entry SYNCHRONOUSLY on signal abort: stop() aborts the
+    // request controllers directly and AbortController listeners fire
+    // synchronously, so a caller that closes the journal immediately after
+    // stop() must not race a pending dispatch's async fetch rejection.
+    const syncAbortCompleter = (): void => {
+      completeEntry("client_abort", null, [], monotonicMs() - started);
+    };
+    if (reqSignal) {
+      if (reqSignal.aborted) syncAbortCompleter();
+      else reqSignal.addEventListener("abort", syncAbortCompleter, { once: true });
+    }
+
     let upstreamRes: Response;
     try {
       upstreamRes = await fetch(upstreamUrl, {
@@ -300,14 +409,19 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         signal: (req as Request & { signal?: AbortSignal }).signal,
       });
     } catch (e) {
+      const reqSignal = (req as Request & { signal?: AbortSignal }).signal;
+      reqSignal?.removeEventListener("abort", syncAbortCompleter);
+      if (reqSignal?.aborted) {
+        // client went away while the upstream response was still pending; the
+        // response is undeliverable, but journal the abort as such
+        log.debug(`client aborted before upstream response lane=${lane} id=${entry.routerRequestId}`);
+        completeEntry("client_abort", null, [], monotonicMs() - started);
+        const res = localError(502, "GoRouterUpstreamError", "upstream OpenCode request failed");
+        res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+        return res;
+      }
       log.warn(`upstream fetch failed lane=${lane} id=${entry.routerRequestId}: ${e instanceof Error ? e.message : e}`);
-      deps.journal.complete(entry, {
-        completedAtUtc: utcNow(),
-        durationMs: monotonicMs() - started,
-        terminalOutcome: "upstream_error",
-        httpStatus: 502,
-        upstreamRequestIds: [],
-      });
+      completeEntry("upstream_error", 502, [], monotonicMs() - started);
       const res = localError(502, "GoRouterUpstreamError", "upstream OpenCode request failed");
       res.headers.set("x-gorouter-request-id", entry.routerRequestId);
       return res;
@@ -333,15 +447,10 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     const outcome: TerminalOutcome = upstreamRes.status >= 400 ? "upstream_error" : "ok";
 
     const finalize = (mode: "completed" | "aborted" | "error") => {
+      reqSignal?.removeEventListener("abort", syncAbortCompleter);
       const terminalOutcome: TerminalOutcome =
         mode === "aborted" ? "client_abort" : mode === "error" ? "upstream_error" : outcome;
-      deps.journal.complete(entry, {
-        completedAtUtc: utcNow(),
-        durationMs: monotonicMs() - started,
-        terminalOutcome,
-        httpStatus: upstreamRes.status,
-        upstreamRequestIds,
-      });
+      completeEntry(terminalOutcome, upstreamRes.status, upstreamRequestIds, monotonicMs() - started);
     };
 
     // Bodyless responses (204/304/empty 200) must still terminalize the journal:
@@ -352,6 +461,10 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     }
 
     const body = wrapBodyWithFinalize(upstreamRes.body, finalize, (req as Request & { signal?: AbortSignal }).signal);
+    // The wrapper now owns abort finalization and knows the response status;
+    // detach the pending-dispatch completer so it cannot pre-empt with a
+    // null status (a mid-stream abort must journal client_abort/200, not null).
+    reqSignal?.removeEventListener("abort", syncAbortCompleter);
     return new Response(body, { status: upstreamRes.status, headers: outHeaders });
   }
 
@@ -402,6 +515,19 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     if (suffix.includes("//") || suffix.includes("\\")) {
       return localError(400, "GoRouterRouteError", "malformed local path");
     }
+    // fail closed on malformed percent-escapes (e.g. %zz) before dispatch;
+    // encoded traversal content itself is rejected at dispatch with a journal row
+    let decodedSuffix = suffix;
+    for (let i = 0; i < 3; i++) {
+      // stop when no valid percent-encoding remains (a literal '%' from %25
+      // is legal and must not be re-decoded)
+      if (!/%[0-9a-f]{2}/i.test(decodedSuffix)) break;
+      try {
+        decodedSuffix = decodeURIComponent(decodedSuffix);
+      } catch {
+        return localError(400, "GoRouterRouteError", "malformed local path");
+      }
+    }
     return dispatch(lane, suffix, url.search, req);
   };
 
@@ -410,19 +536,105 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       const st = deps.state.read();
       const host = st.settings.host;
       const port = st.settings.port;
-      server = Bun.serve({
-        hostname: host,
-        port,
-        fetch: handler,
-      });
-      log.info(`GoRouter V1 listening on http://${host}:${server.port} (go/v1, zen/v1)`);
+
+      const journalReject = (rawTarget: string, reason: string, method?: string) => {
+        // Create a synthetic journal entry for the rejected request
+        const correlationId = null; // no correlation id for rejected requests
+        const rejectedPath = rawTarget.split("?")[0] ?? "";
+        // Lane derived from the raw target path prefix with an explicit go
+        // check: targets with NO lane prefix (e.g. chunked POST to /foo) must
+        // not be mislabeled "go" — journal provenance stays honest.
+        const rejectedLane = rejectedPath === "/go/v1" || rejectedPath.startsWith("/go/v1/")
+          ? "go"
+          : rejectedPath === "/zen/v1" || rejectedPath.startsWith("/zen/v1/")
+            ? "zen"
+            : "unknown";
+        const entry = deps.journal.begin({
+          lane: rejectedLane,
+          selectedAccountId: null,
+          selectedAccountAliasSnapshot: null,
+          method: method ?? 'GET', // default; actual method unknown
+          endpointFamily: 'unknown',
+          terminalOutcome: 'local_error',
+          httpStatus: 400,
+          upstreamRequestIds: [],
+          model: null,
+          clientCorrelationId: correlationId,
+        });
+        deps.journal.complete(entry, {
+          completedAtUtc: utcNow(),
+          durationMs: 0,
+          terminalOutcome: 'local_error',
+          httpStatus: 400,
+          upstreamRequestIds: [],
+        });
+        // The raw target may carry a known credential (the local key, a lane
+        // account key — possibly percent-encoded by a hostile client echoing
+        // it into a query). Redact every known secret VALUE from the DECODED
+        // target (decoding resolves encoded forms), then apply the shape
+        // redactor for other secret families. Never log credentials verbatim.
+        const knownSecrets: string[] = [];
+        try {
+          const localCred = deps.state.localCredential();
+          if (localCred.length > 0) knownSecrets.push(localCred);
+        } catch { /* local credential unconfigured */ }
+        for (const lane of ["go", "zen"] as const) {
+          try {
+            const snap = deps.state.resolveSnapshot(lane);
+            if (snap.secret.length > 0) knownSecrets.push(snap.secret);
+          } catch { /* no route or missing secret */ }
+        }
+        let loggedTarget = rawTarget;
+        // permissive decode: iteratively resolve runs of VALID percent-escapes
+        // as UTF-8 bytes (so percent-encoded Unicode and double-encoded
+        // credentials resolve to their literal text), leaving malformed
+        // escapes (e.g. %zz) and already-literal Unicode untouched —
+        // decodeURIComponent would throw on a malformed escape and skip the
+        // redaction entirely.
+        for (let i = 0; i < 5; i++) {
+          const prev = loggedTarget;
+          loggedTarget = loggedTarget.replace(/(?:%[0-9a-f]{2})+/gi, (m) =>
+            Buffer.from(m.replace(/%/g, ""), "hex").toString("utf8"),
+          );
+          if (loggedTarget === prev) break;
+        }
+        // longest secrets first: replacing a short value first would destroy a
+        // longer overlapping match and leak its suffix
+        knownSecrets.sort((a, b) => b.length - a.length);
+        for (const secret of knownSecrets) {
+          loggedTarget = loggedTarget.split(secret).join("<redacted>");
+        }
+        loggedTarget = redact(loggedTarget);
+        log.warn(`raw-target validation rejected: ${reason} (target: ${loggedTarget})`);
+      };
+
+      server = createInboundHttpServer(handler, { hostname: host, port }, journalReject);
+      const addr = server.address();
+      const actualPort = addr && typeof addr === 'object' ? addr.port : 0;
+      log.info(`GoRouter V1 listening on http://${host}:${actualPort} (go/v1, zen/v1)`);
     },
     port() {
-      return server?.port ?? 0;
+      const addr = server?.address();
+      return (addr && typeof addr === 'object') ? addr.port : 0;
     },
     stop() {
-      server?.stop(true);
+      // Restore the Bun.serve force-close shutdown semantics. Force-close
+      // order matters on Bun 1.3.14: closeAllConnections() BEFORE close()
+      // (the reverse is a no-op). Active request controllers are aborted
+      // FIRST so the response wrappers finalize their journal rows
+      // synchronously (AbortController listeners fire synchronously) — a
+      // caller that closes the journal immediately after stop() must not race
+      // the finalization.
+      const srv = server;
       server = null;
+      if (srv) {
+        const controllers = (srv as unknown as { __gorouterActiveControllers?: Set<AbortController> }).__gorouterActiveControllers;
+        if (controllers) {
+          for (const ac of [...controllers]) ac.abort();
+        }
+        try { srv.closeAllConnections(); } catch { /* API unavailable */ }
+        srv.close();
+      }
     },
   };
 }

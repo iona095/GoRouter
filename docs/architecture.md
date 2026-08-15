@@ -19,6 +19,7 @@ accounts are supported; the immediate scenario uses two.
 | --- | --- |
 | `src/cli.ts` | operator surface: accounts, routes, probe, serve, journal stats, config, reset |
 | `src/server.ts` | loopback HTTP proxy: local auth, path routing, snapshot dispatch, streaming, response metadata |
+| `src/inbound-http.ts` | node:http transport adapter: raw request-target validation before WHATWG normalization, Transfer-Encoding (chunked) request-body rejection, held-body client-abort detection |
 | `src/state.ts` | non-secret persisted state (accounts metadata, route selections, settings); atomic tmp+fsync+rename writes; per-request snapshot reads |
 | `src/secret-store.ts` | Windows DPAPI (CryptProtectData) blob store with mtime-keyed decrypt cache and spawn retry |
 | `src/journal.ts` | SQLite request journal, schema v1, bounded retention, degradable |
@@ -28,6 +29,18 @@ accounts are supported; the immediate scenario uses two.
 
 ## Request lifecycle (server)
 
+0. **Transport boundary** (`src/inbound-http.ts`): the raw request-target PATH
+   (the query is split off at the first `?` and preserved semantically) is
+   validated BEFORE WHATWG URL normalization — absolute-form and asterisk-form
+   targets, backslashes, encoded double-slashes, encoded dot-dot traversal
+   (including mixed literal+encoded and semicolon-parameter forms), malformed
+   percent-escapes in the path, and percent-encoding nested beyond the 3-pass
+   decode bound are rejected 400. Transfer-Encoding (chunked) request bodies
+   are rejected 400 before consumption (REJECT_UNSAFE_CHUNKED_REQUEST_BODIES:
+   the client-abort invariant is preserved by never admitting unsafe framing)
+   and the connection is terminated. GET/HEAD with a declared request body is
+   rejected 400. Client-abort detection uses the request's `aborted` signal
+   only and is disabled for `Connection: close` requests.
 1. Path must match `/go/v1/*` or `/zen/v1/*`; anything else → local 404/400.
 2. Local client auth: `Authorization: Bearer <local credential>` validated
    against the DPAPI-protected local credential (constant-time compare).

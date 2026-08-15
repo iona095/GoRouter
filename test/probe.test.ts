@@ -76,4 +76,36 @@ describe("probe classification", () => {
       upstream.stop();
     }
   });
+
+  test("probe returns RAW upstream error fields (redaction lives only at the CLI/desktop boundary)", async () => {
+    // classify() compares errorType against AuthError/GoUsageLimitError/
+    // CreditsError verbatim, so probeAccountKey must never pre-redact the
+    // provider-controlled fields — the CLI and desktop control service redact
+    // at their own output boundaries instead.
+    const upstream = await startMockUpstream(() =>
+      Response.json(
+        {
+          type: "error",
+          error: {
+            type: "GoUsageLimitError",
+            message: "quota exceeded: sk-raw-boundary-secret-0123456789",
+            metadata: { workspace: "wrk_x" },
+          },
+        },
+        { status: 429 },
+      ),
+    );
+    try {
+      const r = await probeAccountKey("zen", "sk-probe-key-raw", upstream.baseUrl);
+      expect(r.verdict).toBe("AUTH_PASS_QUOTA_STATE");
+      expect(r.errorType).toBe("GoUsageLimitError");
+      expect(r.errorMessageBrief).toBe("quota exceeded: sk-raw-boundary-secret-0123456789");
+      expect(r.workspaceHint).toBe("wrk_x");
+      expect(r.errorType).not.toContain("[REDACTED]");
+      expect(r.errorMessageBrief).not.toContain("[REDACTED]");
+      expect(r.workspaceHint).not.toContain("[REDACTED]");
+    } finally {
+      upstream.stop();
+    }
+  });
 });

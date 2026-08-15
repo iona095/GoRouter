@@ -177,7 +177,13 @@ authoritative snapshot.
 The service probes `GET http://127.0.0.1:<port>/healthz` every 2s. The
 router is "ours" iff the response is JSON with `status: "ok"` and the
 router version field present; any other healthy-ish listener on the port is
-foreign.
+foreign. The probe decodes the response with a byte-aware strict HTTP/1.1
+chunked decoder (pure hex chunk sizes with RFC-token chunk-extensions,
+complete chunk data + CRLF, terminal 0-chunk followed by a valid RFC-7230
+trailer section, no control bytes) and requires exactly one
+`Transfer-Encoding` field whose value is exactly `chunked` after unfolding
+obs-fold continuations; any malformed framing classifies the listener as
+not ours.
 
 | Router state | Meaning |
 | --- | --- |

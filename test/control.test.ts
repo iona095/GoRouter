@@ -45,16 +45,19 @@ afterEach(async () => {
     // bun:sqlite WAL -shm/-wal handles release asynchronously on Windows;
     // under parallel worker load the release can take many seconds — retry
     // generously (non-blocking sleeps so the release can actually run).
-    for (let attempt = 0; attempt < 15; attempt++) {
+    // Verified: core.stop() clears the poll timer synchronously and the
+    // tests close their journal handles; the residual lock is the async
+    // WAL release, so a bounded wait is the correct mitigation.
+    for (let attempt = 0; attempt < 30; attempt++) {
       try {
         rmSync(d, { recursive: true, force: true })
         break
       } catch (err) {
-        if (attempt === 14) {
+        if (attempt === 29) {
           const listing = Bun.spawnSync(['cmd', '/c', 'dir', '/s', '/b', d]).stdout?.toString() ?? ''
           throw new Error(`cleanup failed for ${d}; contents: ${listing.slice(0, 500)}`)
         }
-        await sleep(200 * (attempt + 1))
+        await sleep(Math.min(200 * (attempt + 1), 2000))
       }
     }
   }

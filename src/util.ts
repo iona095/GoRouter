@@ -39,7 +39,12 @@ export const log = new Logger(
 // must still avoid placing secrets in these strings in the first place.
 // ---------------------------------------------------------------------------
 
-const SECRET_SCAN = /\b(sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._~+/-]{12,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,}|[A-Za-z0-9_-]{40,})\b/g;
+// F02-01: the sk- family is deliberately boundary-free on BOTH sides — the
+// leading \b failed between a preceding word char and 's' (redact('xx'+KEY)
+// leaked the key), and a trailing word char is an equally real leak vector
+// (KEY+'yy'). The 'sk-' prefix plus the {12,} run is a strong enough signal;
+// every other family keeps its \b...\b word boundaries unchanged.
+const SECRET_SCAN = /(?:sk-[A-Za-z0-9_-]{12,}|\b(?:Bearer\s+[A-Za-z0-9._~+/-]{12,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,}|[A-Za-z0-9_-]{40,})\b)/g;
 
 /** Replace credential-shaped fragments with a fixed marker. */
 export function redact(text: string): string {

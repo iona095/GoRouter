@@ -22,7 +22,12 @@ export type TerminalOutcome =
   | "ok" // upstream response dispatched to the client
   | "upstream_error" // upstream returned an error status (faithfully proxied)
   | "local_error" // router rejected before/without upstream success
-  | "client_abort"; // client disconnected mid-stream
+  | "client_abort"; // client disconnected mid-stream, OR the router closed the
+                    // connection mid-stream during shutdown: a server-initiated
+                    // stop lands here too because the response stream is canceled
+                    // from the router side with no live client abort to observe.
+                    // This is the least-wrong label; a distinct outcome would be
+                    // a schema change and is not warranted.
 
 export interface JournalEntry {
   routerRequestId: string;

@@ -45,13 +45,20 @@ export interface MockUpstream {
   stop: () => void;
 }
 
+export interface MockUpstreamOpts {
+  /** idleTimeout in seconds for the mock server; 0 disables (default 10). */
+  idleTimeout?: number;
+}
+
 export async function startMockUpstream(
   handler?: (req: Request) => Promise<Response> | Response,
+  opts?: MockUpstreamOpts,
 ): Promise<MockUpstream> {
   const requests: MockRequest[] = [];
   const upstream = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
+    idleTimeout: opts?.idleTimeout ?? 10,
     fetch: async (req) => {
       const clone = req.clone();
       const bodyText = await clone.text();
@@ -64,16 +71,22 @@ export async function startMockUpstream(
         aborted: false,
       };
       requests.push(record);
+      req.signal?.addEventListener("abort", () => { record.aborted = true; });
       if (handler) return handler(req);
       return Response.json({ ok: true, echo: bodyText });
     },
   });
+  let stopped = false;
   return {
     port: upstream.port ?? 0,
     baseUrl: `http://127.0.0.1:${upstream.port ?? 0}`,
     requests,
     handler: handler ?? (() => Response.json({ ok: true })),
-    stop: () => upstream.stop(true),
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      upstream.stop(true);
+    },
   };
 }
 
@@ -90,6 +103,8 @@ export interface TestRouter {
 
 export async function startTestRouter(opts: {
   upstreamBase: string;
+  upstreamGo?: string;
+  upstreamZen?: string;
   upstreamHandler?: (req: Request) => Promise<Response> | Response;
   accounts?: Array<{ alias: string; key: string }>;
   routes?: Partial<Record<Lane, string>>;
@@ -105,8 +120,8 @@ export async function startTestRouter(opts: {
   state.mutate((s) => {
     s.localCredentialRef = "sec_local";
     s.settings.port = 0;
-    s.settings.upstreamGo = opts.upstreamBase;
-    s.settings.upstreamZen = opts.upstreamBase;
+    s.settings.upstreamGo = opts.upstreamGo ?? opts.upstreamBase;
+    s.settings.upstreamZen = opts.upstreamZen ?? opts.upstreamBase;
     if (opts.retentionDays !== undefined) s.settings.journalRetentionDays = opts.retentionDays;
     if (opts.maxRecords !== undefined) s.settings.journalMaxRecords = opts.maxRecords;
   });
@@ -169,15 +184,61 @@ export function sseStream(chunks: string[], delayMs = 20): Response {
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (i >= chunks.length) {
-        controller.close();
+        try { controller.close(); } catch { /* canceled */ }
         return;
       }
       await new Promise((r) => setTimeout(r, delayMs));
-      controller.enqueue(encoder.encode(chunks[i]!));
-      i++;
+      try {
+        controller.enqueue(encoder.encode(chunks[i]!));
+        i++;
+      } catch { /* canceled mid-pull (mock stopped while streaming) */ }
     },
   });
   return new Response(stream, {
     headers: { "content-type": "text/event-stream", "x-request-id": "upstream-req-123" },
+  });
+}
+
+export interface RawGetResult {
+  status: number;
+  bodyText: string;
+  elapsedMs: number;
+  error?: string;
+}
+
+function parseRawResponse(data: string, elapsedMs: number): RawGetResult {
+  const sep = data.indexOf("\r\n\r\n");
+  const head = sep === -1 ? data : data.slice(0, sep);
+  const bodyText = sep === -1 ? "" : data.slice(sep + 4);
+  const m = /^HTTP\/\d\.\d\s+(\d{3})/.exec(head);
+  return { status: m ? Number(m[1]) : 0, bodyText, elapsedMs };
+}
+
+/**
+ * Raw HTTP/1.1 GET over a fresh TCP connection with the exact request-path
+ * bytes preserved (fetch/undici would normalize dot segments and escapes).
+ * Reads until the connection closes, then parses the status line + body.
+ */
+export async function rawGet(port: number, rawPath: string): Promise<RawGetResult> {
+  const { connect } = await import("node:net");
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const sock = connect(port, "127.0.0.1");
+    let data = "";
+    sock.setEncoding("utf8");
+    sock.on("connect", () => {
+      sock.write(
+        `GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nConnection: close\r\n\r\n`,
+      );
+    });
+    sock.on("data", (d) => { data += d; });
+    sock.on("end", () => resolve(parseRawResponse(data, Date.now() - started)));
+    sock.on("error", (e) => {
+      resolve({ status: 0, bodyText: data, elapsedMs: Date.now() - started, error: e.message });
+    });
+    sock.setTimeout(10_000, () => {
+      sock.destroy();
+      resolve({ status: 0, bodyText: data, elapsedMs: Date.now() - started, error: "timeout" });
+    });
   });
 }
