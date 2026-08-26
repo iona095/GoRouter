@@ -33,6 +33,10 @@ import {
   type AccountRecord,
 } from "./state.ts";
 import { createJournal, type JournalStats } from "./journal.ts";
+import { tryUnlink } from "./util.ts";
+import { registryPathFor, loadRegistry, peekRegistry, storeRegistry, registryAgeMs, isFresh, isCooldown, cooldownRemainingMs } from "./models/registry.ts";
+import { refreshRegistry, type RefreshResult } from "./models/refresh.ts";
+import { MODELS_TTL_MS, MODELS_COOLDOWN_MS, type RegistryFile, type ModelEntry, type DiffEntry } from "./models/types.ts";
 import { probeAccountKey, type ProbeResult } from "./probe.ts";
 import { withFileLock, lockPathFor } from "./lock.ts";
 
@@ -63,6 +67,30 @@ export interface StatusView {
   stateDir: string;
 }
 
+export interface ModelsStatusView {
+  exists: boolean;
+  corrupt: boolean;
+  registry: RegistryFile | null;
+  ageMs: number | null;
+  ageHuman: string | null;
+  ttlMs: number;
+  cooldownMs: number;
+  isFresh: boolean | null;
+  isCooldown: boolean;
+  cooldownRemainingMs: number;
+  retryEligible: boolean;
+  counts: Record<Lane, number>;
+  diffSummary: { added: number; removed: number; changed: number; total: number; lastDiffAtUtc: string | null };
+  lastAttempt: RegistryFile["lastAttempt"] | null;
+}
+
+export interface ModelsListView {
+  lane: Lane;
+  count: number;
+  fetchedAtUtc: string | null;
+  models: ModelEntry[];
+}
+
 export interface Domain {
   setup(): { created: boolean; credential: string | null };
   localCredential(): string;
@@ -80,6 +108,10 @@ export interface Domain {
   configShow(): StateFile["settings"];
   configSet(key: string, value: string): void;
   reset(): void;
+  modelsStatus(): ModelsStatusView;
+  modelsList(lane: Lane): ModelsListView;
+  modelsRefresh(): Promise<RefreshResult>;
+  modelsDiff(): DiffEntry[];
 }
 
 function viewAccount(state: StateFile, secrets: SecretStore, a: AccountRecord): AccountView {
@@ -102,6 +134,21 @@ function viewRoutes(state: StateFile): RouteView[] {
       accountMissing: !account,
     };
   });
+}
+
+function formatAge(ms: number): string {
+  if (ms < 1000) return ms + "ms";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  const remS = s % 60;
+  if (m < 60) return m + "m" + (remS ? " " + remS + "s" : "");
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  if (h < 24) return h + "h" + (remM ? " " + remM + "m" : "");
+  const d = Math.floor(h / 24);
+  const remH = h % 24;
+  return d + "d" + (remH ? " " + remH + "h" : "");
 }
 
 export function createDomain(paths: Paths, secrets: SecretStore): Domain {
@@ -330,6 +377,80 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         x.localCredentialRef = null;
       });
       for (const r of refs) secrets.delete(r);
+      // Slice A: reset also removes persisted registry (clean slate)
+      try { tryUnlink(registryPathFor(paths)); } catch {}
+    },
+
+    modelsStatus(): ModelsStatusView {
+      const peek = peekRegistry(paths);
+      const reg = peek.file;
+      if (!reg) {
+        return {
+          exists: peek.exists,
+          corrupt: peek.corrupt,
+          registry: null,
+          ageMs: null,
+          ageHuman: null,
+          ttlMs: MODELS_TTL_MS,
+          cooldownMs: MODELS_COOLDOWN_MS,
+          isFresh: null,
+          isCooldown: false,
+          cooldownRemainingMs: 0,
+          retryEligible: true,
+          counts: { go: 0, zen: 0 },
+          diffSummary: { added: 0, removed: 0, changed: 0, total: 0, lastDiffAtUtc: null },
+          lastAttempt: null,
+        };
+      }
+      const now = Date.now();
+      const ageMs = registryAgeMs(reg, now);
+      const fresh = isFresh(reg, now);
+      const cd = isCooldown(reg, now);
+      const rem = cooldownRemainingMs(reg, now);
+      const counts = { go: reg.go?.models.length ?? 0, zen: reg.zen?.models.length ?? 0 } as Record<Lane, number>;
+      const added = reg.lastDiff.filter((d) => d.kind === "MODEL_ADDED").length;
+      const removed = reg.lastDiff.filter((d) => d.kind === "MODEL_REMOVED").length;
+      const changed = reg.lastDiff.filter((d) => d.kind === "MODEL_CHANGED").length;
+      const ageHuman = formatAge(ageMs);
+      return {
+        exists: true,
+        corrupt: false,
+        registry: reg,
+        ageMs,
+        ageHuman,
+        ttlMs: MODELS_TTL_MS,
+        cooldownMs: MODELS_COOLDOWN_MS,
+        isFresh: fresh,
+        isCooldown: cd,
+        cooldownRemainingMs: rem,
+        retryEligible: !cd,
+        counts,
+        diffSummary: { added, removed, changed, total: reg.lastDiff.length, lastDiffAtUtc: reg.lastDiff.length > 0 ? reg.updatedAtUtc : null },
+        lastAttempt: reg.lastAttempt,
+      };
+    },
+
+    modelsList(lane: Lane): ModelsListView {
+      const reg = loadRegistry(paths);
+      const snap = reg ? (lane === "go" ? reg.go : reg.zen) : null;
+      if (!snap) return { lane, count: 0, fetchedAtUtc: null, models: [] };
+      return { lane, count: snap.models.length, fetchedAtUtc: snap.fetchedAtUtc, models: [...snap.models] };
+    },
+
+    async modelsRefresh(): Promise<RefreshResult> {
+      const s = state.read();
+      const result = await refreshRegistry(paths, {
+        upstreamGo: s.settings.upstreamGo,
+        upstreamZen: s.settings.upstreamZen,
+        forced: true,
+      });
+      return result;
+    },
+
+    modelsDiff(): DiffEntry[] {
+      const reg = loadRegistry(paths);
+      if (!reg) return [];
+      return [...reg.lastDiff];
     },
   };
 }

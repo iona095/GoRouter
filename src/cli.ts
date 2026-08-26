@@ -23,6 +23,10 @@
  *   config set <key> <value>      change a setting (port/host/upstreams/retention)
  *   serve                         run the router in the foreground
  *   reset --yes                   remove accounts, secrets and the local credential
+ *   models status [--json]          registry state (age, TTL, attempts, retry, counts, diff summary)
+ *   models list <go|zen> [--json]   list models for a lane (also: --lane go|zen, or no lane for both)
+ *   models refresh [--json]         forced refresh (bypass TTL, non-zero on failure)
+ *   models diff [--json]            last meaningful model changes
  *
  * Secrets never appear on argv, in shell history or in output.
  *
@@ -42,7 +46,8 @@ Commands:
   setup | local-cred | rotate-local-cred
   account add|update|list|rename|remove|test ...
   route [go|zen <alias>] | route clear <go|zen>
-  status | journal stats | config show | config set <key> <value> | serve | reset --yes`;
+  status | journal stats | config show | config set <key> <value> | serve | reset --yes
+  models status|list|refresh|diff [--json]  (list: gorouter models list <go|zen> [--json] or --lane)`;
 
 async function readSecretFromStdin(): Promise<string> {
   const text = await Bun.stdin.text();
@@ -307,7 +312,7 @@ async function main(argv: string[]): Promise<number> {
         return 1;
       }
       const journal = createJournal(paths.journalDb, s.settings.journalRetentionDays, s.settings.journalMaxRecords);
-      const server = createServer({ state, journal });
+      const server = createServer({ state, journal, paths });
       server.serve();
       // A long-running proxy must survive runtime-level async faults: log
       // them and keep serving; each request is already isolated by its own
@@ -333,6 +338,195 @@ async function main(argv: string[]): Promise<number> {
       domain.reset();
       console.log("router state reset (secrets deleted); journal db left in place");
       return 0;
+    }
+    case "models": {
+      const sub = args[0];
+      const rest = args.slice(1);
+      const wantJson = args.includes("--json");
+      const cleanRest = rest.filter((x) => x !== "--json");
+      switch (sub) {
+        case "status": {
+          if (cleanRest.length > 0) throw new Error("usage: gorouter models status [--json]");
+          const s = domain.modelsStatus();
+          if (wantJson) {
+            const payload: Record<string, unknown> = {
+              exists: s.exists,
+              corrupt: (s as unknown as { corrupt?: boolean }).corrupt ?? false,
+              schemaVersion: s.registry?.schemaVersion ?? null,
+              updatedAtUtc: s.registry?.updatedAtUtc ?? null,
+              ageMs: s.ageMs,
+              ageHuman: s.ageHuman,
+              ttlMs: s.ttlMs,
+              cooldownMs: s.cooldownMs,
+              isFresh: s.isFresh,
+              isCooldown: s.isCooldown,
+              cooldownRemainingMs: s.cooldownRemainingMs,
+              retryEligible: s.retryEligible,
+              counts: s.counts,
+              diffSummary: s.diffSummary,
+              lastAttempt: s.lastAttempt,
+              isStale: s.exists && !((s as unknown as { corrupt?: boolean }).corrupt) ? !s.isFresh : null,
+            };
+            console.log(JSON.stringify(payload, null, 2));
+          } else {
+            if (!s.exists) {
+              const isCorrupt = (s as unknown as { corrupt?: boolean }).corrupt;
+              if (isCorrupt) {
+                console.log("GoRouter Models \u2014 registry corrupt");
+                console.log("  Registry file is corrupt (schema invalid or unreadable) \u2014 treating as absent.");
+                console.log("  TTL: " + (s.ttlMs / 3600000) + "h  Cooldown: " + (s.cooldownMs / 60000) + "m");
+                console.log("  Run `gorouter models refresh` to refetch and repair.");
+              } else {
+                console.log("GoRouter Models \u2014 registry missing");
+                console.log("  No registry file yet (no successful refresh).");
+                console.log("  TTL: " + (s.ttlMs / 3600000) + "h  Cooldown: " + (s.cooldownMs / 60000) + "m");
+                console.log("  Run `gorouter models refresh` to fetch the upstream catalogs.");
+              }
+            } else if ((s as unknown as { corrupt?: boolean }).corrupt) {
+              console.log("GoRouter Models \u2014 registry corrupt");
+              console.log("  Registry file is corrupt (schema invalid or unreadable) \u2014 treating as absent.");
+              console.log("  TTL: " + (s.ttlMs / 3600000) + "h  Cooldown: " + (s.cooldownMs / 60000) + "m");
+              console.log("  Run `gorouter models refresh` to refetch and repair.");
+            } else {
+              const freshLabel = s.isFresh ? "fresh" : "stale";
+              console.log("GoRouter Models \u2014 registry present (" + freshLabel + ")");
+              console.log("  Schema: v" + (s.registry!.schemaVersion) + "  Updated: " + s.registry!.updatedAtUtc + "  Age: " + (s.ageHuman ?? s.ageMs + "ms") + " / TTL: " + (s.ttlMs / 3600000) + "h  Threshold: " + new Date(Date.parse(s.registry!.updatedAtUtc) + s.ttlMs).toISOString());
+              if (s.isCooldown) {
+                const secs = Math.ceil(s.cooldownRemainingMs / 1000);
+                console.log("  Cooldown: active (" + secs + "s remaining) \u2014 retry not yet eligible");
+              } else {
+                console.log("  Cooldown: none \u2014 retry eligible: " + (s.retryEligible ? "yes" : "no"));
+              }
+              for (const lane of ["go", "zen"] as const) {
+                const snap = lane === "go" ? s.registry!.go : s.registry!.zen;
+                const att = s.lastAttempt ? (lane === "go" ? s.lastAttempt.go : s.lastAttempt.zen) : null;
+                const count = s.counts[lane];
+                const fetchedAt = snap?.fetchedAtUtc ?? "(never)";
+                const expiresAt = snap ? new Date(Date.parse(snap.fetchedAtUtc) + s.ttlMs).toISOString() : "(n/a)";
+                console.log("  " + lane.toUpperCase() + ": " + count + " models  fetchedAt=" + fetchedAt + "  expiresAt=" + expiresAt);
+                if (att) {
+                  const okLabel = att.success ? "success" : "FAIL";
+                  const errPart = att.error ? " error=" + redact(att.error) : "";
+                  const statusPart = att.httpStatus !== null ? " http=" + att.httpStatus : "";
+                  console.log("    last attempt: " + att.atUtc + " " + okLabel + statusPart + errPart + " (" + att.durationMs + "ms)");
+                } else {
+                  console.log("    last attempt: none");
+                }
+                console.log("    retry eligible: " + (!s.isCooldown ? "yes" : "no"));
+              }
+              const ds = s.diffSummary;
+              if (ds.total === 0) {
+                console.log("  Diff: no changes (lastDiff empty)");
+              } else {
+                console.log("  Diff: +" + ds.added + " added, -" + ds.removed + " removed, ~" + ds.changed + " changed (total " + ds.total + ", last at " + (ds.lastDiffAtUtc ?? s.registry!.updatedAtUtc) + ")");
+              }
+            }
+          }
+          return 0;
+        }
+        case "list": {
+          // Accept: `models list <go|zen>`, `models list --lane go|zen`, or `models list` (=both lanes).
+          const laneFlagIdx = cleanRest.indexOf("--lane");
+          let lane: string | null = null;
+          let remaining: string[] = [];
+          if (laneFlagIdx >= 0) {
+            lane = cleanRest[laneFlagIdx + 1]?.toLowerCase() ?? null;
+            remaining = cleanRest.filter((_, i) => i !== laneFlagIdx && i !== laneFlagIdx + 1);
+          } else {
+            lane = cleanRest[0]?.toLowerCase() ?? null;
+            remaining = cleanRest.slice(lane ? 1 : 0);
+          }
+          if (remaining.length > 0) throw new Error("usage: gorouter models list [go|zen|--lane go|zen] [--json]");
+          if (lane !== null && lane !== "go" && lane !== "zen") throw new Error("usage: gorouter models list [go|zen|--lane go|zen] [--json]");
+          if (lane === null) {
+            // No lane filter: show both lanes (spec's optional lane).
+            const go = domain.modelsList("go");
+            const zen = domain.modelsList("zen");
+            if (wantJson) {
+              console.log(JSON.stringify({ go, zen }, null, 2));
+            } else {
+              for (const v of [go, zen] as const) {
+                console.log("Models lane=" + v.lane + " (" + v.count + " entries" + (v.fetchedAtUtc ? ", fetched " + v.fetchedAtUtc : ", never fetched") + ")");
+                if (v.models.length === 0) console.log("  (no models)");
+                else for (const m of v.models) {
+                  const extra: string[] = [];
+                  if (typeof m.object === "string") extra.push("object=" + m.object);
+                  if (typeof m.owned_by === "string") extra.push("owned_by=" + m.owned_by);
+                  if (typeof m.created === "number") extra.push("created=" + m.created);
+                  console.log("  " + m.id + (extra.length ? "  " + extra.join("  ") : ""));
+                }
+              }
+            }
+            return 0;
+          }
+          const v = domain.modelsList(lane as "go" | "zen");
+          if (wantJson) {
+            console.log(JSON.stringify(v, null, 2));
+          } else {
+            console.log("Models lane=" + v.lane + " (" + v.count + " entries" + (v.fetchedAtUtc ? ", fetched " + v.fetchedAtUtc : ", never fetched") + ")");
+            if (v.models.length === 0) {
+              console.log("  (no models)");
+            } else {
+              for (const m of v.models) {
+                const extra: string[] = [];
+                if (typeof m.object === "string") extra.push("object=" + m.object);
+                if (typeof m.owned_by === "string") extra.push("owned_by=" + m.owned_by);
+                if (typeof m.created === "number") extra.push("created=" + m.created);
+                console.log("  " + m.id + (extra.length ? "  " + extra.join("  ") : ""));
+              }
+            }
+          }
+          return 0;
+        }
+        case "refresh": {
+          if (cleanRest.length > 0) throw new Error("usage: gorouter models refresh [--json]");
+          const result = await domain.modelsRefresh();
+          if (wantJson) {
+            const payload = {
+              success: result.success,
+              error: result.error,
+              fromCache: result.fromCache,
+              diff: result.diff,
+              registry: result.registry,
+            };
+            console.log(JSON.stringify(payload, null, 2));
+          } else {
+            if (result.success) {
+              const goCount = result.registry?.go?.models.length ?? 0;
+              const zenCount = result.registry?.zen?.models.length ?? 0;
+              console.log("models refreshed: go=" + goCount + " zen=" + zenCount);
+              if (result.diff.length > 0) {
+                console.log("  diff: +" + result.diff.filter((d) => d.kind === "MODEL_ADDED").length + " added, -" + result.diff.filter((d) => d.kind === "MODEL_REMOVED").length + " removed, ~" + result.diff.filter((d) => d.kind === "MODEL_CHANGED").length + " changed");
+              }
+            } else {
+              console.error("models refresh failed: " + redact(result.error ?? "unknown error"));
+            }
+          }
+          return result.success ? 0 : 1;
+        }
+        case "diff": {
+          if (cleanRest.length > 0) throw new Error("usage: gorouter models diff [--json]");
+          const entries = domain.modelsDiff();
+          if (wantJson) {
+            const reg = domain.modelsStatus().registry;
+            console.log(JSON.stringify({ entries, generatedAtUtc: new Date().toISOString(), lastDiffAtUtc: reg?.updatedAtUtc ?? null }, null, 2));
+          } else {
+            if (entries.length === 0) {
+              console.log("no changes (no diff since last successful publish)");
+            } else {
+              const reg = domain.modelsStatus().registry;
+              console.log("Model changes (since " + (reg?.updatedAtUtc ?? "first publish") + ", " + entries.length + " entries):");
+              for (const e of entries) {
+                const sym = e.kind === "MODEL_ADDED" ? "+" : e.kind === "MODEL_REMOVED" ? "-" : "~";
+                console.log("  " + sym + " " + e.lane.toUpperCase() + " " + e.kind + " " + e.id);
+              }
+            }
+          }
+          return 0;
+        }
+        default:
+          throw new Error("usage: gorouter models <status|list|refresh|diff> [--json]");
+      }
     }
     default:
       throw new Error(`unknown command '${cmd}'\n${USAGE}`);

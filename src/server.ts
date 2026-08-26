@@ -33,6 +33,9 @@ import {
 } from "./util.ts";
 import type { StateStore, Lane } from "./state.ts";
 import type { Journal, TerminalOutcome } from "./journal.ts";
+import { resolvePaths, type Paths } from "./paths.ts";
+import { loadRegistry, isFresh, isCooldown } from "./models/registry.ts";
+import { maybeRefreshOnStartup, refreshRegistry } from "./models/refresh.ts";
 
 export const SERVER_VERSION = "1.0.0";
 
@@ -41,6 +44,9 @@ const LANE_PREFIX: Record<Lane, string> = { go: "/go/v1", zen: "/zen/v1" };
 interface ServerDeps {
   state: StateStore;
   journal: Journal;
+  paths?: Paths;
+  /** When false, skip Slice A background startup refresh (tests use fresh state per router) */
+  startupRefresh?: boolean;
 }
 
 interface DispatchResult {
@@ -234,6 +240,142 @@ export function wrapBodyWithFinalize(
 
 export function createServer(deps: ServerDeps): { serve: () => void; stop: () => void; port: () => number } {
   let server: Server | null = null;
+
+  function serveModelsCache(lane: Lane, reg: import("./models/types.ts").RegistryFile, fromCache: "hit" | "stale"): Response {
+    const snap = lane === "go" ? reg.go! : reg.zen!;
+    const body = JSON.stringify({ object: "list", data: snap.models });
+    const age = Date.now() - Date.parse(reg.updatedAtUtc);
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-gorouter-models-cache": fromCache,
+        "x-gorouter-models-age-ms": String(Math.max(0, age)),
+        "x-gorouter-request-id": "", // filled by caller if needed
+      },
+    });
+  }
+
+  async function handleModels(lane: Lane, suffix: string, req: Request): Promise<Response> {
+    // local auth — same as dispatch (preserve auth even for bad method)
+    let localCred: string;
+    try {
+      localCred = deps.state.localCredential();
+    } catch (e) {
+      log.error(`local credential unavailable: ${e instanceof Error ? e.message : e}`);
+      return localError(503, "GoRouterCredentialError", "local router credential is not configured; run `gorouter setup`");
+    }
+    if (!validateLocalAuth(req, localCred)) {
+      const entry = deps.journal.begin({
+        lane,
+        selectedAccountId: null,
+        selectedAccountAliasSnapshot: null,
+        method: req.method,
+        endpointFamily: "models",
+        terminalOutcome: "ok",
+        httpStatus: null,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: validateCorrelationId(req.headers.get("x-gorouter-correlation-id")) ?? null,
+      });
+      deps.journal.complete(entry, { completedAtUtc: utcNow(), durationMs: 0, terminalOutcome: "local_error", httpStatus: 401, upstreamRequestIds: [] });
+      const res = localError(401, "GoRouterAuthError", "missing or invalid local client credential");
+      res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      return res;
+    }
+    if (req.method !== "GET") {
+      const entry = deps.journal.begin({
+        lane,
+        selectedAccountId: null,
+        selectedAccountAliasSnapshot: null,
+        method: req.method,
+        endpointFamily: "models",
+        terminalOutcome: "ok",
+        httpStatus: null,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: validateCorrelationId(req.headers.get("x-gorouter-correlation-id")) ?? null,
+      });
+      deps.journal.complete(entry, { completedAtUtc: utcNow(), durationMs: 0, terminalOutcome: "local_error", httpStatus: 405, upstreamRequestIds: [] });
+      const res = localError(405, "GoRouterRouteError", "method not allowed for /models; use GET");
+      res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      return res;
+    }
+    // For /models: when no registry exists, proxy directly (preserves existing proxy semantics and exact upstream request counts).
+    // When registry exists, serve from cache (fresh/stale) with background refresh. This keeps inference routing and
+    // route-snapshot validation (dangling/missing-secret -> 503/500) intact for the no-cache path.
+    const paths = deps.paths ?? resolvePaths();
+    const now = Date.now();
+    let reg = loadRegistry(paths);
+    const hasLaneData = reg !== null && (lane === "go" ? reg.go !== null : reg.zen !== null);
+    const fresh = reg !== null ? isFresh(reg, now) : false;
+    const cooldown = reg !== null ? isCooldown(reg, now) : false;
+    const correlationId = validateCorrelationId(req.headers.get("x-gorouter-correlation-id"));
+
+    // If no registry at all, directly proxy (do not attempt dual-lane refresh which would double-hit upstream and break request counts)
+    if (!reg || !hasLaneData) {
+      return dispatch(lane, suffix, new URL(req.url).search, req);
+    }
+
+    // At this point we have a registry with data for this lane: check route snapshot before serving cache
+    // so that dangling/missing-secret still fails closed (503/500) rather than silently serving stale cache.
+    try {
+      deps.state.resolveSnapshot(lane);
+    } catch (e) {
+      // Fall back to dispatch so the existing route-error handling (journal + 503/500) applies
+      return dispatch(lane, suffix, new URL(req.url).search, req);
+    }
+
+    let snapForJournal: { accountId: string; alias: string } | null = null;
+    try { const s = deps.state.resolveSnapshot(lane); snapForJournal = { accountId: s.accountId, alias: s.alias }; } catch {}
+
+    // fresh cache -> serve immediately without upstream
+    if (fresh) {
+      const entry = deps.journal.begin({
+        lane,
+        selectedAccountId: snapForJournal?.accountId ?? null,
+        selectedAccountAliasSnapshot: snapForJournal?.alias ?? null,
+        method: req.method,
+        endpointFamily: "models",
+        terminalOutcome: "ok",
+        httpStatus: 200,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: correlationId ?? null,
+      });
+      const cached = serveModelsCache(lane, reg, "hit");
+      cached.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      deps.journal.complete(entry, { completedAtUtc: utcNow(), durationMs: 0, terminalOutcome: "ok", httpStatus: 200, upstreamRequestIds: [] });
+      return cached;
+    }
+
+    // stale cache -> trigger background refresh (single-flight) and immediately serve stale
+    if (!cooldown) {
+      const s = deps.state.read();
+      refreshRegistry(paths, { upstreamGo: s.settings.upstreamGo, upstreamZen: s.settings.upstreamZen }).then((result) => {
+        if (result.success) log.info(`models registry refreshed in background (${result.registry?.go?.models.length ?? 0} go, ${result.registry?.zen?.models.length ?? 0} zen)`);
+        else log.warn(`models background refresh failed: ${result.error}`);
+      }).catch((e) => log.warn(`models background refresh failed: ${e instanceof Error ? e.message : String(e)}`));
+    }
+    {
+      const entry = deps.journal.begin({
+        lane,
+        selectedAccountId: snapForJournal?.accountId ?? null,
+        selectedAccountAliasSnapshot: snapForJournal?.alias ?? null,
+        method: req.method,
+        endpointFamily: "models",
+        terminalOutcome: "ok",
+        httpStatus: 200,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: correlationId ?? null,
+      });
+      const cached = serveModelsCache(lane, reg, "stale");
+      cached.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      deps.journal.complete(entry, { completedAtUtc: utcNow(), durationMs: 0, terminalOutcome: "ok", httpStatus: 200, upstreamRequestIds: [] });
+      return cached;
+    }
+  }
 
   async function dispatch(lane: Lane, suffix: string, search: string, req: Request): Promise<Response> {
     // --- local client auth -------------------------------------------------
@@ -509,6 +651,9 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     if (!lane) {
       return localError(404, "GoRouterRouteError", "unsupported local path; use /go/v1/* or /zen/v1/*");
     }
+    if (suffix === "/models") {
+      return handleModels(lane, suffix, req);
+    }
     if (suffix.length === 0) {
       return localError(404, "GoRouterRouteError", "unsupported local path; expected /go/v1/<path> or /zen/v1/<path>");
     }
@@ -612,6 +757,17 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       const addr = server.address();
       const actualPort = addr && typeof addr === 'object' ? addr.port : 0;
       log.info(`GoRouter V1 listening on http://${host}:${actualPort} (go/v1, zen/v1)`);
+      // Slice A startup trigger: if registry absent/stale and not in cooldown, background refresh
+      // Disabled in tests (startupRefresh===false) so per-test upstream request counts stay deterministic.
+      if (deps.startupRefresh !== false) {
+        try {
+          const startupPaths = deps.paths ?? resolvePaths();
+          const sForStartup = deps.state.read();
+          maybeRefreshOnStartup(startupPaths, sForStartup.settings.upstreamGo, sForStartup.settings.upstreamZen);
+        } catch (e) {
+          log.warn(`models startup trigger skipped: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
     },
     port() {
       const addr = server?.address();

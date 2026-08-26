@@ -24,6 +24,8 @@ export interface Paths {
   stateJson: string;
   secretsDir: string;
   journalDb: string;
+  /** Slice A: registry file for dynamic Go+Zen model catalogs. */
+  modelsRegistryJson: string;
 }
 
 export function resolvePaths(base?: string): Paths {
@@ -33,6 +35,7 @@ export function resolvePaths(base?: string): Paths {
     stateJson: join(state, "state.json"),
     secretsDir: join(state, "secrets"),
     journalDb: join(state, "journal.db"),
+    modelsRegistryJson: join(state, "models-registry.json"),
   };
 }
 
