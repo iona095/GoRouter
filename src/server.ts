@@ -36,6 +36,9 @@ import type { Journal, TerminalOutcome } from "./journal.ts";
 import { resolvePaths, type Paths } from "./paths.ts";
 import { loadRegistry, isFresh, isCooldown } from "./models/registry.ts";
 import { maybeRefreshOnStartup, refreshRegistry } from "./models/refresh.ts";
+import { createDshClient } from "./models/dsh-client.ts";
+import { reconcileDshCatalog } from "./models/dsh-sync.ts";
+import { storeDshSyncStatus } from "./models/dsh-sync-state.ts";
 
 export const SERVER_VERSION = "1.0.0";
 
@@ -352,9 +355,21 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     // stale cache -> trigger background refresh (single-flight) and immediately serve stale
     if (!cooldown) {
       const s = deps.state.read();
-      refreshRegistry(paths, { upstreamGo: s.settings.upstreamGo, upstreamZen: s.settings.upstreamZen }).then((result) => {
-        if (result.success) log.info(`models registry refreshed in background (${result.registry?.go?.models.length ?? 0} go, ${result.registry?.zen?.models.length ?? 0} zen)`);
-        else log.warn(`models background refresh failed: ${result.error}`);
+      refreshRegistry(paths, { upstreamGo: s.settings.upstreamGo, upstreamZen: s.settings.upstreamZen }).then(async (result) => {
+        if (result.success && result.registry) {
+          log.info(`models registry refreshed in background (${result.registry?.go?.models.length ?? 0} go, ${result.registry?.zen?.models.length ?? 0} zen)`);
+          // Downstream DSH reconciliation (failure-isolated, non-blocking, single-flight inside).
+          try {
+            const client = createDshClient();
+            const dshStatus = await reconcileDshCatalog(result.registry, client, {}, (st) => {
+              try { storeDshSyncStatus(paths, st); } catch {}
+            });
+            if (dshStatus.outcome === "current") log.info(`dsh live catalog reconciled (${dshStatus.activeGoCount ?? 0} go, ${dshStatus.activeZenCount ?? 0} zen, withheld go=${dshStatus.withheldGoCount ?? 0} zen=${dshStatus.withheldZenCount ?? 0})`);
+            else if (dshStatus.outcome !== "no-op") log.warn(`dsh sync pending: ${redact(dshStatus.lastError ?? dshStatus.outcome)}`);
+          } catch (e) {
+            log.warn(`dsh sync after background refresh failed (registry preserved): ${redact(e instanceof Error ? e.message : String(e))}`);
+          }
+        } else log.warn(`models background refresh failed: ${result.error}`);
       }).catch((e) => log.warn(`models background refresh failed: ${e instanceof Error ? e.message : String(e)}`));
     }
     {
@@ -763,7 +778,22 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         try {
           const startupPaths = deps.paths ?? resolvePaths();
           const sForStartup = deps.state.read();
-          maybeRefreshOnStartup(startupPaths, sForStartup.settings.upstreamGo, sForStartup.settings.upstreamZen);
+          const maybe = maybeRefreshOnStartup(startupPaths, sForStartup.settings.upstreamGo, sForStartup.settings.upstreamZen);
+          if (maybe) {
+            maybe.then(async (result) => {
+              if (result?.success && result.registry) {
+                try {
+                  const client = createDshClient();
+                  const st = await reconcileDshCatalog(result.registry, client, {}, (d) => {
+                    try { storeDshSyncStatus(startupPaths, d); } catch {}
+                  });
+                  if (st.outcome === "current") log.info(`dsh live catalog reconciled on startup (${st.activeGoCount ?? 0} go, ${st.activeZenCount ?? 0} zen)`);
+                } catch (e) {
+                  log.warn(`dsh sync on startup failed (registry preserved): ${redact(e instanceof Error ? e.message : String(e))}`);
+                }
+              }
+            }).catch((e) => log.warn(`dsh sync on startup failed: ${e instanceof Error ? e.message : String(e)}`));
+          }
         } catch (e) {
           log.warn(`models startup trigger skipped: ${e instanceof Error ? e.message : String(e)}`);
         }

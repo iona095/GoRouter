@@ -26,6 +26,8 @@ export interface Paths {
   journalDb: string;
   /** Slice A: registry file for dynamic Go+Zen model catalogs. */
   modelsRegistryJson: string;
+  /** Slice B: DSH sync status (narrow, non-secret, separate from registry). */
+  dshSyncStateJson: string;
 }
 
 export function resolvePaths(base?: string): Paths {
@@ -36,6 +38,7 @@ export function resolvePaths(base?: string): Paths {
     secretsDir: join(state, "secrets"),
     journalDb: join(state, "journal.db"),
     modelsRegistryJson: join(state, "models-registry.json"),
+    dshSyncStateJson: join(state, "dsh-sync-state.json"),
   };
 }
 

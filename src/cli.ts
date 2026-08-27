@@ -366,6 +366,7 @@ async function main(argv: string[]): Promise<number> {
               diffSummary: s.diffSummary,
               lastAttempt: s.lastAttempt,
               isStale: s.exists && !((s as unknown as { corrupt?: boolean }).corrupt) ? !s.isFresh : null,
+              dshSync: s.dshSync ?? null,
             };
             console.log(JSON.stringify(payload, null, 2));
           } else {
@@ -419,6 +420,18 @@ async function main(argv: string[]): Promise<number> {
                 console.log("  Diff: no changes (lastDiff empty)");
               } else {
                 console.log("  Diff: +" + ds.added + " added, -" + ds.removed + " removed, ~" + ds.changed + " changed (total " + ds.total + ", last at " + (ds.lastDiffAtUtc ?? s.registry!.updatedAtUtc) + ")");
+              }
+              // Slice B: DSH sync observability
+              const dsh = s.dshSync;
+              if (dsh) {
+                console.log("  DSH sync: enabled=" + dsh.enabled + " reachable=" + dsh.reachable + " outcome=" + dsh.outcome + " mutation=" + dsh.mutationPerformed);
+                if (dsh.lastAttemptAt) console.log("    lastAttempt: " + dsh.lastAttemptAt + (dsh.lastSuccessAt ? " lastSuccess: " + dsh.lastSuccessAt : ""));
+                if (dsh.activeGoCount !== null || dsh.activeZenCount !== null) console.log("    active: go=" + (dsh.activeGoCount ?? "?") + " zen=" + (dsh.activeZenCount ?? "?"));
+                if (dsh.withheldGoCount !== null || dsh.withheldZenCount !== null) console.log("    withheld: go=" + (dsh.withheldGoCount ?? "?") + " zen=" + (dsh.withheldZenCount ?? "?"));
+                if (dsh.observedRevision !== null || dsh.committedRevision !== null) console.log("    revision: observed=" + dsh.observedRevision + " committed=" + dsh.committedRevision);
+                if (dsh.lastError) console.log("    lastError: " + redact(dsh.lastError));
+              } else {
+                console.log("  DSH sync: no status yet (no reconciliation attempted)");
               }
             }
           }

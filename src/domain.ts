@@ -33,10 +33,14 @@ import {
   type AccountRecord,
 } from "./state.ts";
 import { createJournal, type JournalStats } from "./journal.ts";
-import { tryUnlink } from "./util.ts";
+import { tryUnlink, redact, log } from "./util.ts";
 import { registryPathFor, loadRegistry, peekRegistry, storeRegistry, registryAgeMs, isFresh, isCooldown, cooldownRemainingMs } from "./models/registry.ts";
 import { refreshRegistry, type RefreshResult } from "./models/refresh.ts";
 import { MODELS_TTL_MS, MODELS_COOLDOWN_MS, type RegistryFile, type ModelEntry, type DiffEntry } from "./models/types.ts";
+import { emptyDshSyncStatus, type DshSyncStatus } from "./models/dsh-types.ts";
+import { loadDshSyncStatus, storeDshSyncStatus } from "./models/dsh-sync-state.ts";
+import { createDshClient, type DshClient } from "./models/dsh-client.ts";
+import { reconcileDshCatalog } from "./models/dsh-sync.ts";
 import { probeAccountKey, type ProbeResult } from "./probe.ts";
 import { withFileLock, lockPathFor } from "./lock.ts";
 
@@ -82,6 +86,8 @@ export interface ModelsStatusView {
   counts: Record<Lane, number>;
   diffSummary: { added: number; removed: number; changed: number; total: number; lastDiffAtUtc: string | null };
   lastAttempt: RegistryFile["lastAttempt"] | null;
+  /** Slice B: DSH sync status (when available). */
+  dshSync?: DshSyncStatus | null;
 }
 
 export interface ModelsListView {
@@ -110,8 +116,10 @@ export interface Domain {
   reset(): void;
   modelsStatus(): ModelsStatusView;
   modelsList(lane: Lane): ModelsListView;
-  modelsRefresh(): Promise<RefreshResult>;
+  modelsRefresh(opts?: { dshClient?: DshClient }): Promise<RefreshResult & { dshSync?: DshSyncStatus | null }>;
   modelsDiff(): DiffEntry[];
+  /** Slice B: trigger DSH reconciliation for current registry (downstream, non-blocking). */
+  dshSync(opts?: { dshClient?: DshClient }): Promise<DshSyncStatus | null>;
 }
 
 function viewAccount(state: StateFile, secrets: SecretStore, a: AccountRecord): AccountView {
@@ -384,6 +392,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
     modelsStatus(): ModelsStatusView {
       const peek = peekRegistry(paths);
       const reg = peek.file;
+      const dshSync = loadDshSyncStatus(paths);
       if (!reg) {
         return {
           exists: peek.exists,
@@ -400,6 +409,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
           counts: { go: 0, zen: 0 },
           diffSummary: { added: 0, removed: 0, changed: 0, total: 0, lastDiffAtUtc: null },
           lastAttempt: null,
+          dshSync,
         };
       }
       const now = Date.now();
@@ -427,6 +437,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         counts,
         diffSummary: { added, removed, changed, total: reg.lastDiff.length, lastDiffAtUtc: reg.lastDiff.length > 0 ? reg.updatedAtUtc : null },
         lastAttempt: reg.lastAttempt,
+        dshSync,
       };
     },
 
@@ -437,13 +448,25 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       return { lane, count: snap.models.length, fetchedAtUtc: snap.fetchedAtUtc, models: [...snap.models] };
     },
 
-    async modelsRefresh(): Promise<RefreshResult> {
+    async modelsRefresh(opts: { dshClient?: DshClient } = {}): Promise<RefreshResult & { dshSync?: DshSyncStatus | null }> {
       const s = state.read();
       const result = await refreshRegistry(paths, {
         upstreamGo: s.settings.upstreamGo,
         upstreamZen: s.settings.upstreamZen,
         forced: true,
       });
+      // Downstream DSH reconciliation after successful authoritative publication (failure-isolated).
+      if (result.success && result.registry) {
+        try {
+          const client = opts.dshClient ?? createDshClient();
+          const dshStatus = await reconcileDshCatalog(result.registry, client, {}, (st) => {
+            try { storeDshSyncStatus(paths, st); } catch {}
+          });
+          return { ...result, dshSync: dshStatus };
+        } catch (e) {
+          log.warn(`dsh sync after refresh failed (registry preserved): ${redact(e instanceof Error ? e.message : String(e))}`);
+        }
+      }
       return result;
     },
 
@@ -451,6 +474,16 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const reg = loadRegistry(paths);
       if (!reg) return [];
       return [...reg.lastDiff];
+    },
+
+    async dshSync(opts: { dshClient?: DshClient } = {}): Promise<DshSyncStatus | null> {
+      const reg = loadRegistry(paths);
+      if (!reg || !reg.go || !reg.zen) return null;
+      const client = opts.dshClient ?? createDshClient();
+      const status = await reconcileDshCatalog(reg, client, {}, (st) => {
+        try { storeDshSyncStatus(paths, st); } catch {}
+      });
+      return status;
     },
   };
 }
