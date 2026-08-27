@@ -1,15 +1,17 @@
-﻿/**
- * T7 — Deterministic tests: DSH-sync (Slice B) + Slice A regression.
+/**
+ * T7 / B.1 — Deterministic tests: DSH-sync engine mechanics + Slice A regression.
  *
- * Covers every contract-required case deterministically (no live network):
+ * DSH reconcile tests are approval-gated: eligibility is sourced from an
+ * injected approval store ({ state:"initialized", store:{...} }), never from
+ * the removed deriveDesiredDshState / knownGoIds / knownZenIds legacy opts.
+ * Covers engine mechanics deterministically (no live network):
  *  offline, becomes-available, no-op zero mutations, one-lane change,
- *  both-lane change, removed model, new known, new unknown withheld,
- *  failed/partial/corrupt registry no mutation, revision race,
- *  bounded retry exhaustion, verification re-read, verification mismatch,
- *  unrelated settings preserved, provider metadata preserved,
- *  per-model overrides preserved, deterministic ordering,
- *  concurrent coalescing, restart mid-sync, sanitized errors,
- *  registry survives DSH failure.
+ *  both-lane change, removed model, revision race, bounded retry exhaustion,
+ *  verification re-read, verification mismatch, unrelated settings preserved
+ *  (FileDshClient real-file seam), provider metadata preserved, per-model
+ *  overrides preserved, deterministic ordering, concurrent coalescing,
+ *  restart mid-sync, sanitized errors, registry survives DSH failure.
+ * Approval-gate status classes live in test/dsh-sync-approvals.test.ts.
  * Proves Slice A regression: 24h TTL, 5m cooldown, manual bypass,
  *  transactional publication, single-flight, known-good preservation,
  *  auth, routing regression — all deterministic.
@@ -58,7 +60,8 @@ import {
   type DshClient,
   type DshSnapshot,
 } from "../src/models/dsh-client.ts";
-import { deriveDesiredDshState, isSemanticNoOp } from "../src/models/dsh-eligibility.ts";
+import { deriveApprovalDesiredDshState, isSemanticNoOp } from "../src/models/dsh-eligibility.ts";
+import { OWNED_DSH_PROVIDERS, type ApprovalStoreLoad } from "../src/models/dsh-approvals.ts";
 import { reconcileDshCatalog, clearDshSyncSingleFlightForTests } from "../src/models/dsh-sync.ts";
 import { loadDshSyncStatus, storeDshSyncStatus } from "../src/models/dsh-sync-state.ts";
 import { redact } from "../src/util.ts";
@@ -133,6 +136,32 @@ function authoritativeReg(goIds: string[], zenIds: string[], extra?: { goMap?: M
   return reg;
 }
 
+// --- B.1 approval-store + owned-binding helpers -----------------------------
+
+/** Certified owned provider bindings on the canonical local lane routes. */
+const GO_BIND = { api: "openai-completions", baseURL: "http://127.0.0.1:8787/go/v1" };
+const ZEN_BIND = { api: "openai-responses", baseURL: "http://127.0.0.1:8787/zen/v1" };
+const RAW_BINDINGS = { rawGoProvider: { ...GO_BIND }, rawZenProvider: { ...ZEN_BIND } };
+
+function approval(lane: "go" | "zen", modelId: string, opts: { apiProtocol?: string; dshProviderId?: string; source?: "operator" | "legacy-migration" } = {}) {
+  return {
+    lane,
+    dshProviderId: opts.dshProviderId ?? OWNED_DSH_PROVIDERS[lane].providerId,
+    apiProtocol: opts.apiProtocol ?? OWNED_DSH_PROVIDERS[lane].apiProtocol,
+    modelId,
+    approvedAtUtc: BASE_ISO,
+    source: opts.source ?? ("operator" as const),
+  };
+}
+/** Hand-built initialized approval store view for injection into reconcile. */
+function initStore(goIds: string[], zenIds: string[]): ApprovalStoreLoad {
+  const approvals = [
+    ...goIds.map((id) => approval("go", id)),
+    ...zenIds.map((id) => approval("zen", id)),
+  ].sort((a, b) => (a.lane + a.modelId < b.lane + b.modelId ? -1 : 1));
+  return { state: "initialized", store: { version: 1, initializedAtUtc: BASE_ISO, approvals } };
+}
+
 // Helper: memory client with injected behavior
 function failingReadClient(msg = "offline"): DshClient {
   return {
@@ -146,16 +175,25 @@ function nullSnapshotClient(): DshClient {
     async mutate(): Promise<{revision:number}> { throw new Error("should not mutate"); },
   };
 }
+/** Memory client that counts reads (proves the gate short-circuits before DSH I/O). */
+function countingClient(inner: DshClient): DshClient & { reads: number } {
+  const c = {
+    reads: 0,
+    async read(): Promise<DshSnapshot|null> { c.reads += 1; return inner.read(); },
+    async mutate(g: ModelEntry[], z: ModelEntry[], r: number) { return inner.mutate(g, z, r); },
+  };
+  return c;
+}
 
 // ---------------------------------------------------------------------------
-// 1. DSH core: offline / becomes-available
+// 1. DSH core: offline / becomes-available (approval-gated)
 // ---------------------------------------------------------------------------
 
 describe("DSH offline / becomes-available", () => {
   test("offline: read failure yields pending, reachable false, no mutation, registry preserved", async () => {
     const reg = authoritativeReg(["go-a"], ["zen-b"]);
     const client = failingReadClient("ECONNREFUSED dsh host down");
-    const st = await reconcileDshCatalog(reg, client);
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a"], ["zen-b"]) });
     expect(st.reachable).toBe(false);
     expect(st.outcome).toBe("pending");
     expect(st.mutationPerformed).toBe(false);
@@ -165,25 +203,28 @@ describe("DSH offline / becomes-available", () => {
   test("offline: null snapshot (namespace not registered) yields pending", async () => {
     const reg = authoritativeReg(["go-a"], ["zen-b"]);
     const client = nullSnapshotClient();
-    const st = await reconcileDshCatalog(reg, client);
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a"], ["zen-b"]) });
     expect(st.reachable).toBe(false);
     expect(st.outcome).toBe("pending");
     expect(st.mutationPerformed).toBe(false);
   });
 
-  test("becomes-available: after offline, same registry syncs when DSH recovers", async () => {
+  test("becomes-available: after offline, approved registry syncs when DSH recovers", async () => {
     const reg = authoritativeReg(["go-a"], ["zen-b"]);
     const offlineClient = failingReadClient("offline");
-    const s1 = await reconcileDshCatalog(reg, offlineClient);
+    const s1 = await reconcileDshCatalog(reg, offlineClient, { approvalStore: initStore(["go-a"], ["zen-b"]) });
     expect(s1.outcome).toBe("pending");
     clearDshSyncSingleFlightForTests();
 
-    // now with real in-memory DSH that has empty catalog -> knownGo defaults to its own ids, so registry unknown will be withheld
-    // Provide DSH with matching currentGo so it is eligible: start DSH with same ids as registry => no-op or current
-    const online = createMemoryDshClient({ go: [makeModel("go-a")], zen: [makeModel("zen-b")] });
-    const s2 = await reconcileDshCatalog(reg, online as unknown as DshClient);
+    // DSH recovers with empty owned arrays: approved registry ids are newly
+    // eligible and sync in one coherent mutation.
+    const online = createMemoryDshClient({ go: [], zen: [], ...RAW_BINDINGS });
+    const s2 = await reconcileDshCatalog(reg, online as unknown as DshClient, { approvalStore: initStore(["go-a"], ["zen-b"]) });
     expect(s2.reachable).toBe(true);
-    expect(["current","no-op"].includes(s2.outcome)).toBe(true);
+    expect(s2.outcome).toBe("current");
+    const snap = await online.read();
+    expect(snap!.go.map((m) => m.id)).toEqual(["go-a"]);
+    expect(snap!.zen.map((m) => m.id)).toEqual(["zen-b"]);
   });
 });
 
@@ -192,24 +233,28 @@ describe("DSH offline / becomes-available", () => {
 // ---------------------------------------------------------------------------
 
 describe("no-op zero mutations", () => {
-  test("identical DSH and registry contents → no-op with zero mutations", async () => {
+  test("identical DSH and approved-registry contents → no-op with zero mutations", async () => {
     const reg = authoritativeReg(["go-a","go-b"], ["zen-x"]);
-    // DSH snapshot matches desired (known defaults to current ids, so registry known => desired equals current)
-    const client = createMemoryDshClient({ go: [makeModel("go-a"), makeModel("go-b")], zen: [makeModel("zen-x")] }) as unknown as DshClient & { mutations:number; history:any[] };
-    const st = await reconcileDshCatalog(reg, client);
+    const client = createMemoryDshClient({ go: [makeModel("go-a"), makeModel("go-b")], zen: [makeModel("zen-x")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number; history:any[] };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a","go-b"], ["zen-x"]) });
     expect(st.outcome).toBe("no-op");
     expect(st.mutationPerformed).toBe(false);
     expect((client as any).mutations).toBe(0);
     expect((client as any).history.length).toBe(0);
     expect(st.activeGoCount).toBe(2);
     expect(st.activeZenCount).toBe(1);
+    // Success statuses carry the approval-gate health fields
+    expect(st.approvalsInitialized).toBe(true);
+    expect(st.migrationRequired).toBe(false);
+    expect(st.bindingValid).toBe(true);
+    expect(st.bindingError).toBeNull();
   });
 
   test("no-op persists DSH sync status with committedRevision == observedRevision", async () => {
     const reg = authoritativeReg(["a"], ["b"]);
-    const client = createMemoryDshClient({ go:[makeModel("a")], zen:[makeModel("b")], revision: 7 }) as unknown as DshClient;
+    const client = createMemoryDshClient({ go:[makeModel("a")], zen:[makeModel("b")], revision: 7, ...RAW_BINDINGS }) as unknown as DshClient;
     const statuses: any[] = [];
-    const st = await reconcileDshCatalog(reg, client, {}, (s)=>statuses.push(s));
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a"], ["b"]) }, (s)=>statuses.push(s));
     expect(st.observedRevision).toBe(7);
     expect(st.committedRevision).toBe(7);
     expect(statuses[0].observedRevision).toBe(7);
@@ -221,21 +266,19 @@ describe("no-op zero mutations", () => {
 // ---------------------------------------------------------------------------
 
 describe("one-lane and both-lane change", () => {
-  test("one-lane go change: only go lane mutates while zen stable -> single coherent mutate", async () => {
+  test("one-lane go change: newly approved model activates, zen stable -> single coherent mutate", async () => {
     const reg = authoritativeReg(["go-a","go-new"], ["zen-x"]);
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-x")] }) as unknown as DshClient & { mutations:number; history:any[] };
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["go-a","go-new"]), knownZenIds: new Set(["zen-x"]) });
+    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-x")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number; history:any[] };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a","go-new"], ["zen-x"]) });
     expect(st.outcome).toBe("current");
     expect((client as any).history.length).toBe(1);
     expect((client as any).history[0].go.map((m:ModelEntry)=>m.id)).toEqual(["go-a","go-new"]);
     expect((client as any).history[0].zen.map((m:ModelEntry)=>m.id)).toEqual(["zen-x"]);
   });
-  test("one-lane change: only zen lane mutates when only zen registry changes (both lanes atomically written)", async () => {
-    // Current DSH: go-a, zen-x (both lanes). Registry adds new zen-y but go unchanged, with zen-y known
+  test("one-lane change: only zen lane gains an approved model (both lanes atomically written)", async () => {
     const reg = authoritativeReg(["go-a"], ["zen-x","zen-y"]);
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-x")] }) as unknown as DshClient & { mutations:number; history:any[] };
-    // allow zen-y: add to known via opts
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["go-a"]), knownZenIds: new Set(["zen-x","zen-y"]) });
+    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-x")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number; history:any[] };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a"], ["zen-x","zen-y"]) });
     expect(st.outcome).toBe("current");
     expect(st.mutationPerformed).toBe(true);
     expect((client as any).history.length).toBe(1);
@@ -246,11 +289,8 @@ describe("one-lane and both-lane change", () => {
 
   test("both-lane change: both lanes evolve together in single coherent mutation", async () => {
     const reg = authoritativeReg(["go-a","go-b"], ["zen-x","zen-y"]);
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-x")] }) as unknown as DshClient & { mutations:number; history:any[] };
-    const st = await reconcileDshCatalog(reg, client, {
-      knownGoIds: new Set(["go-a","go-b"]),
-      knownZenIds: new Set(["zen-x","zen-y"]),
-    });
+    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-x")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number; history:any[] };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a","go-b"], ["zen-x","zen-y"]) });
     expect(st.outcome).toBe("current");
     expect((client as any).history.length).toBe(1);
     expect((client as any).history[0].go.map((m:ModelEntry)=>m.id)).toEqual(["go-a","go-b"]);
@@ -263,95 +303,55 @@ describe("one-lane and both-lane change", () => {
 // ---------------------------------------------------------------------------
 
 describe("removed model", () => {
-  test("model absent from registry is removed from DSH (eligible removal)", async () => {
-    const reg = authoritativeReg(["go-a"], ["zen-b"]); // zen-x removed
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-b"), makeModel("zen-x")] }) as unknown as DshClient;
-    const st = await reconcileDshCatalog(reg, client, {
-      knownGoIds: new Set(["go-a"]),
-      knownZenIds: new Set(["zen-b","zen-x"]),
-    });
+  test("approved model absent from registry is removed from DSH (inactive, approval retained)", async () => {
+    const reg = authoritativeReg(["go-a"], ["zen-b"]); // zen-gone not discovered upstream
+    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-b"), makeModel("zen-gone")], ...RAW_BINDINGS }) as unknown as DshClient & { history:any[] };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a"], ["zen-b","zen-gone"]) });
     expect(st.outcome).toBe("current");
     const snap = await client.read() as DshSnapshot;
     expect(snap.zen.map(m=>m.id)).toEqual(["zen-b"]);
     expect(snap.go.map(m=>m.id)).toEqual(["go-a"]);
+    expect(st.approvedAbsentZenCount).toBe(1);
+    expect(st.activeZenCount).toBe(1);
   });
-});
 
-// ---------------------------------------------------------------------------
-// 5. New known / new unknown withheld
-// ---------------------------------------------------------------------------
-
-describe("eligibility: new known vs unknown withheld", () => {
-  test("new known model is activated (appended deterministically)", async () => {
-    const reg = authoritativeReg(["go-a","go-new"], ["zen-b"]);
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-b")] }) as unknown as DshClient;
-    const st = await reconcileDshCatalog(reg, client, {
-      knownGoIds: new Set(["go-a","go-new"]),
-      knownZenIds: new Set(["zen-b"]),
-    });
+  test("unapproved configured model is removed and withheld (approval-gated removal)", async () => {
+    const reg = authoritativeReg(["go-a"], ["zen-b"]); // zen-x approval revoked
+    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-b"), makeModel("zen-x")], ...RAW_BINDINGS }) as unknown as DshClient & { history:any[] };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a"], ["zen-b"]) });
     expect(st.outcome).toBe("current");
     const snap = await client.read() as DshSnapshot;
-    expect(snap.go.map(m=>m.id)).toEqual(["go-a","go-new"]);
-    expect(st.withheldGoCount).toBe(0);
-  });
-
-  test("new unknown model is withheld (not routed) — withheld counts accurate", async () => {
-    const reg = authoritativeReg(["go-new-unknown"], ["zen-b"]);
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-b")] }) as unknown as DshClient;
-    // knownGo does NOT contain go-new-unknown => withheld
-    const st = await reconcileDshCatalog(reg, client, {
-      knownGoIds: new Set(["go-a"]), // unknown not included
-      knownZenIds: new Set(["zen-b"]),
-    });
-    // Desired = surviving go-a (since withheld, not added)
-    // But registry go-new-unknown not surviving because not in current. So DSH stays go-a only
-    // However our deriveDesired will see currentGo=[go-a], registryGoIds=[go-new-unknown], knownGo=[go-a] => withheldGo=[go-new-unknown], survivingGo=[go-a] filtered by reg set => [] actually go-a not in reg set => removed? Wait go-a not in reg set ["go-new-unknown"] => surviving empty
-    // So desiredGo becomes [] (removal) — still a mutation within withheld semantics
-    expect(st.withheldGoCount).toBe(1);
-    // The key assertion: withheldGo count is 1, and desired active does NOT include the unknown
-    const snap = await client.read() as DshSnapshot;
-    expect(snap.go.find(m=>m.id==="go-new-unknown")).toBeUndefined();
-  });
-
-  test("mixed known + unknown: known activates, unknown withheld simultaneously", async () => {
-    const reg = authoritativeReg(["go-a","go-known-new","go-unknown"], ["zen-b"]);
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("zen-b")] }) as unknown as DshClient;
-    const st = await reconcileDshCatalog(reg, client, {
-      knownGoIds: new Set(["go-a","go-known-new"]), // unknown omitted
-      knownZenIds: new Set(["zen-b"]),
-    });
-    expect(st.withheldGoCount).toBe(1);
-    const snap = await client.read() as DshSnapshot;
-    expect(snap.go.map(m=>m.id)).toEqual(expect.arrayContaining(["go-a","go-known-new"]));
-    expect(snap.go.find(m=>m.id==="go-unknown")).toBeUndefined();
+    expect(snap.zen.map(m=>m.id)).toEqual(["zen-b"]);
+    expect(st.withheldZenCount).toBe(0); // zen-x not in registry → withheld counts track registry only
+    expect((client as any).history.length).toBe(1);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 6. Failed/partial/corrupt registry no mutation
+// 5. Failed/partial/corrupt registry no mutation
 // ---------------------------------------------------------------------------
 
 describe("failed/partial/corrupt registry — no mutation", () => {
   test("registry with go=null (partial) must not mutate DSH", async () => {
     const partial = registryFile({ goIds: null, zenIds: ["zen-b"] }); // go is null => non-authoritative
-    const client = createMemoryDshClient({ go:[makeModel("g")], zen:[makeModel("zen-b")] }) as unknown as DshClient & { mutations:number };
-    const st = await reconcileDshCatalog(partial, client);
+    const client = createMemoryDshClient({ go:[makeModel("g")], zen:[makeModel("zen-b")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number };
+    const st = await reconcileDshCatalog(partial, client, { approvalStore: initStore(["g"], ["zen-b"]) });
     expect(st.outcome).toBe("pending");
     expect((client as any).mutations).toBe(0);
   });
 
   test("registry with zen=null (partial) must not mutate DSH", async () => {
     const partial = registryFile({ goIds: ["go-a"], zenIds: null });
-    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("z")] }) as unknown as DshClient & { mutations:number };
-    const st = await reconcileDshCatalog(partial, client);
+    const client = createMemoryDshClient({ go:[makeModel("go-a")], zen:[makeModel("z")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number };
+    const st = await reconcileDshCatalog(partial, client, { approvalStore: initStore(["go-a"], ["z"]) });
     expect(st.outcome).toBe("pending");
     expect((client as any).mutations).toBe(0);
   });
 
   test("both lanes null (never fetched) must not mutate", async () => {
     const empty = registryFile({ goIds: null, zenIds: null });
-    const client = createMemoryDshClient({ go:[makeModel("g")], zen:[makeModel("z")] }) as unknown as DshClient & { mutations:number };
-    const st = await reconcileDshCatalog(empty, client);
+    const client = createMemoryDshClient({ go:[makeModel("g")], zen:[makeModel("z")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number };
+    const st = await reconcileDshCatalog(empty, client, { approvalStore: initStore(["g"], ["z"]) });
     expect(st.outcome).toBe("pending");
     expect((client as any).mutations).toBe(0);
   });
@@ -363,7 +363,7 @@ describe("failed/partial/corrupt registry — no mutation", () => {
     writeFileSync(registryPathFor(paths), "{ corrupt", "utf8");
     expect(loadRegistry(paths)).toBeNull();
     // domain.dshSync path: would return null
-    const mem = createMemoryDshClient({ go:[makeModel("g")], zen:[makeModel("z")] }) as unknown as DshClient & { mutations:number };
+    const mem = createMemoryDshClient({ go:[makeModel("g")], zen:[makeModel("z")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number };
     // Simulate domain guard: no mutation if loadRegistry is null
     const reg = loadRegistry(paths);
     expect(reg).toBeNull();
@@ -373,7 +373,7 @@ describe("failed/partial/corrupt registry — no mutation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. Revision race & bounded retry exhaustion
+// 6. Revision race & bounded retry exhaustion
 // ---------------------------------------------------------------------------
 
 describe("revision race & bounded retry", () => {
@@ -383,7 +383,7 @@ describe("revision race & bounded retry", () => {
     let zen: ModelEntry[] = [makeModel("zen-b")];
     let mutateCalls = 0;
     const client: DshClient = {
-      async read() { return { revision: rev, go: [...go], zen: [...zen] }; },
+      async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
       async mutate(desiredGo, desiredZen, expectedRevision) {
         mutateCalls++;
         if (mutateCalls === 1) {
@@ -397,7 +397,7 @@ describe("revision race & bounded retry", () => {
       },
     };
     const reg = authoritativeReg(["go-a","go-b"], ["zen-b"]);
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["go-a","go-b"]), knownZenIds: new Set(["zen-b"]) });
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["go-a","go-b"], ["zen-b"]) });
     expect(st.outcome).toBe("current");
     expect(mutateCalls).toBe(2);
     expect(st.mutationPerformed).toBe(true);
@@ -409,14 +409,14 @@ describe("revision race & bounded retry", () => {
     const go: ModelEntry[] = [makeModel("g")];
     const zen: ModelEntry[] = [makeModel("z")];
     const client: DshClient = {
-      async read() { return { revision: rev, go: [...go], zen: [...zen] }; },
+      async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
       async mutate(_a,_b, expectedRevision) {
         rev += 1; // external bump each time
         throw new DshConflictError(expectedRevision, rev);
       },
     };
     const reg = authoritativeReg(["g","new"], ["z"]);
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["g","new"]), knownZenIds: new Set(["z"]) });
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["g","new"], ["z"]) });
     expect(st.outcome).toBe("pending");
     expect(st.lastError).toMatch(/revision conflict exhausted/);
     expect(st.lastError).toMatch(/3/);
@@ -424,7 +424,7 @@ describe("revision race & bounded retry", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8. Verification re-read & mismatch
+// 7. Verification re-read & mismatch
 // ---------------------------------------------------------------------------
 
 describe("verification re-read & mismatch", () => {
@@ -436,7 +436,7 @@ describe("verification re-read & mismatch", () => {
     const client: DshClient = {
       async read() {
         if (afterMutateShouldFail) throw new Error("verification read boom");
-        return { revision: rev, go: [...go], zen: [...zen] };
+        return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS };
       },
       async mutate(desiredGo, desiredZen, expectedRevision) {
         if (expectedRevision !== rev) throw new DshConflictError(expectedRevision, rev);
@@ -446,7 +446,7 @@ describe("verification re-read & mismatch", () => {
       },
     };
     const reg = authoritativeReg(["a","new"], ["b"]);
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) });
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) });
     expect(st.outcome).toBe("pending");
     expect(st.lastError).toMatch(/verification read failed/);
     expect(st.mutationPerformed).toBe(true);
@@ -457,7 +457,7 @@ describe("verification re-read & mismatch", () => {
     let go: ModelEntry[] = [makeModel("a")];
     let zen: ModelEntry[] = [makeModel("b")];
     const client: DshClient = {
-      async read() { return { revision: rev, go: [...go], zen: [...zen] }; },
+      async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
       async mutate(desiredGo, desiredZen, expectedRevision) {
         if (expectedRevision !== rev) throw new DshConflictError(expectedRevision, rev);
         // Simulate DSH silently dropping the new model (mismatch): keep old state
@@ -467,15 +467,15 @@ describe("verification re-read & mismatch", () => {
       },
     };
     const reg = authoritativeReg(["a","new"], ["b"]);
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) });
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) });
     expect(st.outcome).toBe("pending");
     expect(st.lastError).toMatch(/verification mismatch/);
   });
 
   test("verification re-read success path commits observed and committed revisions", async () => {
     const reg = authoritativeReg(["a","new"], ["b"]);
-    const client = createMemoryDshClient({ go:[makeModel("a")], zen:[makeModel("b")], revision: 5 }) as unknown as DshClient;
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) });
+    const client = createMemoryDshClient({ go:[makeModel("a")], zen:[makeModel("b")], revision: 5, ...RAW_BINDINGS }) as unknown as DshClient;
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) });
     expect(st.outcome).toBe("current");
     expect(st.observedRevision).toBe(5);
     expect(st.committedRevision).toBe(6);
@@ -483,75 +483,19 @@ describe("verification re-read & mismatch", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 9. Unrelated settings preserved
+// 8. Unrelated settings / provider metadata / per-model overrides preserved
 // ---------------------------------------------------------------------------
 
-describe("unrelated settings preserved", () => {
-  test("DSH mutate preserves unrelated provider fields and non-gorouter state (simulated via FileDshClient-like doc)", async () => {
-    // broader than memory: we test via a simulated document preservation check
-    // create a memory client that also tracks raw provider shape: we assert that only models arrays change
-    const client = createMemoryDshClient({
-      go: [makeModel("go-a", { displayName: "Go", apiKeyEnv: "OPENCODE_API_KEY", extraField: "kept", models: undefined } as any)],
-      zen: [makeModel("zen-b", { displayName: "Zen", baseURL: "https://x", models: undefined } as any)],
-    }) as unknown as DshClient & { history:any[] };
-    const reg = authoritativeReg(["go-a","go-new"], ["zen-b"]);
-    await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["go-a","go-new"]), knownZenIds: new Set(["zen-b"]) });
-    // after reconcile, go models updated but previous per-model override for go-a should be preserved if surviving
-    // For this, we seed go-a with a compat override and ensure surviving preserves it
-    const client2 = createMemoryDshClient({
-      go: [makeModel("go-a"), makeModel("go-keep")],
-      zen: [makeModel("zen-b")],
-    }) as unknown as DshClient & { history:any[] };
-    // give go-a a custom field via currentGo entry
-    const customGoA = makeModel("go-a", { input: ["custom"], compat: { chatTemplateKwargs: { foo: 1 } } });
-    // We need a client that returns customGoA as current; use manual client
-    let rev=0; let go=[customGoA, makeModel("go-keep")]; let zen=[makeModel("zen-b")];
-    const customClient: DshClient = {
-      async read() { return { revision: rev, go: [...go], zen: [...zen] }; },
-      async mutate(dg, dz, exp) { if(exp!==rev) throw new DshConflictError(exp, rev); go=[...dg]; zen=[...dz]; rev+=1; return {revision: rev}; }
-    };
-    const st = await reconcileDshCatalog(authoritativeReg(["go-a","go-keep"], ["zen-b"]), customClient);
-    // This is no-op, but verifies preservation logic by checking that no-op detection compares extra fields via JSON.stringify
-    expect(st.outcome).toBe("no-op");
-    // Now add a new eligible model — surviving go-a must keep its custom input
-    clearDshSyncSingleFlightForTests();
-    const st2 = await reconcileDshCatalog(authoritativeReg(["go-a","go-keep","go-new"], ["zen-b"]), customClient, { knownGoIds: new Set(["go-a","go-keep","go-new"]), knownZenIds: new Set(["zen-b"]) });
-    expect(st2.outcome).toBe("current");
-    const snap = await customClient.read() as DshSnapshot;
-    const kept = snap.go.find(m=>m.id==="go-a") as any;
-    // Per-contract T4: surviving preserving order, existing entry kept verbatim (override preserved)
-    expect(kept.input).toEqual(["custom"]);
-  });
-
-  test("deriveDesiredDshState preserves per-model overrides for surviving", () => {
-    const surviving = makeModel("keep", { input: ["x"], compat: { chatTemplateKwargs: { a:1 } } });
-    const res = deriveDesiredDshState({
-      currentGo: [surviving, makeModel("remove-me")],
-      currentZen: [],
-      registryGoIds: ["keep","new-one"],
-      registryZenIds: [],
-      knownGoIds: new Set(["keep","new-one","remove-me"]),
-    });
-    expect(res.desiredGo.find(m=>m.id==="keep")!.input).toEqual(["x"]);
-    expect(res.removalsGo).toEqual(["remove-me"]);
-    expect(res.desiredGo.map(m=>m.id)).toEqual(["keep","new-one"]);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 10. Deterministic ordering
-// ---------------------------------------------------------------------------
-
-
-  test("FileDshClient preserves unrelated provider fields on disk (real file seam)", async () => {
+describe("unrelated settings preserved (FileDshClient real file seam)", () => {
+  test("FileDshClient preserves unrelated provider fields on disk; owned provider metadata preserved", async () => {
     const { paths } = freshPaths();
     // Build a real settings file via FileDshClient's file seam (JSON fallback for test)
     const settingsPath = join(paths.state, "settings.yaml");
     const initialDoc: Record<string, unknown> = {
       "llm-pi-ai": {
         providers: {
-          "gorouter-go": { displayName: "Go", api: "openai", apiKeyEnv: "OPENCODE_API_KEY", baseURL: "https://opencode.ai/zen/go/v1", models: [{ id: "go-a" }] },
-          "gorouter-zen": { displayName: "Zen", api: "openai", apiKeyEnv: "OPENCODE_API_KEY", baseURL: "https://opencode.ai/zen/v1", models: [{ id: "zen-b" }] },
+          "gorouter-go": { displayName: "Go", api: "openai-completions", apiKeyEnv: "OPENCODE_API_KEY", baseURL: "http://127.0.0.1:8787/go/v1", models: [{ id: "go-a" }] },
+          "gorouter-zen": { displayName: "Zen", api: "openai-responses", apiKeyEnv: "OPENCODE_API_KEY", baseURL: "http://127.0.0.1:8787/zen/v1", models: [{ id: "zen-b" }] },
           "openrouter": { displayName: "OpenRouter", api: "openai", baseURL: "https://openrouter.ai", models: [{ id: "other" }] },
         }
       },
@@ -561,7 +505,7 @@ describe("unrelated settings preserved", () => {
     const { FileDshClient } = await import("../src/models/dsh-client.ts");
     const client = new FileDshClient(settingsPath, null);
     const reg = authoritativeReg(["go-a","go-new"], ["zen-b"]);
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["go-a","go-new"]), knownZenIds: new Set(["zen-b"]) });
+    const st = await reconcileDshCatalog(reg, client as unknown as DshClient, { approvalStore: initStore(["go-a","go-new"], ["zen-b"]) });
     expect(st.outcome).toBe("current");
     const raw = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
     const ns = (raw["llm-pi-ai"] as Record<string, unknown>);
@@ -570,26 +514,66 @@ describe("unrelated settings preserved", () => {
     expect(raw["other-namespace"]).toEqual({ untouched: true });
     // unrelated provider preserved
     expect(providers["openrouter"]).toBeDefined();
+    expect(providers["openrouter"]!["models"]).toEqual([{ id: "other" }]);
     // gorouter-go metadata preserved except models
     const goProv = providers["gorouter-go"]!;
     expect(goProv["displayName"]).toBe("Go");
+    expect(goProv["api"]).toBe("openai-completions");
     expect(goProv["apiKeyEnv"]).toBe("OPENCODE_API_KEY");
-    expect(goProv["baseURL"]).toBe("https://opencode.ai/zen/go/v1");
+    expect(goProv["baseURL"]).toBe("http://127.0.0.1:8787/go/v1");
     expect((goProv["models"] as ModelEntry[]).map(m=>m.id).sort()).toEqual(["go-a","go-new"]);
     // gorouter-zen metadata preserved
     const zenProv = providers["gorouter-zen"]!;
     expect(zenProv["displayName"]).toBe("Zen");
+    expect(zenProv["api"]).toBe("openai-responses");
   });
+
+  test("provider metadata + per-model overrides preserved for surviving entries; new entries template-copied from registry", async () => {
+    // Surviving go-a keeps its custom per-model override verbatim; newly
+    // eligible go-new is template-copied from the registry entry.
+    const customGoA = makeModel("go-a", { input: ["custom"], compat: { chatTemplateKwargs: { foo: 1 } } });
+    const customGoNew = makeModel("go-new", { input: ["from-registry"] });
+    let rev = 0;
+    let go = [customGoA, makeModel("go-keep")];
+    let zen = [makeModel("zen-b")];
+    const customClient: DshClient = {
+      async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
+      async mutate(dg, dz, exp) { if(exp!==rev) throw new DshConflictError(exp, rev); go=[...dg]; zen=[...dz]; rev+=1; return {revision: rev}; },
+    };
+    // No-op first: identical arrays are detected with override fields in play
+    const st = await reconcileDshCatalog(authoritativeReg(["go-a","go-keep"], ["zen-b"]), customClient, { approvalStore: initStore(["go-a","go-keep"], ["zen-b"]) });
+    expect(st.outcome).toBe("no-op");
+    // Now add a newly approved model — surviving go-a must keep its custom input
+    clearDshSyncSingleFlightForTests();
+    const regMap = new Map([["go-a", customGoA], ["go-keep", makeModel("go-keep")], ["go-new", customGoNew]]);
+    const reg = authoritativeReg(["go-a","go-keep","go-new"], ["zen-b"], { goMap: regMap });
+    const st2 = await reconcileDshCatalog(reg, customClient, { approvalStore: initStore(["go-a","go-keep","go-new"], ["zen-b"]) });
+    expect(st2.outcome).toBe("current");
+    const snap = await customClient.read() as DshSnapshot;
+    const kept = snap.go.find(m=>m.id==="go-a") as any;
+    // Per-contract: existing surviving entry kept verbatim (override preserved)
+    expect(kept.input).toEqual(["custom"]);
+    expect(kept.compat).toEqual({ chatTemplateKwargs: { foo: 1 } });
+    // Newly eligible entry copied from the registry template, not the DSH array
+    const added = snap.go.find(m=>m.id==="go-new") as any;
+    expect(added.input).toEqual(["from-registry"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Deterministic ordering
+// ---------------------------------------------------------------------------
 
 describe("deterministic ordering", () => {
   test("surviving order preserved, newly eligible sorted by id", () => {
     const currentGo = [makeModel("zebra"), makeModel("alpha")]; // existing order is zebra then alpha (not sorted)
-    const res = deriveDesiredDshState({
+    const res = deriveApprovalDesiredDshState({
       currentGo,
       currentZen: [],
-      registryGoIds: ["zebra","alpha","beta","gamma"], // registry order arbitrary, but newly are beta/gamma
-      registryZenIds: [],
-      knownGoIds: new Set(["zebra","alpha","beta","gamma"]),
+      registryGo: [makeModel("zebra"), makeModel("alpha"), makeModel("beta"), makeModel("gamma")],
+      registryZen: [],
+      approvedGoIds: new Set(["zebra","alpha","beta","gamma"]),
+      approvedZenIds: new Set(),
     });
     // surviving preserves current order: zebra, alpha
     // newly eligible: beta, gamma sorted => beta, gamma
@@ -598,8 +582,8 @@ describe("deterministic ordering", () => {
 
   test("ordering deterministic across repeated derivations regardless of registry input order", () => {
     const currentGo = [makeModel("a")];
-    const r1 = deriveDesiredDshState({ currentGo, currentZen: [], registryGoIds: ["a","c","b"], registryZenIds: [], knownGoIds: new Set(["a","b","c"]) });
-    const r2 = deriveDesiredDshState({ currentGo, currentZen: [], registryGoIds: ["b","a","c"], registryZenIds: [], knownGoIds: new Set(["a","b","c"]) });
+    const r1 = deriveApprovalDesiredDshState({ currentGo, currentZen: [], registryGo: [makeModel("a"),makeModel("c"),makeModel("b")], registryZen: [], approvedGoIds: new Set(["a","b","c"]), approvedZenIds: new Set() });
+    const r2 = deriveApprovalDesiredDshState({ currentGo, currentZen: [], registryGo: [makeModel("b"),makeModel("a"),makeModel("c")], registryZen: [], approvedGoIds: new Set(["a","b","c"]), approvedZenIds: new Set() });
     // Both give same desired ordering: surviving [a] + sorted newly [b,c]
     expect(r1.desiredGo.map(m=>m.id)).toEqual(["a","b","c"]);
     expect(r2.desiredGo.map(m=>m.id)).toEqual(["a","b","c"]);
@@ -613,7 +597,7 @@ describe("deterministic ordering", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 11. Concurrent coalescing (single-flight)
+// 10. Concurrent coalescing (single-flight)
 // ---------------------------------------------------------------------------
 
 describe("concurrent coalescing (single-flight)", () => {
@@ -624,7 +608,7 @@ describe("concurrent coalescing (single-flight)", () => {
     let go: ModelEntry[] = [makeModel("a")];
     let zen: ModelEntry[] = [makeModel("b")];
     const client: DshClient = {
-      async read() { return { revision: rev, go:[...go], zen:[...zen] }; },
+      async read() { return { revision: rev, go:[...go], zen:[...zen], ...RAW_BINDINGS }; },
       async mutate(dg, dz, exp) {
         mutateCalls++;
         await new Promise(r=>setTimeout(r, 60));
@@ -633,7 +617,7 @@ describe("concurrent coalescing (single-flight)", () => {
         return { revision: rev };
       }
     };
-    const opts = { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) };
+    const opts = { approvalStore: initStore(["a","new"], ["b"]) };
     const [s1,s2,s3] = await Promise.all([
       reconcileDshCatalog(reg, client, opts),
       reconcileDshCatalog(reg, client, opts),
@@ -647,15 +631,15 @@ describe("concurrent coalescing (single-flight)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 12. Restart mid-sync (persistence)
+// 11. Restart mid-sync (persistence)
 // ---------------------------------------------------------------------------
 
 describe("restart mid-sync: persisted dsh-sync-state survives", () => {
   test("status persisted to disk is reloadable after restart (simulated by new domain instance)", async () => {
     const { paths } = freshPaths();
     const reg = authoritativeReg(["a","new"], ["b"]);
-    const client = createMemoryDshClient({ go:[makeModel("a")], zen:[makeModel("b")] }) as unknown as DshClient & { mutations:number };
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) }, (s)=>storeDshSyncStatus(paths, s));
+    const client = createMemoryDshClient({ go:[makeModel("a")], zen:[makeModel("b")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations:number };
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) }, (s)=>storeDshSyncStatus(paths, s));
     expect(st.outcome).toBe("current");
     // simulate restart: create new process view reading same state dir
     const reloaded = loadDshSyncStatus(paths);
@@ -675,11 +659,11 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
     const { paths } = freshPaths();
     let rev=0; let go=[makeModel("a")]; let zen=[makeModel("b")];
     const client: DshClient = {
-      async read() { return { revision: rev, go:[...go], zen:[...zen] }; },
+      async read() { return { revision: rev, go:[...go], zen:[...zen], ...RAW_BINDINGS }; },
       async mutate(dg,dz,exp) { if(exp!==rev) throw new DshConflictError(exp, rev); rev+=1; return {revision: rev}; } // mismatch: not updating go/zen
     };
     const reg = authoritativeReg(["a","new"], ["b"]);
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) }, (s)=>storeDshSyncStatus(paths, s));
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) }, (s)=>storeDshSyncStatus(paths, s));
     expect(st.outcome).toBe("pending");
     const reloaded = loadDshSyncStatus(paths);
     expect(reloaded!.outcome).toBe("pending");
@@ -688,7 +672,7 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 13. Sanitized errors & redaction
+// 12. Sanitized errors & redaction
 // ---------------------------------------------------------------------------
 
 describe("sanitized errors", () => {
@@ -696,18 +680,17 @@ describe("sanitized errors", () => {
     const secretGo = "sk-proj-abcdef1234567890-XYZ";
     const reg = authoritativeReg(["a","new"], ["b"]);
     const client: DshClient = {
-      async read() { return { revision: 0, go:[makeModel("a")], zen:[makeModel("b")] }; },
+      async read() { return { revision: 0, go:[makeModel("a")], zen:[makeModel("b")], ...RAW_BINDINGS }; },
       async mutate() { throw new Error("dsh mutate failed: key " + secretGo + " leaked"); },
     };
-    // Ensure the new model is known so a mutation is actually attempted (otherwise no-op skips mutate)
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) });
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) });
     expect(typeof st.lastError).toBe("string");
     expect(st.lastError as string).not.toContain(secretGo);
     expect(st.lastError as string).toMatch(/\[REDACTED\]/);
     // also check that redacted error not persisted with raw secret
     const { paths } = freshPaths();
     clearDshSyncSingleFlightForTests();
-    await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) }, (s)=>storeDshSyncStatus(paths, s));
+    await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) }, (s)=>storeDshSyncStatus(paths, s));
     const persisted = loadDshSyncStatus(paths)!.lastError!;
     expect(persisted).not.toContain(secretGo);
   });
@@ -719,10 +702,10 @@ describe("sanitized errors", () => {
     const combined = bearerSecret + " leaked along with " + gorouterSecret;
     const reg = authoritativeReg(["a","new"], ["b"]);
     const client: DshClient = {
-      async read() { return { revision: 0, go:[makeModel("a")], zen:[makeModel("b")] }; },
+      async read() { return { revision: 0, go:[makeModel("a")], zen:[makeModel("b")], ...RAW_BINDINGS }; },
       async mutate() { throw new Error("dsh failed: " + combined); },
     };
-    const st = await reconcileDshCatalog(reg, client, { knownGoIds: new Set(["a","new"]), knownZenIds: new Set(["b"]) });
+    const st = await reconcileDshCatalog(reg, client, { approvalStore: initStore(["a","new"], ["b"]) });
     expect(typeof st.lastError).toBe("string");
     expect(st.lastError as string).not.toContain(bearerSecret.slice(-20));
     expect(st.lastError as string).not.toContain("B".repeat(20));
@@ -739,7 +722,7 @@ describe("sanitized errors", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 14. Registry survives DSH failure
+// 13. Registry survives DSH failure
 // ---------------------------------------------------------------------------
 
 describe("registry survives DSH failure", () => {
@@ -748,7 +731,7 @@ describe("registry survives DSH failure", () => {
     const reg = authoritativeReg(["go-a"], ["zen-b"]);
     storeRegistry(paths, reg);
     const client: DshClient = {
-      async read() { return { revision: 0, go:[makeModel("go-a")], zen:[makeModel("zen-b")] }; },
+      async read() { return { revision: 0, go:[makeModel("go-a")], zen:[makeModel("zen-b")], ...RAW_BINDINGS }; },
       async mutate() { throw new Error("dsh unavailable"); },
     };
     const reg2 = authoritativeReg(["go-a","go-new"], ["zen-b"]);
@@ -756,7 +739,7 @@ describe("registry survives DSH failure", () => {
     storeRegistry(paths, reg2);
     const before = readFileSync(registryPathFor(paths), "utf8");
     // Now DSH sync fails (separate step that should NOT rollback registry)
-    const st = await reconcileDshCatalog(reg2, client, { knownGoIds: new Set(["go-a","go-new"]), knownZenIds: new Set(["zen-b"]) });
+    const st = await reconcileDshCatalog(reg2, client, { approvalStore: initStore(["go-a","go-new"], ["zen-b"]) });
     expect(["error","pending"].includes(st.outcome)).toBe(true);
     const after = readFileSync(registryPathFor(paths), "utf8");
     expect(after).toBe(before); // unchanged
@@ -766,7 +749,7 @@ describe("registry survives DSH failure", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 15. Slice A regression — TTL / cooldown / manual bypass / transactional / single-flight / known-good / auth / routing
+// 14. Slice A regression — TTL / cooldown / manual bypass / transactional / single-flight / known-good / auth / routing
 // ---------------------------------------------------------------------------
 
 describe("Slice A regression (deterministic, no live network)", () => {
@@ -927,7 +910,7 @@ describe("Slice A regression (deterministic, no live network)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 16. Extra contract: local-only guards, narrow persistence, file guards
+// 15. Extra contract: local-only guards, narrow persistence, file guards
 // ---------------------------------------------------------------------------
 
 describe("local-only guards & narrow persistence", () => {
@@ -962,11 +945,11 @@ describe("local-only guards & narrow persistence", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 17. Determinism: no wall-clock flakes, no real timers, sorted output
+// 16. Registry refresh success survives DSH failure (domain integration)
 // ---------------------------------------------------------------------------
 
 describe("registry refresh success survives DSH failure (domain integration)", () => {
-  test("refreshRegistry succeeds via mock upstream but injected DSH client throws -> registry on disk still SUCCESS, DSH status pending", async () => {
+  test("refreshRegistry succeeds via mock upstream but injected DSH client fails closed -> registry on disk still SUCCESS, DSH status gated/blocked", async () => {
     const upstream = await startMockUpstream(() => Response.json({ object: "list", data: [{ id: "fresh-model" }] }, { status: 200 }));
     const stateDir = mkdtempSync(join(tmpdir(), "gorouter-dsh-domain-"));
     dirs.push(stateDir);
@@ -976,7 +959,7 @@ describe("registry refresh success survives DSH failure (domain integration)", (
     state2.mutate((s2)=>{ s2.localCredentialRef="sec_local"; s2.settings.upstreamGo=upstream.baseUrl; s2.settings.upstreamZen=upstream.baseUrl; });
     const domain3 = createDomain(paths, secrets);
     const failingDsh: DshClient = {
-      async read() { return { revision: 0, go: [makeModel("fresh-model")], zen: [makeModel("fresh-model")] }; },
+      async read() { return { revision: 0, go: [makeModel("fresh-model")], zen: [makeModel("fresh-model")], ...RAW_BINDINGS }; },
       async mutate() { throw new Error("dsh mid-sync boom " + "Bearer " + "x".repeat(40)); },
     };
     const result = await domain3.modelsRefresh({ dshClient: failingDsh });
@@ -986,27 +969,39 @@ describe("registry refresh success survives DSH failure (domain integration)", (
     const onDisk = loadRegistry(paths)!;
     expect(onDisk.go!.models.map(m=>m.id)).toEqual(["fresh-model"]);
     expect(onDisk.updatedAtUtc).toBe(result.registry!.updatedAtUtc);
+    // Fresh temp state dir => approval store absent => reconcile is gated
+    // blocked (migration ratification) and NEVER touches the DSH client.
     if (result.dshSync) {
-      expect(["pending","error","no-op","current"].includes(result.dshSync.outcome)).toBe(true);
-      if (result.dshSync.lastError) expect(result.dshSync.lastError).not.toContain("x".repeat(20));
+      expect(result.dshSync.outcome).toBe("blocked");
+      expect(result.dshSync.mutationPerformed).toBe(false);
+      expect(result.dshSync.migrationRequired).toBe(true);
+      expect(result.dshSync.approvalsInitialized).toBe(false);
     }
     upstream.stop();
   });
 });
 
+// ---------------------------------------------------------------------------
+// 17. Determinism: pure derivation, no wall-clock flakes
+// ---------------------------------------------------------------------------
+
 describe("determinism", () => {
-  test("deriveDesired helpers are pure and sort deterministically regardless of clock", () => {
+  test("deriveApprovalDesiredDshState is pure and sorts deterministically regardless of clock", () => {
     const g = [makeModel("b"), makeModel("a")];
-    const r = deriveDesiredDshState({ currentGo:g, currentZen:[], registryGoIds:["a","b","c"], registryZenIds:[], knownGoIds: new Set(["a","b","c"]) });
-    const r2 = deriveDesiredDshState({ currentGo:g, currentZen:[], registryGoIds:["c","b","a"], registryZenIds:[], knownGoIds: new Set(["a","b","c"]) });
+    const approved = new Set(["a","b","c"]);
+    const r = deriveApprovalDesiredDshState({ currentGo:g, currentZen:[], registryGo:[makeModel("a"),makeModel("b"),makeModel("c")], registryZen:[], approvedGoIds: approved, approvedZenIds: new Set() });
+    const r2 = deriveApprovalDesiredDshState({ currentGo:g, currentZen:[], registryGo:[makeModel("c"),makeModel("b"),makeModel("a")], registryZen:[], approvedGoIds: approved, approvedZenIds: new Set() });
     expect(r.desiredGo.map(m=>m.id)).toEqual(r2.desiredGo.map(m=>m.id));
   });
 
-  test("registry and dsh-sync helpers do not mutate inputs", () => {
+  test("registry and dsh derivation helpers do not mutate inputs", () => {
     const go = [makeModel("a")];
-    const orig = JSON.stringify(go);
-    deriveDesiredDshState({ currentGo: go, currentZen: [], registryGoIds:["a","new"], registryZenIds:[], knownGoIds: new Set(["a","new"]) });
-    expect(JSON.stringify(go)).toBe(orig);
+    const reg = [makeModel("a"), makeModel("new")];
+    const origGo = JSON.stringify(go);
+    const origReg = JSON.stringify(reg);
+    deriveApprovalDesiredDshState({ currentGo: go, currentZen: [], registryGo: reg, registryZen: [], approvedGoIds: new Set(["a","new"]), approvedZenIds: new Set() });
+    expect(JSON.stringify(go)).toBe(origGo);
+    expect(JSON.stringify(reg)).toBe(origReg);
   });
 });
 
@@ -1016,67 +1011,87 @@ describe("determinism", () => {
 // ---------------------------------------------------------------------------
 
 describe("R1 cross-lane routability fence", () => {
-  test("R1-1: Zen-only known + Go-new registry => Go WITHHELD (no cross-promotion)", async () => {
+  test("R1-1: Zen-only approval + Go registry entry => Go WITHHELD (no cross-promotion)", () => {
     const currentGo = [makeModel("go-known")];
     const currentZen = [makeModel("zen-only-model")];
-    const registryGoIds = ["go-known", "zen-only-model"];
-    const registryZenIds = ["zen-only-model"];
-    const knownGo = new Set(currentGo.map(m=>m.id));
-    const knownZen = new Set(currentZen.map(m=>m.id));
-    const res = deriveDesiredDshState({ currentGo, currentZen, registryGoIds, registryZenIds, knownGoIds: knownGo, knownZenIds: knownZen });
+    const registryGo = [makeModel("go-known"), makeModel("zen-only-model")];
+    const registryZen = [makeModel("zen-only-model")];
+    const res = deriveApprovalDesiredDshState({
+      currentGo, currentZen, registryGo, registryZen,
+      approvedGoIds: new Set(["go-known"]),
+      approvedZenIds: new Set(["zen-only-model"]),
+    });
     expect(res.withheldGo).toContain("zen-only-model");
     expect(res.desiredGo.map(m=>m.id)).not.toContain("zen-only-model");
-    // Even if Zen knows it, Go must not be promoted
-    const res2 = deriveDesiredDshState({ currentGo, currentZen, registryGoIds, registryZenIds, knownGoIds: knownGo, knownZenIds: new Set(["zen-only-model", "go-known"]) });
+    // Even if zen approves BOTH ids, go approval is still required for the go lane
+    const res2 = deriveApprovalDesiredDshState({
+      currentGo, currentZen, registryGo, registryZen,
+      approvedGoIds: new Set(["go-known"]),
+      approvedZenIds: new Set(["zen-only-model", "go-known"]),
+    });
     expect(res2.desiredGo.map(m=>m.id)).not.toContain("zen-only-model");
   });
 
-  test("R1-2: Go-only known + Zen-new registry => Zen WITHHELD", async () => {
+  test("R1-2: Go-only approval + Zen registry entry => Zen WITHHELD", () => {
     const currentGo = [makeModel("go-only-model")];
     const currentZen = [makeModel("zen-known")];
-    const registryGoIds = ["go-only-model"];
-    const registryZenIds = ["zen-known", "go-only-model"];
-    const knownGo = new Set(currentGo.map(m=>m.id));
-    const knownZen = new Set(currentZen.map(m=>m.id));
-    const res = deriveDesiredDshState({ currentGo, currentZen, registryGoIds, registryZenIds, knownGoIds: knownGo, knownZenIds: knownZen });
+    const registryGo = [makeModel("go-only-model")];
+    const registryZen = [makeModel("zen-known"), makeModel("go-only-model")];
+    const res = deriveApprovalDesiredDshState({
+      currentGo, currentZen, registryGo, registryZen,
+      approvedGoIds: new Set(["go-only-model"]),
+      approvedZenIds: new Set(["zen-known"]),
+    });
     expect(res.withheldZen).toContain("go-only-model");
     expect(res.desiredZen.map(m=>m.id)).not.toContain("go-only-model");
   });
 
-  test("R1-3: same ID known for both providers => eligible both when in registry", () => {
+  test("R1-3: same ID approved for both lanes => eligible both when in registry", () => {
     const sharedId = "shared-model";
     const currentGo = [makeModel(sharedId)];
     const currentZen = [makeModel(sharedId)];
-    const knownGo = new Set([sharedId]);
-    const knownZen = new Set([sharedId]);
-    const res = deriveDesiredDshState({ currentGo, currentZen, registryGoIds: [sharedId], registryZenIds: [sharedId], knownGoIds: knownGo, knownZenIds: knownZen });
+    const registryGo = [makeModel(sharedId)];
+    const registryZen = [makeModel(sharedId)];
+    const res = deriveApprovalDesiredDshState({
+      currentGo, currentZen, registryGo, registryZen,
+      approvedGoIds: new Set([sharedId]),
+      approvedZenIds: new Set([sharedId]),
+    });
     expect(res.withheldGo).not.toContain(sharedId);
     expect(res.withheldZen).not.toContain(sharedId);
     expect(res.desiredGo.map(m=>m.id)).toContain(sharedId);
     expect(res.desiredZen.map(m=>m.id)).toContain(sharedId);
-    const res2 = deriveDesiredDshState({ currentGo: [], currentZen: [], registryGoIds: [sharedId], registryZenIds: [sharedId], knownGoIds: knownGo, knownZenIds: knownZen });
+    const res2 = deriveApprovalDesiredDshState({
+      currentGo: [], currentZen: [], registryGo, registryZen,
+      approvedGoIds: new Set([sharedId]),
+      approvedZenIds: new Set([sharedId]),
+    });
     expect(res2.desiredGo.map(m=>m.id)).toContain(sharedId);
     expect(res2.desiredZen.map(m=>m.id)).toContain(sharedId);
   });
 
-  test("R1-4: provider metadata/override only one lane => no cross-promotion", () => {
+  test("R1-4: per-model override only on one lane => no cross-promotion", () => {
     const id = "meta-only-go";
     const currentGo = [makeModel(id, { compat:{ chatTemplateKwargs:{ custom:"go-override" } } })];
     const currentZen: ModelEntry[] = [];
-    const knownGo = new Set([id]);
-    const knownZen = new Set<string>([]);
-    const res = deriveDesiredDshState({ currentGo, currentZen, registryGoIds: [id], registryZenIds: [id], knownGoIds: knownGo, knownZenIds: knownZen });
+    const registryGo = [makeModel(id)];
+    const registryZen = [makeModel(id)];
+    const res = deriveApprovalDesiredDshState({
+      currentGo, currentZen, registryGo, registryZen,
+      approvedGoIds: new Set([id]),
+      approvedZenIds: new Set(),
+    });
     expect(res.desiredGo.map(m=>m.id)).toContain(id);
     expect(res.withheldZen).toContain(id);
     expect(res.desiredZen.map(m=>m.id)).not.toContain(id);
   });
 
-  test("R1-5: reconcileDshCatalog respects lane-specific known sets end-to-end", async () => {
+  test("R1-5: reconcileDshCatalog respects lane-specific approvals end-to-end", async () => {
     // Zen-only model appears in Go registry — must be withheld even through reconcile
     const reg = authoritativeReg(["go-a", "zen-only-leak"], ["zen-x"]);
-    const mem = createMemoryDshClient({ go: [makeModel("go-a")], zen: [makeModel("zen-x")] });
-    const st = await reconcileDshCatalog(reg, mem, { knownGoIds: new Set(["go-a"]), knownZenIds: new Set(["zen-x"]) });
-    expect(mem.history.length > 0 || st.outcome === "no-op" || st.outcome === "current").toBe(true);
+    const mem = createMemoryDshClient({ go: [makeModel("go-a")], zen: [makeModel("zen-x")], ...RAW_BINDINGS });
+    const st = await reconcileDshCatalog(reg, mem as unknown as DshClient, { approvalStore: initStore(["go-a"], ["zen-x"]) });
+    expect(mem.history.length === 0 || st.outcome === "no-op" || st.outcome === "current").toBe(true);
     const snap = await mem.read();
     expect(snap!.go.map(m=>m.id)).not.toContain("zen-only-leak");
     expect(st.withheldGoCount).toBe(1);

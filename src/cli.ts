@@ -47,7 +47,10 @@ Commands:
   account add|update|list|rename|remove|test ...
   route [go|zen <alias>] | route clear <go|zen>
   status | journal stats | config show | config set <key> <value> | serve | reset --yes
-  models status|list|refresh|diff [--json]  (list: gorouter models list <go|zen> [--json] or --lane)`;
+  models status|list|refresh|diff [--json]  (list: gorouter models list <go|zen> [--json] or --lane)
+  models approvals status|list [--json]
+  models approvals approve|revoke --lane <go|zen> <model-id> [--json]
+  models approvals migrate [--json]          (preview; apply: migrate --apply --proposal <id>)`;
 
 async function readSecretFromStdin(): Promise<string> {
   const text = await Bun.stdin.text();
@@ -536,6 +539,123 @@ async function main(argv: string[]): Promise<number> {
             }
           }
           return 0;
+        }
+        case "approvals": {
+          const sub = rest[0];
+          const a = rest.slice(1);
+          const wantAJson = a.includes("--json");
+          const cleanA = a.filter((x) => x !== "--json" && x !== "--apply" && x !== "--lane" && x !== "--proposal");
+          const laneFlagIdx = a.indexOf("--lane");
+          const laneValue = laneFlagIdx >= 0 ? a[laneFlagIdx + 1]?.toLowerCase() : undefined;
+          const proposalIdx = a.indexOf("--proposal");
+          const proposalValue = proposalIdx >= 0 ? a[proposalIdx + 1] : undefined;
+          const applyFlag = a.includes("--apply");
+          const positional = cleanA.filter((x, i) => x !== laneValue && x !== proposalValue);
+          switch (sub) {
+            case "status": {
+              if (cleanA.length > 0) throw new Error("usage: gorouter models approvals status [--json]");
+              const s = await domain.approvalsStatus();
+              if (wantAJson) {
+                console.log(JSON.stringify(s, null, 2));
+              } else {
+                console.log("GoRouter DSH Catalog Approvals");
+                console.log("  Store: " + s.storeState + (s.initializedAtUtc ? " (initialized " + s.initializedAtUtc + ")" : "") + (s.corruptReason ? " (" + s.corruptReason + ")" : ""));
+                console.log("  Migration required: " + (s.migrationRequired ? "YES (legacy DSH state not yet ratified; owned arrays preserved)" : "no"));
+                if (s.migrationCandidateCount !== null) console.log("  Migration candidates: " + s.migrationCandidateCount);
+                console.log("  Approvals: go=" + s.countsByLane.go + " zen=" + s.countsByLane.zen);
+                for (const ap of s.approvals) {
+                  console.log("    [" + ap.lane + "] " + ap.dshProviderId + " / " + ap.apiProtocol + " / " + ap.modelId + " (" + ap.source + ", " + ap.approvedAtUtc + ")");
+                }
+                if (s.binding) {
+                  console.log("  Owned provider binding: " + (s.binding.valid ? "valid" : "INVALID"));
+                  for (const b of [s.binding.go, s.binding.zen]) {
+                    console.log("    " + b.lane + ": " + (b.valid ? "ok (" + (b.api ?? "?") + " -> " + (b.baseURL ?? "?") + ")" : "invalid: " + b.reason));
+                  }
+                } else {
+                  console.log("  Owned provider binding: unknown (DSH settings not readable)");
+                }
+                if (s.activeCounts) console.log("  Active (approved + in registry): go=" + s.activeCounts.go + " zen=" + s.activeCounts.zen);
+                if (s.withheldCounts) console.log("  Withheld/unapproved (in registry): go=" + s.withheldCounts.go + " zen=" + s.withheldCounts.zen);
+                if (s.approvedAbsentCounts) console.log("  Approved-absent (inactive): go=" + s.approvedAbsentCounts.go + " zen=" + s.approvedAbsentCounts.zen);
+                const d = s.dshSync;
+                if (d) {
+                  console.log("  DSH sync: outcome=" + d.outcome + " mutation=" + d.mutationPerformed + (d.lastSuccessAt ? " lastSuccess=" + d.lastSuccessAt : "") + (d.lastError ? " lastError=" + redact(d.lastError) : ""));
+                } else {
+                  console.log("  DSH sync: no status yet");
+                }
+              }
+              return 0;
+            }
+            case "list": {
+              if (cleanA.length > 0) throw new Error("usage: gorouter models approvals list [--json]");
+              const s = await domain.approvalsStatus();
+              if (wantAJson) {
+                console.log(JSON.stringify({ storeState: s.storeState, approvals: s.approvals, countsByLane: s.countsByLane }, null, 2));
+              } else {
+                if (s.approvals.length === 0) {
+                  console.log(s.storeState === "initialized" ? "no approvals (initialized empty authority set)" : "no approvals (store " + s.storeState + ")");
+                } else {
+                  for (const ap of s.approvals) {
+                    console.log("[" + ap.lane + "] " + ap.modelId + "\tprovider=" + ap.dshProviderId + "\tapi=" + ap.apiProtocol + "\tsource=" + ap.source);
+                  }
+                }
+              }
+              return 0;
+            }
+            case "approve": {
+              const modelId = positional.find((x) => x !== "approve");
+              if (!modelId || !laneValue) throw new Error("usage: gorouter models approvals approve --lane <go|zen> <model-id> [--json]");
+              if (laneValue !== "go" && laneValue !== "zen") throw new Error("--lane must be go or zen");
+              const r = await domain.approvalsApprove(laneValue, modelId);
+              const dupLabel = r.duplicate ? " (already approved; idempotent)" : "";
+              console.log("approved [" + r.tuple.lane + "] " + r.tuple.modelId + " provider=" + r.tuple.dshProviderId + " api=" + r.tuple.apiProtocol + dupLabel);
+              if (r.dshSync) console.log("dsh sync: outcome=" + r.dshSync.outcome + " mutation=" + r.dshSync.mutationPerformed + (r.dshSync.lastError ? " lastError=" + redact(r.dshSync.lastError) : ""));
+              return 0;
+            }
+            case "revoke": {
+              const modelId = positional.find((x) => x !== "revoke");
+              if (!modelId || !laneValue) throw new Error("usage: gorouter models approvals revoke --lane <go|zen> <model-id> [--json]");
+              if (laneValue !== "go" && laneValue !== "zen") throw new Error("--lane must be go or zen");
+              const r = await domain.approvalsRevoke(laneValue, modelId);
+              console.log("revoked [" + laneValue + "] " + modelId + " (entries removed: " + r.removed + ")");
+              if (r.dshSync) console.log("dsh sync: outcome=" + r.dshSync.outcome + " mutation=" + r.dshSync.mutationPerformed + (r.dshSync.lastError ? " lastError=" + redact(r.dshSync.lastError) : ""));
+              return 0;
+            }
+            case "migrate": {
+              if (applyFlag) {
+                if (!proposalValue) throw new Error("usage: gorouter models approvals migrate --apply --proposal <id> [--json]");
+                const r = await domain.approvalsMigrateApply(proposalValue);
+                if (wantAJson) {
+                  console.log(JSON.stringify(r, null, 2));
+                } else {
+                  console.log("migration ratified and applied: proposal=" + r.proposalId.slice(0, 16) + "…");
+                  for (const c of r.candidates) {
+                    console.log("  imported [" + c.lane + "] " + c.modelId + " provider=" + c.dshProviderId + " api=" + c.apiProtocol);
+                  }
+                  if (r.dshSync) console.log("dsh sync: outcome=" + r.dshSync.outcome + " mutation=" + r.dshSync.mutationPerformed + (r.dshSync.lastError ? " lastError=" + redact(r.dshSync.lastError) : ""));
+                }
+                return 0;
+              }
+              if (cleanA.length > 0) throw new Error("usage: gorouter models approvals migrate [--json] | migrate --apply --proposal <id>");
+              const p = await domain.approvalsMigratePreview();
+              if (wantAJson) {
+                console.log(JSON.stringify(p, null, 2));
+              } else {
+                console.log("DSH Legacy Migration Preview (read-only)");
+                console.log("  Bindings: " + (p.bindingsValid ? "valid" : "INVALID — apply will fail closed until fixed"));
+                console.log("  DSH revision observed: " + p.revision);
+                console.log("  Proposal id: " + p.proposalId);
+                console.log("  Candidates (" + p.candidates.length + "):");
+                for (const c of p.candidates) {
+                  console.log("    [" + c.lane + "] " + c.modelId + "\tprovider=" + c.dshProviderId + "\tapi=" + c.apiProtocol);
+                }
+                console.log("  Ratify with: gorouter models approvals migrate --apply --proposal " + p.proposalId);
+              }
+              return 0;
+            }
+            default:
+              throw new Error("usage: gorouter models approvals <status|list|approve|revoke|migrate> ...");
+          }
         }
         default:
           throw new Error("usage: gorouter models <status|list|refresh|diff> [--json]");

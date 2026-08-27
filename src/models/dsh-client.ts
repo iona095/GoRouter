@@ -555,15 +555,15 @@ export function createDshClient(opts: DshClientOptions = {}): DshClient {
 }
 
 /** For tests: injectable in-memory client. */
-export function createMemoryDshClient(initial: { go: ModelEntry[]; zen: ModelEntry[]; revision?: number }): DshClient & { mutations: number; history: Array<{ go: ModelEntry[]; zen: ModelEntry[]; rev: number }> } {
+export function createMemoryDshClient(initial: { go: ModelEntry[]; zen: ModelEntry[]; revision?: number; rawGoProvider?: Record<string, unknown> | null; rawZenProvider?: Record<string, unknown> | null }): DshClient & { mutations: number; history: Array<{ go: ModelEntry[]; zen: ModelEntry[]; rev: number }> } {
   let rev = initial.revision ?? 0;
   let go = [...initial.go];
   let zen = [...initial.zen];
   const history: Array<{ go: ModelEntry[]; zen: ModelEntry[]; rev: number }> = [];
   return {
+    async read() { return { revision: rev, go: [...go], zen: [...zen], rawGoProvider: initial.rawGoProvider ?? null, rawZenProvider: initial.rawZenProvider ?? null }; },
     mutations: 0,
     history,
-    async read() { return { revision: rev, go: [...go], zen: [...zen] }; },
     async mutate(desiredGo, desiredZen, expectedRevision) {
       if (expectedRevision !== rev) throw new DshConflictError(expectedRevision, rev);
       go = [...desiredGo];

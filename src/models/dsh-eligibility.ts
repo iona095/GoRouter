@@ -1,7 +1,16 @@
 /**
- * Slice B — eligibility / routability gate and deterministic ordering.
+ * Slice B / B.1 — eligibility / routability gate and deterministic ordering.
  *
  * DISCOVERY != ROUTABILITY. Unknown newly discovered IDs are withheld.
+ *
+ * B.1: desired DSH arrays are derived from the operator approval store, not
+ * from "current DSH membership is the known authority". Eligibility for an
+ * owned lane is: model present in that lane's registry snapshot AND an exact
+ * (lane, owned provider, certified api protocol, model id) approval exists.
+ * Approved-but-absent models go inactive (approval retained); identical
+ * tuples reappearing become eligible again; currently configured eligible
+ * survivors retain their existing relative order; newly eligible models are
+ * added deterministically (sorted id).
  */
 
 import type { ModelEntry } from "./types.ts";
@@ -11,9 +20,12 @@ export interface EligibilityResult {
   desiredZen: ModelEntry[];
   withheldGo: string[];
   withheldZen: string[];
-  /** Whether an eligible removal is required (active model absent from registry). */
+  /** Ids removed from the currently configured arrays by this reconciliation. */
   removalsGo: string[];
   removalsZen: string[];
+  /** Approved ids absent from the registry (inactive; approval retained). */
+  approvedAbsentGo: string[];
+  approvedAbsentZen: string[];
 }
 
 /** Deep equality for ModelEntry arrays (ordered). */
@@ -33,70 +45,61 @@ export function isSemanticNoOp(currentGo: ModelEntry[], currentZen: ModelEntry[]
   return entriesEqual(currentGo, desiredGo) && entriesEqual(currentZen, desiredZen);
 }
 
+function deriveLane(
+  current: ModelEntry[],
+  registry: ModelEntry[],
+  approvedIds: Set<string>,
+): { desired: ModelEntry[]; withheld: string[]; removals: string[]; approvedAbsent: string[] } {
+  const regMap = new Map(registry.map((m) => [m.id, m] as const));
+
+  // Survivors: currently configured AND in registry AND approved (order preserved, overrides kept).
+  const desired = current.filter((m) => approvedIds.has(m.id) && regMap.has(m.id));
+  const desiredIds = new Set(desired.map((m) => m.id));
+
+  // Removed from current config: unapproved-but-configured, or approved-but-absent.
+  const removals = current.filter((m) => !desiredIds.has(m.id)).map((m) => m.id);
+
+  // Newly eligible: approved, in registry, not currently configured (sorted deterministically).
+  const newly = registry
+    .filter((m) => approvedIds.has(m.id) && !desiredIds.has(m.id))
+    .map((m) => m.id)
+    .sort();
+
+  const newlyEntries: ModelEntry[] = newly.map((id) => ({ ...regMap.get(id)! }));
+
+  // Withheld: discovered (registry) but unapproved.
+  const withheld = registry.filter((m) => !approvedIds.has(m.id)).map((m) => m.id);
+
+  // Approved but absent upstream: inactive, approval retained.
+  const approvedAbsent = [...approvedIds].filter((id) => !regMap.has(id)).sort();
+
+  return { desired: [...desired, ...newlyEntries], withheld, removals, approvedAbsent };
+}
+
 /**
- * Derive desired DSH arrays from registry membership and local known IDs.
+ * Derive approval-gated desired DSH arrays.
  *
- * @param currentGo - currently configured DSH go models (preserve overrides)
- * @param currentZen - currently configured DSH zen models
- * @param registryGoIds - authoritative registry go ids (sorted by registry)
- * @param registryZenIds - authoritative registry zen ids
- * @param knownGoIds - set of ids whose request semantics are known (defaults to currentGo ids)
- * @param knownZenIds - set of ids whose request semantics are known (defaults to currentZen ids)
- * @param registryGoEntries - optional registry ModelEntry objects to use as new model templates
- * @param registryZenEntries - optional registry ModelEntry objects
+ * @param approvedGoIds - model ids with an exact (go, gorouter-go, current certified api, id) approval
+ * @param approvedZenIds - same for the zen owned provider
  */
-export function deriveDesiredDshState(opts: {
+export function deriveApprovalDesiredDshState(opts: {
   currentGo: ModelEntry[];
   currentZen: ModelEntry[];
-  registryGoIds: string[];
-  registryZenIds: string[];
-  knownGoIds?: Set<string>;
-  knownZenIds?: Set<string>;
-  registryGoEntries?: Map<string, ModelEntry>;
-  registryZenEntries?: Map<string, ModelEntry>;
+  registryGo: ModelEntry[];
+  registryZen: ModelEntry[];
+  approvedGoIds: Set<string>;
+  approvedZenIds: Set<string>;
 }): EligibilityResult {
-  const { currentGo, currentZen, registryGoIds, registryZenIds } = opts;
-  const knownGo = opts.knownGoIds ?? new Set(currentGo.map((m) => m.id));
-  const knownZen = opts.knownZenIds ?? new Set(currentZen.map((m) => m.id));
-
-  const regGoSet = new Set(registryGoIds);
-  const regZenSet = new Set(registryZenIds);
-
-  const withheldGo = registryGoIds.filter((id) => !knownGo.has(id));
-  const withheldZen = registryZenIds.filter((id) => !knownZen.has(id));
-
-  // Surviving: currently configured eligible models that still exist in registry, preserving current order
-  const survivingGo = currentGo.filter((m) => regGoSet.has(m.id));
-  const survivingZen = currentZen.filter((m) => regZenSet.has(m.id));
-
-  const survivingGoIds = new Set(survivingGo.map((m) => m.id));
-  const survivingZenIds = new Set(survivingZen.map((m) => m.id));
-
-  // Removals: currently configured but absent from registry (eligible removals)
-  const removalsGo = currentGo.filter((m) => !regGoSet.has(m.id)).map((m) => m.id);
-  const removalsZen = currentZen.filter((m) => !regZenSet.has(m.id)).map((m) => m.id);
-
-  // Newly eligible: registry ids that are known, not already surviving, sorted deterministically
-  const newlyGoIds = registryGoIds.filter((id) => knownGo.has(id) && !survivingGoIds.has(id)).sort();
-  const newlyZenIds = registryZenIds.filter((id) => knownZen.has(id) && !survivingZenIds.has(id)).sort();
-
-  const newlyGo: ModelEntry[] = newlyGoIds.map((id) => {
-    const src = opts.registryGoEntries?.get(id);
-    if (src) return { ...src };
-    return { id, input: [], compat: { chatTemplateKwargs: {} } } as ModelEntry;
-  });
-  const newlyZen: ModelEntry[] = newlyZenIds.map((id) => {
-    const src = opts.registryZenEntries?.get(id);
-    if (src) return { ...src };
-    return { id, input: [], compat: { chatTemplateKwargs: {} } } as ModelEntry;
-  });
-
+  const go = deriveLane(opts.currentGo, opts.registryGo, opts.approvedGoIds);
+  const zen = deriveLane(opts.currentZen, opts.registryZen, opts.approvedZenIds);
   return {
-    desiredGo: [...survivingGo, ...newlyGo],
-    desiredZen: [...survivingZen, ...newlyZen],
-    withheldGo,
-    withheldZen,
-    removalsGo,
-    removalsZen,
+    desiredGo: go.desired,
+    desiredZen: zen.desired,
+    withheldGo: go.withheld,
+    withheldZen: zen.withheld,
+    removalsGo: go.removals,
+    removalsZen: zen.removals,
+    approvedAbsentGo: go.approvedAbsent,
+    approvedAbsentZen: zen.approvedAbsent,
   };
 }

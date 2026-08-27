@@ -28,6 +28,8 @@ export interface Paths {
   modelsRegistryJson: string;
   /** Slice B: DSH sync status (narrow, non-secret, separate from registry). */
   dshSyncStateJson: string;
+  /** B.1: persistent operator approval store for DSH catalog eligibility. */
+  dshApprovalsJson: string;
 }
 
 export function resolvePaths(base?: string): Paths {
@@ -39,6 +41,7 @@ export function resolvePaths(base?: string): Paths {
     journalDb: join(state, "journal.db"),
     modelsRegistryJson: join(state, "models-registry.json"),
     dshSyncStateJson: join(state, "dsh-sync-state.json"),
+    dshApprovalsJson: join(state, "dsh-catalog-approvals.json"),
   };
 }
 

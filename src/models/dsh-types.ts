@@ -10,7 +10,7 @@ export const DSH_NAMESPACE = "llm-pi-ai" as const;
 export const DSH_GO_PATH: readonly string[] = ["providers", "gorouter-go", "models"] as const;
 export const DSH_ZEN_PATH: readonly string[] = ["providers", "gorouter-zen", "models"] as const;
 
-export type DshSyncOutcome = "current" | "no-op" | "pending" | "error";
+export type DshSyncOutcome = "current" | "no-op" | "pending" | "error" | "blocked";
 
 export interface DshSyncStatus {
   enabled: boolean;
@@ -26,6 +26,13 @@ export interface DshSyncStatus {
   withheldGoCount: number | null;
   withheldZenCount: number | null;
   lastError: string | null;
+  /** B.1 — approval-gating observability (optional so older status files load). */
+  approvalsInitialized?: boolean | null;
+  migrationRequired?: boolean | null;
+  bindingValid?: boolean | null;
+  bindingError?: string | null;
+  approvedAbsentGoCount?: number | null;
+  approvedAbsentZenCount?: number | null;
 }
 
 export function emptyDshSyncStatus(): DshSyncStatus {
@@ -43,6 +50,12 @@ export function emptyDshSyncStatus(): DshSyncStatus {
     withheldGoCount: null,
     withheldZenCount: null,
     lastError: null,
+    approvalsInitialized: null,
+    migrationRequired: null,
+    bindingValid: null,
+    bindingError: null,
+    approvedAbsentGoCount: null,
+    approvedAbsentZenCount: null,
   };
 }
 

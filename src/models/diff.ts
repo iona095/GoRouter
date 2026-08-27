@@ -13,8 +13,21 @@ function stableStringify(v: unknown): string {
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + stableStringify(obj[k])).join(",") + "}";
 }
 
+/**
+ * B.1 — semantic model equality. Exactly the TOP-LEVEL `created` field is
+ * ignored: upstream `created` is volatile origin-generated metadata proven to
+ * churn across otherwise-identical catalog refreshes. Every other field —
+ * including id, object, owned_by and any future unknown metadata — remains
+ * significant. Raw registry publication still preserves the latest `created`.
+ */
+function semanticModelStringify(m: ModelEntry): string {
+  const rest = { ...m } as Record<string, unknown>;
+  delete rest["created"];
+  return stableStringify(rest);
+}
+
 function entriesEqual(a: ModelEntry, b: ModelEntry): boolean {
-  return stableStringify(a) === stableStringify(b);
+  return semanticModelStringify(a) === semanticModelStringify(b);
 }
 
 export function computeDiff(prev: RegistryFile | null, curr: RegistryFile): DiffEntry[] {

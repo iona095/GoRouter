@@ -42,6 +42,18 @@ import { loadDshSyncStatus, storeDshSyncStatus } from "./models/dsh-sync-state.t
 import { createDshClient, type DshClient } from "./models/dsh-client.ts";
 import { reconcileDshCatalog } from "./models/dsh-sync.ts";
 import { probeAccountKey, type ProbeResult } from "./probe.ts";
+import {
+  OWNED_DSH_PROVIDERS,
+  loadApprovalStore,
+  initializeApprovalStore,
+  approveTuple,
+  revokeModelApproval,
+  type ApprovalTuple,
+  type ApprovalRecord,
+  type ApprovalStoreLoad,
+} from "./models/dsh-approvals.ts";
+import { checkOwnedProviderBindings, type LaneBindingCheck } from "./models/dsh-binding.ts";
+import { computeMigrationPreview, applyMigration } from "./models/dsh-migration.ts";
 import { withFileLock, lockPathFor } from "./lock.ts";
 
 const MUTATE_LOCK_TIMEOUT_MS = 10_000;
@@ -120,6 +132,38 @@ export interface Domain {
   modelsDiff(): DiffEntry[];
   /** Slice B: trigger DSH reconciliation for current registry (downstream, non-blocking). */
   dshSync(opts?: { dshClient?: DshClient }): Promise<DshSyncStatus | null>;
+  /** B.1 — DSH catalog approval operations. */
+  approvalsStatus(opts?: { dshClient?: DshClient }): Promise<ApprovalStatusView>;
+  approvalsApprove(lane: Lane, modelId: string, opts?: { dshClient?: DshClient }): Promise<{ tuple: ApprovalTuple; duplicate: boolean; dshSync?: DshSyncStatus | null }>;
+  approvalsRevoke(lane: Lane, modelId: string, opts?: { dshClient?: DshClient }): Promise<{ removed: number; dshSync?: DshSyncStatus | null }>;
+  approvalsMigratePreview(opts?: { dshClient?: DshClient }): Promise<MigrationPreviewView>;
+  approvalsMigrateApply(proposalId: string, opts?: { dshClient?: DshClient }): Promise<{ applied: true; candidates: ApprovalTuple[]; proposalId: string; dshSync?: DshSyncStatus | null }>;
+}
+
+export interface ApprovalStatusView {
+  storeState: "absent" | "initialized" | "corrupt" | "unsupported-version";
+  version: number | null;
+  corruptReason: string | null;
+  initializedAtUtc: string | null;
+  approvals: ApprovalRecord[];
+  countsByLane: Record<Lane, number>;
+  registryPresent: boolean;
+  binding: { valid: boolean; go: LaneBindingCheck; zen: LaneBindingCheck } | null;
+  bindingError: string | null;
+  migrationRequired: boolean;
+  migrationCandidateCount: number | null;
+  activeCounts: Record<Lane, number> | null;
+  withheldCounts: Record<Lane, number> | null;
+  approvedAbsentCounts: Record<Lane, number> | null;
+  dshSync: DshSyncStatus | null;
+}
+
+export interface MigrationPreviewView {
+  proposalId: string;
+  candidates: ApprovalTuple[];
+  bindingsValid: boolean;
+  revision: number;
+  computedAtUtc: string;
 }
 
 function viewAccount(state: StateFile, secrets: SecretStore, a: AccountRecord): AccountView {
@@ -459,7 +503,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       if (result.success && result.registry) {
         try {
           const client = opts.dshClient ?? createDshClient();
-          const dshStatus = await reconcileDshCatalog(result.registry, client, {}, (st) => {
+          const dshStatus = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(paths), expectedPort: s.settings.port }, (st) => {
             try { storeDshSyncStatus(paths, st); } catch {}
           });
           return { ...result, dshSync: dshStatus };
@@ -480,10 +524,160 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const reg = loadRegistry(paths);
       if (!reg || !reg.go || !reg.zen) return null;
       const client = opts.dshClient ?? createDshClient();
-      const status = await reconcileDshCatalog(reg, client, {}, (st) => {
+      const status = await reconcileDshCatalog(reg, client, { approvalStore: loadApprovalStore(paths), expectedPort: state.read().settings.port }, (st) => {
         try { storeDshSyncStatus(paths, st); } catch {}
       });
       return status;
+    },
+
+    // ------------------------------------------------------------------
+    // B.1 — DSH catalog approvals
+    // ------------------------------------------------------------------
+
+    async approvalsStatus(opts: { dshClient?: DshClient } = {}): Promise<ApprovalStatusView> {
+      const cur = loadApprovalStore(paths);
+      const reg = loadRegistry(paths);
+      const port = state.read().settings.port;
+      const client = opts.dshClient ?? createDshClient();
+      let binding: ApprovalStatusView["binding"] = null;
+      let migrationCandidateCount: number | null = null;
+      try {
+        const snap = await client.read();
+        if (snap) {
+          const b = checkOwnedProviderBindings(snap, port);
+          binding = { valid: b.valid, go: b.go, zen: b.zen };
+          if (cur.state === "absent") {
+            migrationCandidateCount = snap.go.length + snap.zen.length;
+          }
+        }
+      } catch (e) {
+        log.warn(`approvals status: DSH snapshot read failed: ${redact(e instanceof Error ? e.message : String(e))}`);
+      }
+      const approvals = cur.state === "initialized" ? cur.store.approvals : [];
+      const countsByLane: Record<Lane, number> = {
+        go: approvals.filter((a) => a.lane === "go").length,
+        zen: approvals.filter((a) => a.lane === "zen").length,
+      };
+      let activeCounts: Record<Lane, number> | null = null;
+      let withheldCounts: Record<Lane, number> | null = null;
+      let approvedAbsentCounts: Record<Lane, number> | null = null;
+      if (cur.state === "initialized" && reg && reg.go && reg.zen) {
+        const perLane = (lane: Lane) => {
+          const owned = OWNED_DSH_PROVIDERS[lane];
+          const approved = new Set(
+            cur.store.approvals
+              .filter((a) => a.lane === lane && a.dshProviderId === owned.providerId && a.apiProtocol === owned.apiProtocol)
+              .map((a) => a.modelId),
+          );
+          const regModels = lane === "go" ? reg.go!.models : reg.zen!.models;
+          const regIds = new Set(regModels.map((m) => m.id));
+          const active = [...regIds].filter((id) => approved.has(id)).length;
+          const withheld = [...regIds].filter((id) => !approved.has(id)).length;
+          const absent = [...approved].filter((id) => !regIds.has(id)).length;
+          return { active, withheld, absent };
+        };
+        const g = perLane("go");
+        const z = perLane("zen");
+        activeCounts = { go: g.active, zen: z.active };
+        withheldCounts = { go: g.withheld, zen: z.withheld };
+        approvedAbsentCounts = { go: g.absent, zen: z.absent };
+      }
+      return {
+        storeState: cur.state,
+        version: cur.state === "unsupported-version" ? cur.version : cur.state === "initialized" ? cur.store.version : null,
+        corruptReason: cur.state === "corrupt" ? cur.reason : null,
+        initializedAtUtc: cur.state === "initialized" ? cur.store.initializedAtUtc : null,
+        approvals,
+        countsByLane,
+        registryPresent: reg !== null,
+        binding,
+        bindingError: binding && !binding.valid ? [binding.go.reason, binding.zen.reason].filter(Boolean).join("; ") : null,
+        migrationRequired: cur.state === "absent",
+        migrationCandidateCount,
+        activeCounts,
+        withheldCounts,
+        approvedAbsentCounts,
+        dshSync: loadDshSyncStatus(paths),
+      };
+    },
+
+    async approvalsApprove(lane: Lane, modelId: string, opts: { dshClient?: DshClient } = {}) {
+      const owned = OWNED_DSH_PROVIDERS[lane];
+      const reg = loadRegistry(paths);
+      const laneSnap = reg ? (lane === "go" ? reg.go : reg.zen) : null;
+      if (!laneSnap) {
+        throw new Error(`no ${lane} registry snapshot; run \`gorouter models refresh\` before approving`);
+      }
+      if (!laneSnap.models.some((m) => m.id === modelId)) {
+        throw new Error(`model '${modelId}' not present in the current ${lane} registry snapshot`);
+      }
+      const tuple: ApprovalTuple = { lane, dshProviderId: owned.providerId, apiProtocol: owned.apiProtocol, modelId };
+      const cur = loadApprovalStore(paths);
+      if (cur.state === "corrupt") throw new Error(`approval store corrupt (${cur.reason}); refusing to mutate — fix or remove the file manually`);
+      if (cur.state === "unsupported-version") throw new Error(`approval store schema version ${cur.version} unsupported; refusing to mutate`);
+      let duplicate = false;
+      if (cur.state === "absent") {
+        // FIRST-INITIALIZATION SAFETY: legacy entries present => ratification required.
+        const client = opts.dshClient ?? createDshClient();
+        const dsh = await client.read();
+        if (dsh && (dsh.go.length > 0 || dsh.zen.length > 0)) {
+          throw new Error("migration required: owned DSH providers already contain legacy model entries; ratify `gorouter models approvals migrate` before approving");
+        }
+        initializeApprovalStore(paths, [tuple], "operator");
+      } else {
+        const out = approveTuple(paths, tuple, "operator");
+        duplicate = out.duplicate;
+      }
+      // Best-effort reconciliation; approval state stays truthful on DSH failure.
+      let dshSync: DshSyncStatus | null = null;
+      try {
+        dshSync = await this.dshSync(opts);
+      } catch (e) {
+        log.warn(`dsh sync after approve failed (approval preserved): ${redact(e instanceof Error ? e.message : String(e))}`);
+      }
+      return { tuple, duplicate, dshSync };
+    },
+
+    async approvalsRevoke(lane: Lane, modelId: string, opts: { dshClient?: DshClient } = {}) {
+      const out = revokeModelApproval(paths, { lane, modelId });
+      let dshSync: DshSyncStatus | null = null;
+      try {
+        dshSync = await this.dshSync(opts);
+      } catch (e) {
+        log.warn(`dsh sync after revoke failed (approval preserved): ${redact(e instanceof Error ? e.message : String(e))}`);
+      }
+      return { removed: out.removed, dshSync };
+    },
+
+    async approvalsMigratePreview(opts: { dshClient?: DshClient } = {}): Promise<MigrationPreviewView> {
+      const client = opts.dshClient ?? createDshClient();
+      const snap = await client.read();
+      if (!snap) throw new Error("DSH settings not found or llm-pi-ai namespace missing");
+      const port = state.read().settings.port;
+      const preview = computeMigrationPreview(snap, port, new Date().toISOString());
+      return {
+        proposalId: preview.proposalId,
+        candidates: preview.candidates,
+        bindingsValid: preview.bindings.valid,
+        revision: preview.revision,
+        computedAtUtc: preview.computedAtUtc,
+      };
+    },
+
+    async approvalsMigrateApply(proposalId: string, opts: { dshClient?: DshClient } = {}) {
+      const client = opts.dshClient ?? createDshClient();
+      const snap = await client.read();
+      if (!snap) throw new Error("DSH settings not found or llm-pi-ai namespace missing");
+      const port = state.read().settings.port;
+      const res = applyMigration(paths, snap, proposalId, port);
+      if (!res.ok) throw new Error(res.reason);
+      let dshSync: DshSyncStatus | null = null;
+      try {
+        dshSync = await this.dshSync(opts);
+      } catch (e) {
+        log.warn(`dsh sync after migration apply failed (approval preserved): ${redact(e instanceof Error ? e.message : String(e))}`);
+      }
+      return { applied: true as const, candidates: res.candidates, proposalId: res.proposalId, dshSync };
     },
   };
 }
