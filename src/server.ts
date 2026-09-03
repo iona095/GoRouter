@@ -24,6 +24,8 @@ import { createInboundHttpServer } from "./inbound-http.ts";
 import {
   sanitizeForwardHeaders,
   validateCorrelationId,
+  OPENCODE_SESSION_HEADER,
+  resolveUpstreamSessionId,
   extractUpstreamRequestIds,
   classifyEndpointFamily,
   monotonicMs,
@@ -538,6 +540,13 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         forwardHeaders.delete(name);
       }
     }
+    // OpenCode requires x-opencode-session (one stable id per conversation):
+    // forward the client's value untouched when valid, else reuse the router
+    // correlation id, else generate one — upstream never sees it missing.
+    forwardHeaders.set(
+      OPENCODE_SESSION_HEADER,
+      resolveUpstreamSessionId(req.headers.get(OPENCODE_SESSION_HEADER), correlationId),
+    );
     forwardHeaders.set(
       authHeaderForFamily(authFamily),
       authFamily === "bearer" ? `Bearer ${snapshot.secret}` : snapshot.secret,

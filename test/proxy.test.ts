@@ -637,3 +637,47 @@ describe("route switching and snapshot coherence", () => {
     upstream.stop();
   });
 });
+
+describe("opencode session header", () => {
+  test("inbound x-opencode-session forwarded untouched", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-abc-123" }) });
+    expect(res.status).toBe(200);
+    expect(upstream.requests.length).toBe(1);
+    expect(upstream.requests[0]!.headers.get("x-opencode-session")).toBe("conv-abc-123");
+    upstream.stop();
+  });
+
+  test("missing header is generated, never absent upstream", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    expect(res.status).toBe(200);
+    const v = upstream.requests[0]!.headers.get("x-opencode-session");
+    expect(v).toBeTruthy();
+    expect(v!.length).toBeLessThanOrEqual(256);
+    upstream.stop();
+  });
+
+  test("router correlation id reused as session when no inbound session", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-gorouter-correlation-id": "myconv-1" }) });
+    expect(res.status).toBe(200);
+    expect(upstream.requests[0]!.headers.get("x-opencode-session")).toBe("myconv-1");
+    upstream.stop();
+  });
+
+  test("oversized inbound session replaced, not forwarded", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const bad = "x".repeat(300);
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": bad }) });
+    expect(res.status).toBe(200);
+    const v = upstream.requests[0]!.headers.get("x-opencode-session");
+    expect(v).toBeTruthy();
+    expect(v).not.toBe(bad);
+    upstream.stop();
+  });
+});

@@ -156,6 +156,26 @@ export function validateCorrelationId(value: string | null): string | undefined 
   return v;
 }
 
+/** Upstream session header required by OpenCode (one stable id per conversation). */
+export const OPENCODE_SESSION_HEADER = "x-opencode-session";
+
+/**
+ * Resolve the upstream OpenCode session id for one proxied request.
+ * A valid inbound client value is forwarded untouched so DSH/OMP
+ * conversations keep their stable grouping id; otherwise the validated
+ * router correlation id is reused; otherwise a fresh UUID is generated
+ * so upstream never sees a missing header.
+ */
+export function resolveUpstreamSessionId(
+  inbound: string | null | undefined,
+  correlationId: string | undefined,
+): string {
+  const v = (inbound ?? "").trim();
+  if (v.length > 0 && v.length <= 256 && /^[\x20-\x7E]+$/.test(v)) return v;
+  if (correlationId) return correlationId;
+  return randomUUID();
+}
+
 /** Narrow allowlist of upstream response headers archived as request ids. */
 export const UPSTREAM_REQUEST_ID_HEADERS = ["x-request-id", "x-amzn-requestid"] as const;
 
