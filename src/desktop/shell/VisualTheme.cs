@@ -47,6 +47,11 @@ internal static class VisualTheme
     internal static Font SmallFont { get; } = new Font("Segoe UI", 8.75f, FontStyle.Regular);
     internal static Font FooterFont { get; } = new Font("Segoe UI", 9f, FontStyle.Regular);
     internal static Font StatusFont { get; } = new Font("Segoe UI", 9.75f, FontStyle.Bold);
+    // Visual slice 3 (5-role scale): Caption for footnotes/hints, Mono for
+    // machine identifiers (ports, versions, paths, endpoints). Consolas ships
+    // with Windows; no bundled fonts.
+    internal static Font CaptionFont { get; } = new Font("Segoe UI", 8.5f, FontStyle.Regular);
+    internal static Font MonoFont { get; } = new Font("Consolas", 9.5f, FontStyle.Regular);
 
     /// <summary>State color for truthful status rendering.</summary>
     internal static Color StateColor(string state)

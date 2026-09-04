@@ -368,7 +368,7 @@ public sealed class ControlCenterForm : Form
         _lblPort = new Label
         {
             AutoSize = true,
-            Font = VisualTheme.SmallFont,
+            Font = VisualTheme.MonoFont,
             Margin = new Padding(14, 1, 0, 0),
             Text = "",
             ForeColor = VisualTheme.SecondaryText,
@@ -378,7 +378,7 @@ public sealed class ControlCenterForm : Form
         _lblVersion = new Label
         {
             AutoSize = true,
-            Font = VisualTheme.BodyFont,
+            Font = VisualTheme.MonoFont,
             Margin = new Padding(14, 1, 0, 0),
             Text = "",
             ForeColor = VisualTheme.SecondaryText,
@@ -762,7 +762,7 @@ public sealed class ControlCenterForm : Form
         {
             Text = "Switching affects new requests only.",
             AutoSize = true,
-            Font = VisualTheme.SmallFont,
+            Font = VisualTheme.CaptionFont,
             Margin = new Padding(0, 6, 0, 4),
             MaximumSize = new Size(360, 0),
             ForeColor = VisualTheme.SecondaryText,
@@ -860,7 +860,7 @@ public sealed class ControlCenterForm : Form
         {
             Dock = DockStyle.Fill,
             Text = "Latest requests (up to 5).",
-            Font = VisualTheme.SmallFont,
+            Font = VisualTheme.CaptionFont,
             ForeColor = VisualTheme.SecondaryText,
             BackColor = VisualTheme.SurfaceWhite,
             Margin = new Padding(12, 0, 0, 0),
@@ -1050,7 +1050,7 @@ public sealed class ControlCenterForm : Form
         _lblFooter = new Label
         {
             AutoSize = true,
-            Font = VisualTheme.FooterFont,
+            Font = VisualTheme.MonoFont,
             ForeColor = VisualTheme.SecondaryText,
             TextAlign = ContentAlignment.MiddleLeft,
             AccessibleName = "Desktop release and local endpoint",
@@ -1311,6 +1311,7 @@ public sealed class ControlCenterForm : Form
         _lblStateDirValue = new Label
         {
             AutoSize = true,
+            Font = VisualTheme.MonoFont,
             AccessibleName = "State directory",
         };
         sysLayout.Controls.Add(_lblStateDirValue, 1, 0);
