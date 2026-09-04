@@ -440,6 +440,10 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       emitTimer = null
     }
     emitScheduled = false
+    // Reset dedup state with the lifecycle: a stop->start cycle whose first
+    // snapshot serializes identically to pre-stop must still emit to
+    // (possibly re-attached) listeners, or the UI goes stale silently.
+    lastEmittedJson = null
     supervisor?.close(stopRouter)
   }
 

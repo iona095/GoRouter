@@ -117,19 +117,54 @@ public sealed partial class FirstRunFlow : Form
 
     private static void DisposeControls(Control.ControlCollection controls)
     {
-        foreach (Control child in controls)
+        // Snapshot first: Control.Dispose() removes the control from its
+        // parent collection, invalidating a live enumerator (every ShowStep
+        // after the first would throw InvalidOperationException).
+        for (int i = controls.Count - 1; i >= 0; i--)
         {
-            child.Dispose();
+            controls[i]?.Dispose();
         }
+    }
+
+    /// <summary>Stops the clipboard timer without firing it. Returns the
+    /// credential value it was armed for (null when disarmed) so callers can
+    /// take the text back immediately instead of stranding it.</summary>
+    private string? DisarmCredentialClipboardTimer()
+    {
+        var timer = _credentialClipboardTimer;
+        var armedFor = _clipboardArmedFor;
+        _credentialClipboardTimer = null;
+        _clipboardArmedFor = null;
+        if (timer is not null)
+        {
+            try { timer.Stop(); } catch { /* already fired */ }
+            timer.Dispose();
+        }
+        return armedFor;
     }
 
     private void ShowStep(int step)
     {
         _step = step;
         // Scrub on navigation, not just on close: leaving the credential step
-        // must not keep the one-time secret in the undisposed controls or in
-        // _shownCredential. Best effort (managed strings cannot be zeroed),
-        // so the clipboard timer and close-scrub below stay as backstops.
+        // must not keep the one-time secret in the undisposed controls, in
+        // _shownCredential, or on the clipboard. Navigating away ends the
+        // clipboard exposure window NOW (the close-time backstop below keys
+        // off _shownCredential, which is nulled here — without this the text
+        // would be stranded indefinitely). Best effort (managed strings
+        // cannot be zeroed), so the close-scrub stays as a backstop.
+        var clipboardArmedFor = DisarmCredentialClipboardTimer();
+        if (clipboardArmedFor is not null)
+        {
+            try
+            {
+                if (Clipboard.ContainsText() && Clipboard.GetText() == clipboardArmedFor)
+                {
+                    Clipboard.Clear();
+                }
+            }
+            catch { /* contention: best effort only */ }
+        }
         ClearTextBoxes(_content.Controls);
         DisposeControls(_content.Controls);
         _shownCredential = null;
@@ -288,6 +323,14 @@ public sealed partial class FirstRunFlow : Form
         try
         {
             var response = await _channel.CallAsync("localCred.once", null, 10_000);
+            // Stale-continuation guard: navigating away during the fetch
+            // disposes/scrubs these controls — a late arrival must not write
+            // the fresh secret into a disposed box or resurrect
+            // _shownCredential after the navigation scrub nulled it.
+            if (_step != 2 || txtCredential.IsDisposed || layout.IsDisposed)
+            {
+                return;
+            }
             if (response.Ok && response.TryDataAs<LocalCredentialData>(out var data) && !string.IsNullOrEmpty(data?.Credential))
             {
                 txtCredential.Text = data.Credential;
@@ -679,6 +722,9 @@ public sealed partial class FirstRunFlow : Form
                         catch { /* best effort only */ }
                     };
                     _credentialClipboardTimer = retry;
+                    // Keep the armed value so navigation-away can still take
+                    // the text back during the retry window.
+                    _clipboardArmedFor = credential;
                     retry.Start();
                 }
             }
@@ -690,14 +736,7 @@ public sealed partial class FirstRunFlow : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        var timer = _credentialClipboardTimer;
-        _credentialClipboardTimer = null;
-        _clipboardArmedFor = null;
-        if (timer is not null)
-        {
-            try { timer.Stop(); } catch { /* already fired */ }
-            timer.Dispose();
-        }
+        DisarmCredentialClipboardTimer();
 
         // Clear every TextBox recursively and unconditionally: the one-time
         // credential box lives nested in a layout panel, so a flat control

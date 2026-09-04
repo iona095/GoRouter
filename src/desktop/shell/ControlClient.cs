@@ -161,7 +161,10 @@ public sealed class ControlClient : IControlChannel
     {
         lock (_gate)
         {
-            _connectCts?.Cancel();
+            // Cancel-only: the superseded loop may still await on this CTS
+            // (disposing under it throws ObjectDisposedException out of its
+            // Task.Delay). The exiting loop disposes non-current CTSs itself.
+            try { _connectCts?.Cancel(); } catch { /* already disposed */ }
             _connectCts = new CancellationTokenSource();
         }
 
@@ -269,10 +272,32 @@ public sealed class ControlClient : IControlChannel
         var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         lock (_gate)
         {
-            _connectCts?.Cancel();
+            try { _connectCts?.Cancel(); } catch { /* already disposed */ }
             _connectCts = linked;
         }
 
+        // The previous CTS is NOT disposed here: the superseded loop may
+        // still be awaiting on its token (disposing under it throws
+        // ObjectDisposedException out of Task.Delay). Each loop disposes its
+        // own CTS on exit once it is no longer current (finally below).
+        try
+        {
+            await ConnectLoopBodyAsync(linked).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                if (!ReferenceEquals(_connectCts, linked))
+                {
+                    linked.Dispose();
+                }
+            }
+        }
+    }
+
+    private async Task ConnectLoopBodyAsync(CancellationTokenSource linked)
+    {
         SetState(ClientState.Reconnecting, null);
         foreach (var delay in Backoff)
         {
@@ -285,8 +310,10 @@ public sealed class ControlClient : IControlChannel
             {
                 await Task.Delay(delay, linked.Token).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException || ex is ObjectDisposedException)
             {
+                // Cancelled normally, or the CTS was disposed by Dispose()
+                // while this loop awaited — either way this loop is done.
                 return;
             }
 
@@ -563,6 +590,11 @@ public sealed class ControlClient : IControlChannel
             ownedReader?.Dispose();
             try { ownedCts?.Cancel(); } catch { /* already disposed */ }
             ownedCts?.Dispose();
+            // The pipe itself: Dispose is idempotent, so unconditionally
+            // disposing the loop's own handle closes the natural-exit leak
+            // (EOF/error/cancel paths that never passed through ClosePipe)
+            // without double-dispose risk on paths that did.
+            try { pipe.Dispose(); } catch { /* already torn down */ }
 
             FailAllPending();
 
@@ -646,10 +678,17 @@ public sealed class ControlClient : IControlChannel
     public void Dispose()
     {
         _disposed = true;
+        CancellationTokenSource? cts;
         lock (_gate)
         {
-            _connectCts?.Cancel();
+            cts = _connectCts;
+            _connectCts = null;
         }
+        // Cancel first so loops exit via OperationCanceledException; dispose
+        // after (a loop still inside Task.Delay tolerates ObjectDisposed-
+        // Exception via the widened catch and its finally skips non-current).
+        try { cts?.Cancel(); } catch { /* already disposed */ }
+        cts?.Dispose();
 
         ClosePipe();
         FailAllPending();
