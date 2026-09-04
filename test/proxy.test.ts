@@ -779,6 +779,7 @@ describe("opencode session header", () => {
     // short secret would otherwise rotate innocent ids per request).
     const r3 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-opencode-session": "conv-short-suffix" }) });
     expect(r3.status).toBe(200);
+    expect(upstream.requests[2]!.headers.get("x-opencode-session")).toBe("conv-short-suffix");
     upstream.stop();
   });
 

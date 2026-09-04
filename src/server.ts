@@ -520,7 +520,10 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     upstreamUrl.pathname = basePathname.endsWith("/")
       ? basePathname.slice(0, -1) + suffix
       : basePathname + suffix;
-    // strip the local credential from query params if present (client misplacement)
+    // strip the local credential from query params if present (client misplacement).
+    // Deliberately no entropy floor here (unlike the header/session substring
+    // scans): a query-param delete has no innocent-id rotation/spam vector,
+    // so exact-or-substring always strips.
     const searchParams = new URLSearchParams(search);
     let stripped = false;
     for (const [k, v] of [...searchParams]) {
