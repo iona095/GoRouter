@@ -166,12 +166,15 @@ public sealed class TrayIcon : IDisposable
 
     private void UpdateIcon(string routerState)
     {
+        // Visual slice 5: the state pip rides theme tokens (no literals), so
+        // the tray glyph can never drift from the in-app state colors and
+        // inherits the dark-theme contract in slice 6.
         var color = routerState switch
         {
-            "running" => Color.FromArgb(0x1B, 0x7A, 0x3D),
-            "degraded" or "starting" => Color.FromArgb(0xC8, 0x7A, 0x00),
-            "port_conflict" or "failed" => Color.FromArgb(0xC0, 0x2B, 0x1E),
-            _ => Color.FromArgb(0x75, 0x75, 0x75),
+            "running" => VisualTheme.Healthy,
+            "degraded" or "starting" => VisualTheme.Warning,
+            "port_conflict" or "failed" => VisualTheme.Danger,
+            _ => VisualTheme.MutedText,
         };
 
         using var bitmap = new Bitmap(32, 32);
