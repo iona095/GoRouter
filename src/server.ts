@@ -740,9 +740,11 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       const host = st.settings.host;
       const port = st.settings.port;
 
-      const journalReject = (rawTarget: string, reason: string, method?: string, httpStatus?: number) => {
-        // Create a synthetic journal entry for the rejected request
-        const correlationId = null; // no correlation id for rejected requests
+      const journalReject = (rawTarget: string, reason: string, method?: string, httpStatus?: number, correlationId?: string | null) => {
+        // Create a synthetic journal entry for the rejected request.
+        // The correlation id rides in from inbound (D-12, validated there);
+        // absent when the client sent none.
+        const cid = correlationId ?? null;
         const rejectedPath = rawTarget.split("?")[0] ?? "";
         // Lane derived from the raw target path prefix with an explicit go
         // check: targets with NO lane prefix (e.g. chunked POST to /foo) must
@@ -762,7 +764,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
           httpStatus: httpStatus ?? 400,
           upstreamRequestIds: [],
           model: null,
-          clientCorrelationId: correlationId,
+          clientCorrelationId: cid,
         });
         deps.journal.complete(entry, {
           completedAtUtc: utcNow(),

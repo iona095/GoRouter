@@ -7,6 +7,70 @@
  */
 import { describe, test, expect, afterEach } from "bun:test";
 import net from "node:net";
+
+// D-12: rejected requests keep the client's correlation id on the journal row.
+describe("reject correlation (D-12)", () => {
+  test("raw-target reject journals the x-gorouter-correlation-id header", async () => {
+    const router = await newRouter({
+      upstreamBase: "http://127.0.0.1:1",
+      accounts: [{ alias: "a1", key: "k" }],
+      routes: { go: "a1" },
+    });
+    const port = Number(new URL(router.baseUrl).port);
+    const raw: string = await new Promise((resolve, reject) => {
+      const sock = net.connect({ host: "127.0.0.1", port });
+      sock.once("error", reject);
+      sock.once("connect", () => {
+        sock.write(
+          "POST /go/v1/%zz HTTP/1.1\r\n" +
+            `Host: 127.0.0.1:${port}\r\n` +
+            "Content-Length: 0\r\n" +
+            "Connection: close\r\n" +
+            "x-gorouter-correlation-id: corr-reject-1\r\n" +
+            "\r\n",
+        );
+      });
+      let buf = "";
+      sock.on("data", (d: Buffer) => { buf += d.toString("utf8"); });
+      sock.once("close", () => resolve(buf));
+    });
+    expect(raw).toContain("400");
+    const rows = await waitForRows(router.paths.journalDb, 1);
+    const reject = rows.find((r) => r.terminal_outcome === "local_error");
+    expect(reject).toBeDefined();
+    expect(reject!["client_correlation_id"]).toBe("corr-reject-1");
+  });
+
+  test("reject without the header still journals null (no fabrication)", async () => {
+    const router = await newRouter({
+      upstreamBase: "http://127.0.0.1:1",
+      accounts: [{ alias: "a1", key: "k" }],
+      routes: { go: "a1" },
+    });
+    const port = Number(new URL(router.baseUrl).port);
+    const raw: string = await new Promise((resolve, reject) => {
+      const sock = net.connect({ host: "127.0.0.1", port });
+      sock.once("error", reject);
+      sock.once("connect", () => {
+        sock.write(
+          "POST /go/v1/%zz HTTP/1.1\r\n" +
+            `Host: 127.0.0.1:${port}\r\n` +
+            "Content-Length: 0\r\n" +
+            "Connection: close\r\n" +
+            "\r\n",
+        );
+      });
+      let buf = "";
+      sock.on("data", (d: Buffer) => { buf += d.toString("utf8"); });
+      sock.once("close", () => resolve(buf));
+    });
+    expect(raw).toContain("400");
+    const rows = await waitForRows(router.paths.journalDb, 1);
+    const reject = rows.find((r) => r.terminal_outcome === "local_error");
+    expect(reject).toBeDefined();
+    expect(reject!["client_correlation_id"]).toBeNull();
+  });
+});
 import {
   startMockUpstream,
   startTestRouter,
