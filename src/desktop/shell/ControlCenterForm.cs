@@ -42,10 +42,8 @@ public sealed class ControlCenterForm : Form
     private Button _btnStopRouter = null!;
     private ActionButton _btnTheme = null!;
 
-    // footer (state, local endpoint port)
+    // footer (local endpoint only; router state lives in the header badge)
     private Panel _footer = null!;
-    private StatusDot _footerDot = null!;
-    private Label _lblFooterState = null!;
     private Label _lblFooter = null!;
 
     // banner (startup / unavailable / auth-failed / onboarding pending)
@@ -1080,30 +1078,9 @@ public sealed class ControlCenterForm : Form
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        var left = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
-            Padding = new Padding(0, 3, 0, 0),
-            BackColor = VisualTheme.SurfaceWhite,
-            AccessibleName = "Footer status summary",
-        };
-        _footerDot = new StatusDot
-        {
-            Margin = new Padding(0, 3, 0, 0),
-            AccessibleName = "Footer state indicator",
-        };
-        _lblFooterState = new Label
-        {
-            AutoSize = true,
-            Font = VisualTheme.FooterFont,
-            Margin = new Padding(8, 0, 0, 0),
-            ForeColor = VisualTheme.SecondaryText,
-            AccessibleName = "Footer state",
-        };
-        left.Controls.AddRange(new Control[] { _footerDot, _lblFooterState });
-
+        // Visual slice 7: state display lives in exactly one place (the
+        // header badge). The footer keeps only the local endpoint, still
+        // right-aligned via the percent spacer column.
         _lblFooter = new Label
         {
             AutoSize = true,
@@ -1113,25 +1090,10 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Desktop release and local endpoint",
         };
 
-        layout.Controls.Add(left, 0, 0);
         layout.Controls.Add(_lblFooter, 1, 0);
         _footer.Controls.Add(layout);
         _footer.Controls.Add(separator); // docked last so it owns the top strip
         return _footer;
-    }
-
-    private static string FooterStateText(SnapshotRouter router)
-    {
-        return router.State switch
-        {
-            "running" => router.Mode == "attached" ? "Running (attached)" : "Operational",
-            "degraded" => "Degraded",
-            "starting" => "Starting…",
-            "stopped" => "Stopped",
-            "failed" => "Failed",
-            "port_conflict" => "Port conflict",
-            _ => router.State,
-        };
     }
 
     private TabPage BuildAccountsTab()
@@ -1343,22 +1305,36 @@ public sealed class ControlCenterForm : Form
         left.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
 
         // --- system group ---
+        // AutoSize group + Top-docked layout (slice 7): GroupBox does not
+        // derive its preferred size from a Dock=Fill child, so the group
+        // frame collapsed to ~2 rows and clipped the rest. Content-sized
+        // in both directions, the frame always wraps its rows.
         var sysGroup = new GroupBox
         {
             Text = "System",
             Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Padding = new Padding(10),
             AccessibleName = "System information",
         };
         var sysLayout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Top,
+            AutoSize = true,
             ColumnCount = 2,
             RowCount = 4,
             AccessibleName = "System information values",
         };
         sysLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         sysLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        // Explicit content-sized rows (slice 7): value labels fill in late
+        // from the snapshot tick, and implicit rows measured them at empty
+        // height, clipping Journal/Router rows out of the group frame.
+        for (var i = 0; i < 4; i++)
+        {
+            sysLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
 
         sysLayout.Controls.Add(MakeFieldLabel("State directory", "State directory label"), 0, 0);
         _lblStateDirValue = new Label
@@ -1396,23 +1372,33 @@ public sealed class ControlCenterForm : Form
         sysGroup.Controls.Add(sysLayout);
 
         // --- settings group ---
+        // Same content-sized pattern as the System group (slice 7).
         var settingsGroup = new GroupBox
         {
             Text = "Settings",
             Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Padding = new Padding(10),
             AccessibleName = "Desktop settings",
         };
         var settingsLayout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Dock = DockStyle.Top,
+            AutoSize = true,
             ColumnCount = 3,
-            RowCount = 7,
+            RowCount = 8,
             AccessibleName = "Desktop settings controls",
         };
         settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        // Explicit content-sized rows: every settings row measures itself,
+        // so late snapshot text can never clip a row (slice 7).
+        for (var i = 0; i < 8; i++)
+        {
+            settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
 
         _chkStartAtLogin = new CheckBox
         {
@@ -1506,6 +1492,10 @@ public sealed class ControlCenterForm : Form
         };
         settingsLayout.Controls.Add(_lblRetentionError, 0, 7);
         settingsLayout.SetColumnSpan(_lblRetentionError, 3);
+
+        // Visual slice 7: this parent link was missing, so the whole
+        // Settings group rendered as an empty frame.
+        settingsGroup.Controls.Add(settingsLayout);
 
         left.Controls.Add(sysGroup, 0, 0);
         left.Controls.Add(settingsGroup, 0, 1);
@@ -1884,10 +1874,6 @@ public sealed class ControlCenterForm : Form
             UiText.SetIfChanged(_lblRouteSummary, UiText.Truncate(
                 $"Go \u2192 {(string.IsNullOrEmpty(snapshot.Routes.Go.Alias) ? "\u2014" : snapshot.Routes.Go.Alias)} · Zen \u2192 {(string.IsNullOrEmpty(snapshot.Routes.Zen.Alias) ? "\u2014" : snapshot.Routes.Zen.Alias)}", 44));
             _lblVersion.Text = string.IsNullOrEmpty(PresentationVersion) ? "" : $"v{PresentationVersion}";
-            UiText.SetIfChanged(_lblFooterState, UiText.Truncate(FooterStateText(snapshot.Router), 64));
-            _lblFooterState.ForeColor = RouterColor(snapshot.Router.State);
-            _footerDot.FillColor = RouterColor(snapshot.Router.State);
-            _footerDot.Invalidate();
             UiText.SetIfChanged(_lblFooter, $"Local: http://127.0.0.1:{snapshot.Settings.Port}");
             UpdateLifecycleButtons();
 
