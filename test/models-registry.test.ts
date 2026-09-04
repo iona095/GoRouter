@@ -1001,7 +1001,7 @@ describe("single-flight", () => {
     expect(r1.success).toBe(true);
     expect(r1.fromCache).toBe(false);
     expect(r2.fromCache).toBe(true); // served the other's publish, flagged
-    expect(r2.registry!.go.models.map((m) => m.id)).toEqual(["gX"]);
+    expect(r2.registry!.go!.models.map((m) => m.id)).toEqual(["gX"]);
   });
 
   test("single-flight clears after completion so next refresh fetches again", async () => {

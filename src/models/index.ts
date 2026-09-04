@@ -12,3 +12,6 @@ export * from "./dsh-client.ts";
 export * from "./dsh-eligibility.ts";
 export * from "./dsh-sync.ts";
 export * from "./dsh-sync-state.ts";
+export * from "./dsh-approvals.ts";
+export * from "./dsh-binding.ts";
+export * from "./dsh-migration.ts";

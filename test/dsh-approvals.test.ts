@@ -468,6 +468,24 @@ describe("migration", () => {
     expect(client.history.length).toBe(0);
   });
 
+  test("concurrent first-approves converge: one init, loser approves, no throw (L5)", async () => {
+    const { dir, paths } = freshPaths();
+    storeRegistry(paths, registryFile({ goIds: ["g1"], zenIds: ["z1"] }));
+    const { domain } = domainFor(dir);
+    // Empty DSH: both pass the migration-ratification check; the awaits
+    // interleave so both observe absent and race initializeApprovalStore.
+    const [a, b] = await Promise.all([
+      domain.approvalsApprove("go", "g1", { dshClient: memClient([], []) }),
+      domain.approvalsApprove("go", "g1", { dshClient: memClient([], []) }),
+    ]);
+    expect([a.duplicate, b.duplicate].sort()).toEqual([false, true]);
+    const cur = loadApprovalStore(paths);
+    expect(cur.state).toBe("initialized");
+    if (cur.state === "initialized") {
+      expect(cur.store.approvals.filter((t) => t.modelId === "g1")).toHaveLength(1);
+    }
+  });
+
   test("preview is read-only: no store file, no DSH mutation, revision unchanged", async () => {
     const { paths } = freshPaths();
     const client = memClient([makeModel("g1"), makeModel("g2")], [makeModel("z1")], 11);

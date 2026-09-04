@@ -695,7 +695,17 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         if (dsh && (dsh.go.length > 0 || dsh.zen.length > 0)) {
           throw new Error("migration required: owned DSH providers already contain legacy model entries; ratify `gorouter models approvals migrate` before approving");
         }
-        initializeApprovalStore(paths, [tuple], "operator");
+        try {
+          initializeApprovalStore(paths, [tuple], "operator");
+        } catch (e) {
+          // L5: a concurrent first-approve won the init race — the store now
+          // exists, so converge onto approve instead of failing spuriously
+          // (the operator retries nothing; the tuple still lands exactly once).
+          const again = loadApprovalStore(paths);
+          if (again.state !== "initialized") throw e;
+          const out = approveTuple(paths, tuple, "operator");
+          duplicate = out.duplicate;
+        }
       } else {
         const out = approveTuple(paths, tuple, "operator");
         duplicate = out.duplicate;
