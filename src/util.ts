@@ -164,13 +164,19 @@ export const LOCAL_HEADERS = new Set([
   "x-goog-api-key",
 ]);
 
-export function sanitizeForwardHeaders(headers: Headers): Headers {
+/**
+ * Slice D: optional single-pass strip predicate fuses the credential-strip
+ * scan into the allowlist copy (one header walk instead of two). Returning
+ * true drops the header; the predicate owns side effects (e.g. logging).
+ */
+export function sanitizeForwardHeaders(headers: Headers, strip?: (name: string, value: string) => boolean): Headers {
   const out = new Headers();
   for (const [name, value] of headers) {
     const lower = name.toLowerCase();
     if (HOP_BY_HOP.has(lower)) continue;
     if (lower === "host") continue; // set explicitly to the upstream authority
     if (LOCAL_HEADERS.has(lower)) continue;
+    if (strip !== undefined && strip(name, value)) continue;
     out.set(name, value);
   }
   return out;

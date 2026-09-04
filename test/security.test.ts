@@ -8,10 +8,28 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startMockUpstream, startTestRouter, authHeaders, LOCAL_KEY, type TestRouter } from "./harness.ts";
+import { sanitizeForwardHeaders } from "../src/util.ts";
 
 const routers: TestRouter[] = [];
 afterEach(() => {
   for (const r of routers.splice(0)) r.stop();
+});
+
+describe("sanitizeForwardHeaders strip predicate (slice D single-pass fuse)", () => {
+  test("predicate drops matching values in the same copy pass", () => {
+    const h = new Headers({ "x-custom": "abc", "x-evil": "has-secret-here", "authorization": "Bearer local" });
+    const out = sanitizeForwardHeaders(h, (_name, value) => value.includes("secret"));
+    expect(out.get("x-custom")).toBe("abc");
+    expect(out.get("x-evil")).toBeNull();
+    expect(out.get("authorization")).toBeNull(); // local-only, independent of the predicate
+  });
+
+  test("absent predicate preserves the legacy allowlist behavior", () => {
+    const h = new Headers({ "x-custom": "abc", host: "example.com" });
+    const out = sanitizeForwardHeaders(h);
+    expect(out.get("x-custom")).toBe("abc");
+    expect(out.get("host")).toBeNull();
+  });
 });
 
 async function newRouter(opts: Parameters<typeof startTestRouter>[0]) {

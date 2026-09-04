@@ -69,8 +69,14 @@ export interface Journal {
     upstreamRequestIds: string[];
   }): void;
   stats(): JournalStats;
-  /** Prune records beyond retention/max; called on startup and periodically. */
-  prune(): void;
+  /**
+   * Prune records beyond retention/max; called on startup and periodically.
+   * Slice D: `checkpoint=false` (the periodic in-request call) runs only the
+   * indexed DELETEs and skips the synchronous TRUNCATE checkpoint — WAL reuse
+   * plus SQLite's automatic checkpoint bound growth; the TRUNCATE runs at
+   * startup and on last-close instead of on a request's critical path.
+   */
+  prune(checkpoint?: boolean): void;
   close(): void;
 }
 
@@ -182,7 +188,10 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
         insertsSincePrune++;
         if (insertsSincePrune >= 64) {
           insertsSincePrune = 0;
-          journal.prune();
+          // Slice D: in-request maintenance skips the TRUNCATE checkpoint
+          // (p99 fsync off the critical path); startup prune + last-close
+          // still checkpoint, and WAL space is reused between them.
+          journal.prune(false);
         }
       });
       return entry;
@@ -229,7 +238,7 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
         };
       }
     },
-    prune() {
+    prune(checkpoint = true) {
       runSafe(() => {
         if (retentionDays > 0) {
           const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
@@ -245,7 +254,7 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
           `).run(maxRecords);
         }
         // keep the WAL bounded between checkpoints (retention is row-based)
-        db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+        if (checkpoint) db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
       });
     },
     close() {

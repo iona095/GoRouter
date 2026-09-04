@@ -590,17 +590,19 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
 
     // endpoint-family-specific credential injection (validated upstream surface)
     const authFamily = classifyAuthFamily(suffix);
-    const forwardHeaders = sanitizeForwardHeaders(req.headers);
     // defense: arbitrary client headers whose value contains the local credential
-    // are stripped so they never reach the pinned OpenCode authority
-    for (const [name, value] of [...forwardHeaders]) {
+    // are stripped so they never reach the pinned OpenCode authority. The scan
+    // rides inside the allowlist copy (single pass); the length pre-check makes
+    // the substring test O(1)-reject on short values.
+    const forwardHeaders = sanitizeForwardHeaders(req.headers, (name, value) => {
       // Exact equality always strips (even for short/test credentials);
       // only the SUBSTRING scan is gated on the entropy floor.
-      if (value === localCred || (localCred.length >= MIN_SUBSTRING_SECRET_LENGTH && value.includes(localCred))) {
+      if (value === localCred || (localCred.length >= MIN_SUBSTRING_SECRET_LENGTH && value.length >= localCred.length && value.includes(localCred))) {
         log.warn(`local credential stripped from forwarded header ${name} (lane=${lane})`);
-        forwardHeaders.delete(name);
+        return true;
       }
-    }
+      return false;
+    });
     // OpenCode requires x-opencode-session (one stable id per conversation):
     // resolve first, then apply the same credential-containment rule as every
     // other forwarded header — the raw inbound value must not be re-introduced
