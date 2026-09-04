@@ -369,6 +369,11 @@ function dshWebUrl(configured?: string | null): string | null {
   return null;
 }
 
+// The HOST endpoint (Typert RPC) may serve TLS, so https is allowed here.
+// This is intentionally wider than the owned-provider BINDING check
+// (dsh-binding.ts), which requires plaintext http: because the bindings
+// must point at GoRouter's own loopback lane routes (M8: deliberate split,
+// not an inconsistency).
 function validateLoopbackUrl(value: string): URL {
   const u = new URL(value);
   if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("DSH endpoint must be http(s)");
@@ -628,15 +633,20 @@ export interface DshClientOptions {
   dshWebUrl?: string | null;
 }
 
+/**
+ * Client selection. An EXPLICIT web URL (configured or DSH_WEB_URL) that
+ * fails loopback validation THROWS (M7) — the old silent fall-through to
+ * the file client meant the operator believed they were driving the remote
+ * host while edits landed in the local file (or vice versa). No URL at
+ * all still selects the file client. All production callers are
+ * failure-isolated, so the throw surfaces as a loud sync error, never a
+ * crash.
+ */
 export function createDshClient(opts: DshClientOptions = {}): DshClient {
   const web = dshWebUrl(opts.dshWebUrl ?? null);
   if (web) {
-    try {
-      validateLoopbackUrl(web);
-      return new HttpDshClient(web);
-    } catch {
-      // Fall through to file client if loopback validation fails
-    }
+    validateLoopbackUrl(web);
+    return new HttpDshClient(web);
   }
   return new FileDshClient(opts.settingsPath ?? null, opts.dshHome ?? null);
 }

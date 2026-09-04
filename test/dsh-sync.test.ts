@@ -1631,9 +1631,12 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
       expect(http2 instanceof HttpDshClient).toBe(true);
       const file = createDshClient({ dshWebUrl: null });
       expect(file instanceof FileDshClient).toBe(true);
-      // Invalid (non-loopback) URL falls back to file, not remote
-      const fallback = createDshClient({ dshWebUrl: "http://evil.example/api" });
-      expect(fallback instanceof FileDshClient).toBe(true);
+      // M7: an explicit-but-invalid URL THROWS (no silent downgrade to file).
+      expect(() => createDshClient({ dshWebUrl: "http://evil.example/api" })).toThrow(/loopback/);
+      expect(() => createDshClient({ dshWebUrl: "nota-url" })).toThrow();
+      // M8: the host endpoint deliberately allows https (TLS-capable host).
+      const https = createDshClient({ dshWebUrl: "https://127.0.0.1:3080" });
+      expect(https instanceof HttpDshClient).toBe(true);
     } finally {
       if (previous === undefined) delete process.env.DSH_WEB_URL;
       else process.env.DSH_WEB_URL = previous;

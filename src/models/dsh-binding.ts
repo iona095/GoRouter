@@ -60,8 +60,14 @@ function checkLane(lane: Lane, rawProvider: Record<string, unknown> | null | und
   } catch {
     return { ...base, api, baseURL, reason: `owned provider '${owned.providerId}' baseURL unparseable` };
   }
+  // Plaintext http: ONLY (M8): the owned bindings must point at GoRouter's
+  // own loopback lane routes, which serve plaintext. An https: URL here is
+  // not "safer" — TLS against the plaintext router fails at fetch — so it
+  // fails closed with a reason that says so. (The DSH *host* endpoint in
+  // dsh-client.ts deliberately allows https:; different endpoint, different
+  // rule.)
   if (u.protocol !== "http:") {
-    return { ...base, api, baseURL, reason: `owned provider '${owned.providerId}' baseURL must be local http` };
+    return { ...base, api, baseURL, reason: `owned provider '${owned.providerId}' baseURL must be local plaintext http (https against the loopback router cannot handshake)` };
   }
   if (!isLoopbackHostname(u.hostname)) {
     return { ...base, api, baseURL, reason: `owned provider '${owned.providerId}' baseURL host '${u.hostname}' is not loopback` };

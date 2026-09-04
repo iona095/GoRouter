@@ -863,6 +863,11 @@ describe("binding guard", () => {
       const other = badLane === "go" ? b.zen : b.go;
       expect(other.valid).toBe(true);
     }
+    // M8: the https rejection names the real cause (TLS vs plaintext router),
+    // guiding the operator to http: instead of a mysterious closed gate.
+    const https = bindCheck({ ...GO_BIND, baseURL: "https://127.0.0.1:8787/go/v1" }, { ...ZEN_BIND });
+    expect(https.valid).toBe(false);
+    expect(https.go.reason).toMatch(/plaintext http/);
   });
 
   test("reconcile fail-closed: wrong GO path -> error, no mutation of either lane", async () => {
