@@ -976,6 +976,34 @@ describe("single-flight", () => {
     expect(r2.registry!.updatedAtUtc).toBe(r3.registry!.updatedAtUtc);
   });
 
+  test("different args do not masquerade as their own fetch (L2 keyed flight)", async () => {
+    const { paths } = freshPaths();
+    const delayed: FetchFn = async (url) => {
+      await new Promise((r) => setTimeout(r, 120));
+      const tag = url.includes("upstream.go") ? "gX" : url.includes("upstream.go2") ? "gY" : "z";
+      return Response.json(listData([tag]), { status: 200 });
+    };
+    const optsX = {
+      upstreamGo: "https://upstream.go",
+      upstreamZen: "https://upstream.zen",
+      fetchFn: delayed,
+      nowMs: BASE_MS,
+      nowIso: BASE_ISO,
+    };
+    const p1 = refreshRegistry(paths, optsX);
+    // Different upstream while p1 flies: must NOT resolve as p1's own fresh
+    // fetch — it waits on the claim and reports fromCache (honest), or busy.
+    const p2 = refreshRegistry(paths, {
+      ...optsX,
+      upstreamGo: "https://upstream.go2",
+    });
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1.success).toBe(true);
+    expect(r1.fromCache).toBe(false);
+    expect(r2.fromCache).toBe(true); // served the other's publish, flagged
+    expect(r2.registry!.go.models.map((m) => m.id)).toEqual(["gX"]);
+  });
+
   test("single-flight clears after completion so next refresh fetches again", async () => {
     const { paths } = freshPaths();
     let calls = 0;

@@ -115,11 +115,17 @@ async function waitForRefreshLock(lockPath: string, timeoutMs: number): Promise<
   }
 }
 
-// Single-flight state — module-level.
-let inFlight: Promise<RefreshResult> | null = null;
+// Single-flight state — module-level, keyed by the fetch-affecting args
+// (L2): coalescing callers with DIFFERENT upstreams/forced flags onto one
+// flight returned another caller's result. Same args still share one flight.
+const inFlight = new Map<string, Promise<RefreshResult>>();
+
+function flightKey(opts: RefreshOptions): string {
+  return `${opts.upstreamGo}\n${opts.upstreamZen}\n${opts.forced === true ? "1" : "0"}`;
+}
 
 export function clearRefreshSingleFlightForTests(): void {
-  inFlight = null;
+  inFlight.clear();
 }
 
 function attemptInfo(success: boolean, httpStatus: number | null, error: string | null, durationMs: number, atUtc: string): AttemptInfo {
@@ -132,8 +138,11 @@ function parseHttpStatus(errorMsg: string): number | null {
 }
 
 export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promise<RefreshResult> {
-  // Single-flight: coalesce concurrent callers in this process
-  if (inFlight) return inFlight;
+  // Single-flight: coalesce concurrent callers in this process with the
+  // SAME fetch-affecting args; different args fly separately (L2).
+  const key = flightKey(opts);
+  const existing = inFlight.get(key);
+  if (existing) return existing;
   const p = (async (): Promise<RefreshResult> => {
     const lockPath = refreshLockPath(paths);
     let nonce: string | null = null;
@@ -179,9 +188,9 @@ export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promi
       if (nonce !== null) releaseRefreshLock(lockPath, nonce);
     }
   })().finally(() => {
-    inFlight = null;
+    if (inFlight.get(key) === p) inFlight.delete(key);
   });
-  inFlight = p;
+  inFlight.set(key, p);
   return p;
 }
 
