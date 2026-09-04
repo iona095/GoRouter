@@ -343,7 +343,10 @@ if (process.env.ROLE === "a") {
 `,
     );
 
-    const baseEnv = { ...process.env, GOROUTER_REPO: repo, GOROUTER_STATE_DIR: st.dir };
+    // Hermeticity (F-07): keep the ambient DSH_WEB_URL out of the workers'
+    // environment so file-seam tests cannot flip to the HTTP DSH client.
+    const baseEnv: Record<string, string | undefined> = { ...process.env, GOROUTER_REPO: repo, GOROUTER_STATE_DIR: st.dir };
+    delete baseEnv.DSH_WEB_URL;
     const pa = Bun.spawn([process.execPath, script], { env: { ...baseEnv, ROLE: "a" }, stdout: "pipe", stderr: "pipe" });
     const pb = Bun.spawn([process.execPath, script], { env: { ...baseEnv, ROLE: "b" }, stdout: "pipe", stderr: "pipe" });
     const [ca, cb] = await Promise.all([pa.exited, pb.exited]);
@@ -630,20 +633,16 @@ describe("migration", () => {
     writeFileSync(withSettings, JSON.stringify(settingsDoc, null, 2));
     const { dir, paths } = freshPaths();
     const { domain } = domainFor(dir);
-    const prevEnv = process.env.DSH_HOME;
-    process.env.DSH_HOME = dshHome;
-    try {
-      const preview = await domain.approvalsMigratePreview();
-      expect(preview.bindingsValid).toBe(true);
-      expect(preview.candidates).toEqual([tup("go", "legacy-go-1"), tup("zen", "legacy-zen-1")]);
-      expect(preview.candidates.some((c) => c.modelId === "resp-only" || c.modelId === "or-model")).toBe(false);
-      // preview is read-only against the real settings file and the store
-      expect(readFileSync(withSettings, "utf8")).toBe(readFileSync(withSettings, "utf8"));
-      expect(loadRegistry(paths)).toBeNull();
-    } finally {
-      if (prevEnv === undefined) delete process.env.DSH_HOME;
-      else process.env.DSH_HOME = prevEnv;
-    }
+    // Explicit file client (F-07): preview must never resolve via ambient
+    // DSH_WEB_URL/DSH_HOME, which would flip to the HTTP client on DSH machines.
+    const withBefore = readFileSync(withSettings, "utf8");
+    const preview = await domain.approvalsMigratePreview({ dshClient: new FileDshClient(withSettings) });
+    expect(preview.bindingsValid).toBe(true);
+    expect(preview.candidates).toEqual([tup("go", "legacy-go-1"), tup("zen", "legacy-zen-1")]);
+    expect(preview.candidates.some((c) => c.modelId === "resp-only" || c.modelId === "or-model")).toBe(false);
+    // preview is read-only against the real settings file and the store
+    expect(readFileSync(withSettings, "utf8")).toBe(withBefore);
+    expect(loadRegistry(paths)).toBeNull();
     expect(before.length).toBeGreaterThan(0);
   });
 });
@@ -986,9 +985,14 @@ describe("CLI end-to-end", () => {
   const repoRoot = resolve(import.meta.dir, "..");
 
   function cli(args: string[], envOverrides: Record<string, string>) {
+    // Hermeticity (F-07): an ambient DSH_WEB_URL would flip the subprocess to
+    // the HTTP DSH client and hit whatever listens there. Scrub it unless the
+    // test explicitly opts in via envOverrides.
+    const env: Record<string, string | undefined> = { ...process.env, ...envOverrides };
+    if (!("DSH_WEB_URL" in envOverrides)) delete env.DSH_WEB_URL;
     return spawnSync(process.execPath, [join(repoRoot, "src", "cli.ts"), ...args], {
       cwd: repoRoot,
-      env: { ...process.env, ...envOverrides },
+      env,
       encoding: "utf8",
       windowsHide: true,
     });
