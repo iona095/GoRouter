@@ -507,6 +507,44 @@ describe("inbound body limits (F-13)", () => {
     }
   }, { timeout: 15000 });
 
+  test("close-path trickle stall -> idle kill, no upstream call (A1 red)", async () => {
+    // Same stall shape as the held-path test above, but Connection: close
+    // routes through readCloseBody. Pre-fix this hung on the streaming
+    // promise (no idle kill): the 5s guard fired with closed=false. The fix
+    // must destroy the stalled close-declared socket at the idle window.
+    setInboundBodyIdleTimeoutForTests(300);
+    try {
+      const upstream = await startMockUpstream();
+      const router = await newRouter({
+        upstreamBase: upstream.baseUrl,
+        accounts: [{ alias: "a1", key: "k" }],
+        routes: { go: "a1" },
+      });
+      const port = router.server.port();
+      const started = Date.now();
+      const closed = await new Promise<boolean>((resolve) => {
+        const sock = net.connect(port, "127.0.0.1", () => {
+          sock.write(
+            `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789`,
+          );
+        });
+        sock.setEncoding("utf8");
+        sock.on("data", () => {});
+        sock.on("close", () => resolve(true));
+        setTimeout(() => { sock.destroy(); resolve(false); }, 5000);
+      });
+      const elapsed = Date.now() - started;
+      expect(closed).toBe(true);
+      expect(elapsed).toBeLessThan(5000);
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(upstream.requests.length).toBe(0);
+      expect(readJournalRows(router.paths.journalDb).length).toBe(0);
+      upstream.stop();
+    } finally {
+      resetInboundBodyIdleTimeoutForTests();
+    }
+  }, { timeout: 15000 });
+
   test("close-path lying declaration + flood: upstream never gets past declared", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({

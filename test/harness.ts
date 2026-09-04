@@ -107,6 +107,8 @@ export async function startTestRouter(opts: {
   upstreamZen?: string;
   upstreamHandler?: (req: Request) => Promise<Response> | Response;
   accounts?: Array<{ alias: string; key: string }>;
+  /** Override the local control credential (default LOCAL_KEY): short values pin the exact-match containment floor. */
+  localKey?: string;
   routes?: Partial<Record<Lane, string>>;
   retentionDays?: number;
   maxRecords?: number;
@@ -115,7 +117,7 @@ export async function startTestRouter(opts: {
   const paths = resolvePaths(stateDir);
   ensureStateDirs(paths);
   const secrets = memSecrets();
-  secrets.put("sec_local", LOCAL_KEY);
+  secrets.put("sec_local", opts.localKey ?? LOCAL_KEY);
   const state = createStateStore(paths, secrets);
   state.mutate((s) => {
     s.localCredentialRef = "sec_local";

@@ -239,7 +239,9 @@ export function resolveUpstreamSessionIdSafe(
   // is the sole backstop for it: check the local credential and any extra
   // secret the caller names (e.g. the account key).
   for (const secret of [localCred, ...alsoStrip]) {
-    if (secret.length >= MIN_SUBSTRING_SECRET_LENGTH && sessionId.includes(secret)) {
+    // Exact equality always replaces (even for short/test credentials);
+    // only the SUBSTRING scan is gated on the entropy floor.
+    if (sessionId === secret || (secret.length >= MIN_SUBSTRING_SECRET_LENGTH && sessionId.includes(secret))) {
       return { sessionId: randomUUID(), replaced: true };
     }
   }

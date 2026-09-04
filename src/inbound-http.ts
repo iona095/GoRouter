@@ -32,7 +32,12 @@ let bodyIdleTimeoutMs = BODY_IDLE_TIMEOUT_MS;
 /** Test hook (precedent: clearDshSyncSingleFlightForTests): shrink the body
  * idle window. Callers must restore with resetInboundBodyIdleTimeoutForTests. */
 export function setInboundBodyIdleTimeoutForTests(ms: number): void {
-  if (!Number.isFinite(ms) || ms <= 0) throw new Error(`invalid test idle timeout: ${String(ms)}`);
+  // Bounded both sides: a days-long window silently disables the stall kill
+  // the timing test pins, and a 1ms window flakes it. The hook may only
+  // shrink the production window, never extend it.
+  if (!Number.isFinite(ms) || ms < 50 || ms > BODY_IDLE_TIMEOUT_MS) {
+    throw new Error(`invalid test idle timeout: ${String(ms)}`);
+  }
   bodyIdleTimeoutMs = ms;
 }
 
@@ -266,18 +271,19 @@ function readCloseBody(req: IncomingMessage, cap: number, stopAt: number): Promi
       req.off("error", onError);
     };
     const onData = (chunk: Buffer) => {
-      chunks.push(chunk);
-      total += chunk.length;
-      // Pathological parser variance: more bytes than the whole cap with no
-      // end in sight — 413 like the declared path.
-      if (total > cap) {
+      // Check-then-push: the offending chunk must never sit in the buffer
+      // even transiently — the 'never buffers more than the cap' contract
+      // is exact, not per-chunk-minus-one.
+      if (total + chunk.length > cap) {
         cleanup();
         // Pause (do NOT destroy): the caller answers 413 on this same socket
         // and destroys after flush, so the client reads a clean response.
         req.pause();
-        reject(new RequestBodyTooLargeError(total));
+        reject(new RequestBodyTooLargeError(total + chunk.length));
         return;
       }
+      chunks.push(chunk);
+      total += chunk.length;
       // Declared length reached: resolve promptly (wins the parser-kill race
       // like the old streaming path), drain the lying tail into the void.
       if (total >= stopAt) {
@@ -291,7 +297,9 @@ function readCloseBody(req: IncomingMessage, cap: number, stopAt: number): Promi
     };
     const onEnd = () => {
       cleanup();
-      resolve(Buffer.concat(chunks));
+      // Slice like every other resolve path: framing and forwarded bytes
+      // must never disagree, even on a short body.
+      resolve(Buffer.concat(chunks).slice(0, stopAt));
     };
     const onAbort = () => {
       cleanup();
@@ -432,14 +440,19 @@ export function createInboundHttpServer(
       return;
     }
 
-    // Validate raw target
+    // Validate raw target. Pre-consumption reject like chunked above:
+    // Connection: close + gate — a pipelined POST with a declared body would
+    // otherwise leave its unread bytes for the parser to dispatch as the
+    // next request (the keep-alive desync class every sibling branch closes).
     const validation = validateRawTarget(rawTarget);
     if (!validation.valid) {
       journalReject(rawTarget, validation.reason ?? "invalid", req.method ?? "GET");
-      res.writeHead(400, { "content-type": "application/json" });
+      res.writeHead(400, { "content-type": "application/json", connection: "close" });
       res.end(JSON.stringify({
         error: { type: "GoRouterRouteError", message: `invalid request target: ${validation.reason}` },
       }));
+      terminatedSockets.add(req.socket);
+      res.once("finish", () => req.socket.destroy());
       return;
     }
 
@@ -645,9 +658,9 @@ export function createInboundHttpServer(
       activeControllers.delete(abortController);
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "application/json" });
+        // Nested like every other local body: clients parse body.error.type.
         res.end(JSON.stringify({
-          error: "GoRouterInternalError",
-          message: "internal server error",
+          error: { type: "GoRouterInternalError", message: "internal server error" },
         }));
       } else {
         // Headers already sent, just destroy the connection

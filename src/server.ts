@@ -555,7 +555,9 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     // defense: arbitrary client headers whose value contains the local credential
     // are stripped so they never reach the pinned OpenCode authority
     for (const [name, value] of [...forwardHeaders]) {
-      if (localCred.length >= MIN_SUBSTRING_SECRET_LENGTH && value.includes(localCred)) {
+      // Exact equality always strips (even for short/test credentials);
+      // only the SUBSTRING scan is gated on the entropy floor.
+      if (value === localCred || (localCred.length >= MIN_SUBSTRING_SECRET_LENGTH && value.includes(localCred))) {
         log.warn(`local credential stripped from forwarded header ${name} (lane=${lane})`);
         forwardHeaders.delete(name);
       }

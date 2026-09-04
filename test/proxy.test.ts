@@ -761,6 +761,27 @@ describe("opencode session header", () => {
     upstream.stop();
   });
 
+  test("short credential strips on exact match only (F3 floor fallback)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, localKey: "short", accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const auth = (extra?: Record<string, string>) => new Headers({ authorization: "Bearer short", ...extra });
+    // Exact match on the session id: replaced, never forwarded.
+    const r1 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-opencode-session": "short" }) });
+    expect(r1.status).toBe(200);
+    const v1 = upstream.requests[0]!.headers.get("x-opencode-session");
+    expect(v1).toBeTruthy();
+    expect(v1).not.toBe("short");
+    // Exact match on a generic forwarded header: stripped.
+    const r2 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-custom-echo": "short" }) });
+    expect(r2.status).toBe(200);
+    expect(upstream.requests[1]!.headers.get("x-custom-echo")).toBeNull();
+    // Substring below the floor still forwards (documented tradeoff: a
+    // short secret would otherwise rotate innocent ids per request).
+    const r3 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-opencode-session": "conv-short-suffix" }) });
+    expect(r3.status).toBe(200);
+    upstream.stop();
+  });
+
   test("credential-bearing correlation id not reused as session", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
