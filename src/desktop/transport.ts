@@ -9,6 +9,7 @@
  * authenticated clients.
  */
 import net, { type Server, type Socket } from 'node:net'
+import { timingSafeEqual } from 'node:crypto'
 import { log } from '../util.ts'
 import { MAX_LINE_BYTES, type ErrorCode } from './protocol.ts'
 
@@ -27,6 +28,14 @@ export interface ControlTransport {
    * supervision so a losing duplicate instance can never spawn a router child.
    */
   listening: Promise<void>
+}
+
+/** Constant-time admin-token comparison (lengths are not secret). */
+function tokensMatch(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8')
+  const bb = Buffer.from(b, 'utf8')
+  if (ab.length !== bb.length) return false
+  return timingSafeEqual(ab, bb)
 }
 
 const ERROR_CODES: Record<ErrorCode, true> = {
@@ -90,8 +99,9 @@ export function serveControlPipe(
           send({ id: 0, ok: false, error: { code: 'validation', message: 'malformed request' } })
           continue
         }
-        // EVERY message must carry the matching admin token
-        if (typeof msg.token !== 'string' || msg.token !== token) {
+        // EVERY message must carry the matching admin token, compared in
+        // constant time (F-30) so a local attacker cannot byte-guess it.
+        if (typeof msg.token !== 'string' || !tokensMatch(msg.token, token)) {
           send({
             id: typeof msg.id === 'number' ? msg.id : 0,
             ok: false,

@@ -223,6 +223,27 @@ describe('in-process control core', () => {
     core.stop()
   })
 
+  test('onSnapshot unsubscribe detaches; stop() cancels a pending debounced emission (F-28)', async () => {
+    const { core } = freshCore()
+    core.start()
+    const seen: unknown[] = []
+    const unsub = core.onSnapshot((snap) => seen.push(snap))
+    core.noteChange()
+    await new Promise((r) => setTimeout(r, 650))
+    expect(seen.length).toBe(1)
+    unsub()
+    core.noteChange()
+    await new Promise((r) => setTimeout(r, 650))
+    expect(seen.length).toBe(1) // detached: no further calls
+    // A debounced emission pending at stop() must never fire.
+    let post = 0
+    core.onSnapshot(() => post++)
+    core.noteChange()
+    core.stop(false)
+    await new Promise((r) => setTimeout(r, 650))
+    expect(post).toBe(0)
+  }, { timeout: 15000 })
+
   test('journal.recent returns seeded rows newest-first with only safe fields', () => {
     const { core, paths } = freshCore()
     core.start()

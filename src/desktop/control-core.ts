@@ -49,7 +49,7 @@ export interface ControlService {
   /** Teardown; stopRouter=false leaves a managed router child running (app.exit stopRouter:false). */
   stop(stopRouter?: boolean): void
   snapshot(): Snapshot
-  onSnapshot(cb: (snap: Snapshot) => void): void
+  onSnapshot(cb: (snap: Snapshot) => void): () => void
   router: RouterSupervisor
   /** Wire-shaped router view (state mapped to running/… per protocol). */
   routerView(): SnapshotRouter
@@ -428,11 +428,21 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       clearInterval(pollTimer)
       pollTimer = null
     }
+    // A debounced emission must never fire after teardown (F-28): it would
+    // invoke detached listeners against a closed supervisor.
+    if (emitTimer) {
+      clearTimeout(emitTimer)
+      emitTimer = null
+    }
+    emitScheduled = false
     supervisor?.close(stopRouter)
   }
 
-  function onSnapshot(cb: (snap: Snapshot) => void): void {
+  function onSnapshot(cb: (snap: Snapshot) => void): () => void {
     listeners.add(cb)
+    return () => {
+      listeners.delete(cb)
+    }
   }
 
   function setDesktop(partial: { startAtLogin?: boolean; minimizeToTray?: boolean; firstRunDone?: boolean }): DesktopSettingsFile {
