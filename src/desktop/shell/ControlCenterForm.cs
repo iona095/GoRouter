@@ -1786,13 +1786,13 @@ public sealed class ControlCenterForm : Form
         _updating = true;
         try
         {
-            _lblStateBadge.Text = RouterBadgeText(snapshot.Router);
+            _lblStateBadge.Text = UiText.Truncate(RouterBadgeText(snapshot.Router), 64);
             _lblStateBadge.ForeColor = RouterColor(snapshot.Router.State);
             _statusDot.FillColor = RouterColor(snapshot.Router.State);
             _statusDot.Invalidate();
             _lblPort.Text = $"Port {snapshot.Settings.Port}";
             _lblVersion.Text = string.IsNullOrEmpty(PresentationVersion) ? "" : $"v{PresentationVersion}";
-            _lblFooterState.Text = FooterStateText(snapshot.Router);
+            _lblFooterState.Text = UiText.Truncate(FooterStateText(snapshot.Router), 64);
             _lblFooterState.ForeColor = RouterColor(snapshot.Router.State);
             _footerDot.FillColor = RouterColor(snapshot.Router.State);
             _footerDot.Invalidate();
@@ -2311,12 +2311,12 @@ public sealed class ControlCenterForm : Form
                 var degraded = data.Degraded || _snapshot.Journal.Degraded;
                 _lblJournalDegraded.Visible = degraded;
                 _lblJournalDegraded.Text = degraded
-                    ? "Journal degraded: " + (data.Error ?? _snapshot.Journal.LastError ?? "read failure") + " — recent requests may be incomplete."
+                    ? UiText.Truncate("Journal degraded: " + (data.Error ?? _snapshot.Journal.LastError ?? "read failure") + " — recent requests may be incomplete.")
                     : "";
                 _lblJournalEmpty.Visible = data.Rows.Count == 0 && !degraded;
 
                 // The home preview renders from the same response payload.
-                RenderRecentActivity(data.Rows, degraded, degraded ? data.Error ?? _snapshot.Journal.LastError : null);
+                RenderRecentActivity(data.Rows, degraded, degraded ? UiText.Truncate(data.Error ?? _snapshot.Journal.LastError) : null);
             }
             else
             {
