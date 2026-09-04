@@ -10,12 +10,51 @@ import { MODELS_FETCH_TIMEOUT_MS, type LaneSnapshot, type ModelEntry } from "./t
 
 export type FetchFn = (url: string, init: RequestInit) => Promise<Response>;
 
+/**
+ * Ingestion bounds (F-03/M3): a degraded or hostile pinned upstream must not
+ * OOM the router or bloat the on-disk registry. Bodies are read through a
+ * capped reader (declared Content-Length checked first), entry counts and id
+ * lengths are capped during normalization. Anything past a cap rejects the
+ * whole fetch so the previous good registry stays authoritative.
+ */
+export const MAX_CATALOG_BYTES = 5 * 1024 * 1024;
+export const MAX_CATALOG_MODELS = 10_000;
+export const MAX_MODEL_ID_LENGTH = 256;
+
+async function readCappedBody(res: Response, cap: number, what: string): Promise<Uint8Array> {
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > cap) {
+    throw new Error(`${what}: body too large (declared ${declared} > ${cap} bytes)`);
+  }
+  const reader = res.body?.getReader();
+  if (!reader) return new Uint8Array(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.length;
+      if (total > cap) {
+        try { await reader.cancel(); } catch { /* best effort */ }
+        throw new Error(`${what}: body too large (over ${cap} bytes)`);
+      }
+      chunks.push(value);
+    }
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.length; }
+  return out;
+}
+
 /** Validate and normalize the upstream /models response. */
 function normalizeModelsResponse(raw: unknown, lane: Lane): ModelEntry[] {
   if (typeof raw !== "object" || raw === null) throw new Error(`lane ${lane}: response is not an object`);
   const obj = raw as Record<string, unknown>;
   const data = obj.data;
   if (!Array.isArray(data)) throw new Error(`lane ${lane}: missing or non-array data`);
+  if (data.length > MAX_CATALOG_MODELS) throw new Error(`lane ${lane}: too many models (${data.length} > ${MAX_CATALOG_MODELS})`);
   const seen = new Set<string>();
   const out: ModelEntry[] = [];
   for (let i = 0; i < data.length; i++) {
@@ -24,6 +63,7 @@ function normalizeModelsResponse(raw: unknown, lane: Lane): ModelEntry[] {
     const rec = el as Record<string, unknown>;
     const id = rec.id;
     if (typeof id !== "string" || id.trim().length === 0) throw new Error(`lane ${lane}: data[${i}] missing non-empty string id`);
+    if (id.trim().length > MAX_MODEL_ID_LENGTH) throw new Error(`lane ${lane}: data[${i}] id too long (over ${MAX_MODEL_ID_LENGTH} chars)`);
     if (seen.has(id)) throw new Error(`lane ${lane}: duplicate model id '${id}'`);
     seen.add(id);
     // preserve verbatim but guarantee id is present
@@ -73,13 +113,17 @@ export async function fetchLane(
   }
   clearTimeout(timeout);
   if (res.status !== 200) {
-    const bodySnippet = await res.text().catch(() => "");
-    throw new Error(`lane ${lane}: upstream status ${res.status} ${bodySnippet.slice(0, 300)}`);
+    // Capped read: the error body itself is untrusted and must not be buffered whole.
+    const bodyBytes = await readCappedBody(res, MAX_CATALOG_BYTES, `lane ${lane} error`).catch(() => new Uint8Array(0));
+    const bodySnippet = new TextDecoder().decode(bodyBytes.slice(0, 300));
+    throw new Error(`lane ${lane}: upstream status ${res.status} ${bodySnippet}`);
   }
   let raw: unknown;
   try {
-    raw = await res.json();
+    const bodyBytes = await readCappedBody(res, MAX_CATALOG_BYTES, `lane ${lane}`);
+    raw = JSON.parse(new TextDecoder().decode(bodyBytes));
   } catch (e) {
+    if (e instanceof Error && /body too large/.test(e.message)) throw e;
     throw new Error(`lane ${lane}: invalid JSON: ${e instanceof Error ? e.message : String(e)}`);
   }
   const models = normalizeModelsResponse(raw, lane);

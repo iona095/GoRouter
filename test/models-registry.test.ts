@@ -390,6 +390,25 @@ describe("fetcher normalization", () => {
     const noData: FetchFn = async () => Response.json({ object: "list" }, { status: 200 });
     await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: noData })).rejects.toThrow(/missing or non-array data/);
   });
+
+  test("fetchLane rejects oversized bodies, model floods and over-long ids (F-03/M3)", async () => {
+    const { MAX_CATALOG_BYTES, MAX_CATALOG_MODELS } = await import("../src/models/fetcher.ts");
+    // Lying Content-Length: rejected from headers alone, nothing buffered.
+    const lying: FetchFn = async () => new Response("tiny", { status: 200, headers: { "content-length": String(MAX_CATALOG_BYTES + 1) } });
+    await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: lying })).rejects.toThrow(/too large/);
+    // Genuinely large body: rejected by the streaming cap.
+    const huge: FetchFn = async () => new Response("x".repeat(MAX_CATALOG_BYTES + 1), { status: 200 });
+    await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: huge })).rejects.toThrow(/too large/);
+    // Model-count flood.
+    const flood: FetchFn = async () => Response.json(
+      { object: "list", data: Array.from({ length: MAX_CATALOG_MODELS + 1 }, (_, i) => ({ id: `m-${i}` })) },
+      { status: 200 },
+    );
+    await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: flood })).rejects.toThrow(/too many models/);
+    // Over-long id.
+    const longId: FetchFn = async () => Response.json({ object: "list", data: [{ id: "x".repeat(257) }] }, { status: 200 });
+    await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: longId })).rejects.toThrow(/too long/);
+  });
 });
 
 // ---------------------------------------------------------------------------
