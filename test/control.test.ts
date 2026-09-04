@@ -137,6 +137,7 @@ function freshCore(opts?: {
       schemaVersion: 1,
       startAtLogin: false,
       minimizeToTray: false,
+      theme: 'light',
       firstRunDoneAtUtc: '2026-01-01T00:00:00.000Z',
       freshStateCreatedAtUtc: null,
     })
@@ -360,7 +361,7 @@ describe('in-process control core', () => {
       retentionDays: 30,
       maxRecords: 100000,
     })
-    expect(snap.desktop).toEqual({ startAtLogin: false, minimizeToTray: false, firstRunDoneAtUtc: null })
+    expect(snap.desktop).toEqual({ startAtLogin: false, minimizeToTray: false, theme: 'light', firstRunDoneAtUtc: null })
     expect(snap.stateDir).toBe(paths.state)
     expect(snap.localCredentialConfigured).toBe(true)
     core.stop()
@@ -537,6 +538,22 @@ describe('in-process control core', () => {
     expect(snap.desktop.minimizeToTray).toBe(true)
     expect(snap.desktop.firstRunDoneAtUtc).toBeTruthy()
     await expect(handlers('desktop.set', {})).rejects.toMatchObject({ code: 'validation' })
+    core.stop()
+  })
+
+  test('desktop.set theme round-trips and rejects unknown values (6b)', async () => {
+    const { core, handlers } = freshCore()
+    core.start()
+    // absent theme reads as light (no surprise re-skin on upgrade)
+    expect(core.snapshot().desktop.theme).toBe('light')
+    await handlers('desktop.set', { theme: 'dark' })
+    expect(core.snapshot().desktop.theme).toBe('dark')
+    // partial: other fields untouched
+    expect(core.snapshot().desktop.startAtLogin).toBe(false)
+    await handlers('desktop.set', { theme: 'light' })
+    expect(core.snapshot().desktop.theme).toBe('light')
+    await expect(handlers('desktop.set', { theme: 'midnight' })).rejects.toMatchObject({ code: 'validation' })
+    await expect(handlers('desktop.set', { theme: 42 })).rejects.toMatchObject({ code: 'validation' })
     core.stop()
   })
 
@@ -957,7 +974,7 @@ describe('real pipe integration', () => {
       expect(snap.settings.port).toBe(port)
       expect(snap.accounts.map((a) => a.alias).sort()).toEqual(['alpha', 'beta'])
       expect(snap.journal.records).toBe(2)
-      expect(snap.desktop).toEqual({ startAtLogin: false, minimizeToTray: false, firstRunDoneAtUtc: null })
+      expect(snap.desktop).toEqual({ startAtLogin: false, minimizeToTray: false, theme: 'light', firstRunDoneAtUtc: null })
 
       // auto-started managed router (adopted state, firstRun false)
       await waitFor(async () => ((await client.request('snapshot')) as Snapshot).router.state === 'running', 10_000)

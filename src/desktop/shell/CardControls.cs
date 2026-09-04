@@ -10,7 +10,7 @@ namespace GoRouterDesktop;
 /// ordinary controls with BackColor = SurfaceWhite so they sit on the card
 /// without per-control borders.
 /// </summary>
-internal class CardPanel : Panel
+internal class CardPanel : Panel, IThemeAware
 {
     private int _cornerRadius = 10;
     private Color _borderColor = VisualTheme.CardBorder;
@@ -58,6 +58,13 @@ internal class CardPanel : Panel
         var bounds = new Rectangle(1, 1, Width - 2, Height - 2);
         VisualTheme.DrawRounded(e.Graphics, bounds, CornerRadius, BorderColor, 1f);
     }
+
+    public virtual void RefreshTheme()
+    {
+        BorderColor = VisualTheme.Map(BorderColor);
+        BackColor = VisualTheme.Map(BackColor);
+        Invalidate();
+    }
 }
 
 /// <summary>
@@ -67,7 +74,7 @@ internal class CardPanel : Panel
 /// </summary>
 internal class LaneCard : CardPanel
 {
-    private readonly Color _accent;
+    private Color _accent;
 
     internal LaneCard(string title, string marker, Color accent)
     {
@@ -84,6 +91,12 @@ internal class LaneCard : CardPanel
         var strip = new Rectangle(2, 2, Width - 4, 3);
         VisualTheme.FillRounded(e.Graphics, strip, 2, _accent);
     }
+
+    public override void RefreshTheme()
+    {
+        _accent = VisualTheme.Map(_accent);
+        base.RefreshTheme();
+    }
 }
 
 /// <summary>
@@ -91,7 +104,7 @@ internal class LaneCard : CardPanel
 /// hover highlight. Keyboard navigation, type-ahead, drop-down sizing and
 /// accessibility behavior of ComboBox are unchanged.
 /// </summary>
-internal class StyledSelector : ComboBox
+internal class StyledSelector : ComboBox, IThemeAware
 {
     private Color _borderColor = VisualTheme.FieldBorder;
 
@@ -123,6 +136,13 @@ internal class StyledSelector : ComboBox
         base.OnPaint(e);
         var bounds = new Rectangle(0, 0, Width - 1, Height - 1);
         VisualTheme.DrawRounded(e.Graphics, bounds, 4, _borderColor, 1f);
+    }
+
+    public void RefreshTheme()
+    {
+        BackColor = VisualTheme.Map(BackColor);
+        ForeColor = VisualTheme.Map(ForeColor);
+        BorderColor = VisualTheme.Map(BorderColor);
     }
 
     protected override void OnDrawItem(DrawItemEventArgs e)
@@ -161,7 +181,7 @@ internal class StyledSelector : ComboBox
 /// text, hover fill. Disabled state renders gray. Danger() = red outline for
 /// destructive actions; Neutral() = blue outline for regular actions.
 /// </summary>
-internal class ActionButton : Button
+internal class ActionButton : Button, IThemeAware
 {
     internal ActionButton()
     {
@@ -216,5 +236,25 @@ internal class ActionButton : Button
             using var pen = new Pen(VisualTheme.MutedText);
             pevent.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
         }
+    }
+
+    public void RefreshTheme()
+    {
+        BackColor = VisualTheme.Map(BackColor);
+        // Outlined buttons keep text == outline color (SetOutline contract);
+        // plain buttons resolve text and border independently.
+        if (ForeColor.ToArgb() == BorderColor.ToArgb())
+        {
+            SetOutline(VisualTheme.Map(BorderColor));
+        }
+        else
+        {
+            ForeColor = VisualTheme.Map(ForeColor);
+            FlatAppearance.BorderColor = VisualTheme.Map(BorderColor);
+            BorderColor = VisualTheme.Map(BorderColor);
+        }
+        FlatAppearance.MouseOverBackColor = VisualTheme.Map(FlatAppearance.MouseOverBackColor);
+        FlatAppearance.MouseDownBackColor = VisualTheme.Map(FlatAppearance.MouseDownBackColor);
+        Invalidate();
     }
 }

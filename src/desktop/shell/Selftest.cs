@@ -51,6 +51,7 @@ internal static class Selftest
 
         var state = "empty";
         string? snapshotFile = null;
+        var theme = "light";
         (int Width, int Height)? requestedSize = null;
         (int Width, int Height)? requestedClientSize = null;
         float? dpiScale = null;
@@ -67,6 +68,14 @@ internal static class Selftest
             if (args[i] == "--snapshot" && i + 1 < args.Length)
             {
                 snapshotFile = args[++i];
+                continue;
+            }
+
+            // Visual slice 6b: render the requested state under the dark
+            // theme (the form syncs Mode from snapshot.Desktop.Theme).
+            if (args[i] == "--theme" && i + 1 < args.Length)
+            {
+                theme = args[++i];
                 continue;
             }
 
@@ -137,6 +146,14 @@ internal static class Selftest
                 // Handled after form creation
                 continue;
             }
+            // --tab takes a value and is honored after form creation (it
+            // selects the visible page for capture). --theme is consumed by
+            // its own block above.
+            if (args[i] == "--tab" && i + 1 < args.Length)
+            {
+                i++;
+                continue;
+            }
             if (args[i].StartsWith("--", StringComparison.Ordinal))
             {
                 return Fail($"Unknown option: {args[i]}", args);
@@ -148,7 +165,7 @@ internal static class Selftest
         if (positional.Count != 1)
         {
             return Fail(
-                "Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--client-size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>] [--transition-test] [--nav-test]",
+                "Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--client-size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>] [--theme light|dark] [--tab <name>] [--transition-test] [--nav-test]",
                 args);
         }
 
@@ -170,7 +187,9 @@ internal static class Selftest
         }
         else
         {
-            snapshot = SyntheticSnapshot(state);
+            // --theme flows into the synthetic snapshot; custom --snapshot
+            // files carry their own Desktop.Theme.
+            snapshot = SyntheticSnapshot(state, theme);
         }
 
         Directory.CreateDirectory(outDir);
@@ -260,6 +279,13 @@ internal static class Selftest
                 }
             }
 
+            var tabFlag = args.SkipWhile(a => a != "--tab").Skip(1).FirstOrDefault();
+            if (tabFlag is not null && form is ControlCenterForm tabCcf)
+            {
+                tabCcf.SelectTabForSelftest(tabFlag);
+                Pump();
+            }
+
             if (args.Contains("--nav-test") && form is ControlCenterForm navCcf)
             {
                 return RunNavigationTest(outDir, navCcf, stub, dpiScale is not null);
@@ -323,7 +349,7 @@ internal static class Selftest
     private static int Fail(string message, string[] args)
     {
         Console.Error.WriteLine(message);
-        Console.Error.WriteLine("Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--client-size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>] [--transition-test] [--nav-test]");
+        Console.Error.WriteLine("Usage: GoRouterDesktop --selftest <outDir> [--state empty|configured|degraded|stopped|error|confirm|firstrun|longalias|switched|attached|portconflict] [--size <width>x<height>] [--client-size <width>x<height>] [--dpi-scale <factor>] [--snapshot <json-file>] [--theme light|dark] [--tab <name>] [--transition-test] [--nav-test]");
         return 1;
     }
 
@@ -344,8 +370,13 @@ internal static class Selftest
             && height > 0;
     }
 
-    private static ShellSnapshot SyntheticSnapshot(string state)
+    // Test-only --theme flag staging: SyntheticSnapshot fans out to twelve
+    // Make() call sites, so the flag rides a field instead of a parameter.
+    private static string _syntheticTheme = "light";
+
+    private static ShellSnapshot SyntheticSnapshot(string state, string theme = "light")
     {
+        _syntheticTheme = string.Equals(theme, "dark", StringComparison.OrdinalIgnoreCase) ? "dark" : "light";
         var now = DateTime.UtcNow.ToString("o");
         var alpha = new SnapshotAccount
         {
@@ -497,7 +528,13 @@ internal static class Selftest
                 RetentionDays = 30,
                 MaxRecords = 100000,
             },
-            Desktop = new SnapshotDesktop { StartAtLogin = false, MinimizeToTray = true },
+            Desktop = new SnapshotDesktop
+            {
+                StartAtLogin = false,
+                MinimizeToTray = true,
+                // Test-only --theme flag staging (see _syntheticTheme).
+                Theme = _syntheticTheme,
+            },
             StateDir = @"C:\Users\demo\AppData\Local\GoRouter",
             LocalCredentialConfigured = true,
         };

@@ -17,6 +17,8 @@ export interface DesktopSettingsFile {
   schemaVersion: number
   startAtLogin: boolean
   minimizeToTray: boolean
+  /** Shell color theme. Absent/unknown reads as light (no surprise re-skin). */
+  theme: 'light' | 'dark'
   firstRunDoneAtUtc: string | null
   /** Set when the service created the runtime state (fresh state marker);
    * adopted V1 state never has it. Drives persistent first-run arming. */
@@ -42,6 +44,7 @@ export function loadDesktopSettings(stateDir: string): DesktopSettings {
       schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
       startAtLogin: false,
       minimizeToTray: false,
+      theme: 'light',
       firstRunDoneAtUtc: null,
       freshStateCreatedAtUtc: null,
     }
@@ -65,6 +68,7 @@ export function loadDesktopSettings(stateDir: string): DesktopSettings {
       schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
       startAtLogin: typeof parsed.startAtLogin === 'boolean' ? parsed.startAtLogin : false,
       minimizeToTray: typeof parsed.minimizeToTray === 'boolean' ? parsed.minimizeToTray : false,
+      theme: parsed.theme === 'dark' ? 'dark' : 'light',
       firstRunDoneAtUtc: typeof parsed.firstRunDoneAtUtc === 'string' ? parsed.firstRunDoneAtUtc : null,
       freshStateCreatedAtUtc: typeof parsed.freshStateCreatedAtUtc === 'string' ? parsed.freshStateCreatedAtUtc : null,
     }

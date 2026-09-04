@@ -123,6 +123,7 @@ export interface SnapshotJournal {
 export interface SnapshotDesktop {
   startAtLogin: boolean
   minimizeToTray: boolean
+  theme: 'light' | 'dark'
   firstRunDoneAtUtc: string | null
 }
 

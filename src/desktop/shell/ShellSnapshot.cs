@@ -179,6 +179,9 @@ public sealed class SnapshotDesktop
     [JsonPropertyName("minimizeToTray")]
     public bool MinimizeToTray { get; init; }
 
+    [JsonPropertyName("theme")]
+    public string Theme { get; init; } = "light";
+
     [JsonPropertyName("firstRunDoneAtUtc")]
     public string? FirstRunDoneAtUtc { get; init; }
 }

@@ -382,6 +382,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       desktop: {
         startAtLogin: desk.startAtLogin,
         minimizeToTray: desk.minimizeToTray,
+        theme: desk.theme,
         firstRunDoneAtUtc: desk.firstRunDoneAtUtc,
       },
       stateDir: paths.state,
@@ -557,12 +558,13 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     }
   }
 
-  function setDesktop(partial: { startAtLogin?: boolean; minimizeToTray?: boolean; firstRunDone?: boolean }): DesktopSettingsFile {
+  function setDesktop(partial: { startAtLogin?: boolean; minimizeToTray?: boolean; firstRunDone?: boolean; theme?: 'light' | 'dark' }): DesktopSettingsFile {
     const current = desktop.read()
     const next: DesktopSettingsFile = {
       schemaVersion: 1,
       startAtLogin: partial.startAtLogin ?? current.startAtLogin,
       minimizeToTray: partial.minimizeToTray ?? current.minimizeToTray,
+      theme: partial.theme ?? current.theme,
       firstRunDoneAtUtc:
         partial.firstRunDone === true && current.firstRunDoneAtUtc === null
           ? new Date().toISOString()

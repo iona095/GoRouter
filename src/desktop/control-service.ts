@@ -249,7 +249,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
       }
 
       case 'desktop.set': {
-        const partial: { startAtLogin?: boolean; minimizeToTray?: boolean; firstRunDone?: boolean } = {}
+        const partial: { startAtLogin?: boolean; minimizeToTray?: boolean; firstRunDone?: boolean; theme?: 'light' | 'dark' } = {}
         if ('startAtLogin' in params) {
           if (typeof params.startAtLogin !== 'boolean') throw controlError('validation', 'startAtLogin must be a boolean')
           partial.startAtLogin = params.startAtLogin
@@ -263,6 +263,10 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
         if ('firstRunDone' in params) {
           if (typeof params.firstRunDone !== 'boolean') throw controlError('validation', 'firstRunDone must be a boolean')
           partial.firstRunDone = params.firstRunDone
+        }
+        if ('theme' in params) {
+          if (params.theme !== 'light' && params.theme !== 'dark') throw controlError('validation', 'theme must be light or dark')
+          partial.theme = params.theme
         }
         if (Object.keys(partial).length === 0) throw controlError('validation', 'no desktop settings provided')
         return core.setDesktop(partial)

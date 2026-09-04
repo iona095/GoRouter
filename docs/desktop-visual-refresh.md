@@ -73,11 +73,30 @@ endpoint text (state display lives in exactly one place).
   outcome/status chips; truncation rules unchanged.
 - Tray: runtime-composited status pip on the existing generated glyph
   (green / amber / gray), theme-aware.
-- Dark toggle: header sun/moon button beside lifecycle actions; manual
-  Light/Dark persisted in desktop settings (default light = current look);
-  instant apply to all surfaces incl. dialogs and wizard; follow-system
-  explicitly deferred. Owner-drawn tab strip and list headers get dark
-  branches; the wizard inherits the persisted theme.
+- Dark toggle: header text button beside lifecycle actions (names the
+  target: "Dark" while light is active; glyph-free, no font-fallback
+  risk); manual Light/Dark persisted in desktop settings `theme`
+  (default light = current look; absent/corrupt reads as light);
+  instant apply to all open surfaces incl. dialogs; follow-system
+  explicitly deferred. Owner-drawn tab strip paints from live tokens
+  (no branches needed); the non-owner-drawn journal grid re-resolves
+  cached subitem styles on toggle. Implemented in slice 6b:
+  - `VisualTheme.Mode` + per-token dark twins; `Map`/`ApplyTheme` walker
+    re-resolves stored control colors (ARGB-keyed: .NET Core named/system
+    colors do NOT equal identical ARGB literals as dictionary keys, so
+    the maps key on `ToArgb()`).
+  - Custom controls implement `IThemeAware.RefreshTheme` (cards, lane
+    status boxes, selectors, action buttons, status dots); stock labels
+    with OS-default text normalize dark-only (plain Buttons excluded —
+    their faces stay OS light gray).
+  - Toggle persists via `desktop.set { theme }` and applies instantly;
+    the snapshot tick re-syncs (startup included).
+  - The band port label was retired (toggle crowded the row; the footer
+    endpoint already carries the port).
+  - OS-owned chrome stays native by design: window frame, ListView column
+    headers, scrollbars, plain-button faces, tray/context menus.
+  - Evidence: selftest `--theme light|dark` (flows into the synthetic
+    snapshot) and `--tab <name>` (captures Journal etc.).
 - System tab: the empty Settings group is removed or filled with the real
   live settings (port, retention, start-at-login) — decided in its slice;
   no placeholder groups ship.

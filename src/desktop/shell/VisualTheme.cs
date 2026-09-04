@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Windows.Forms;
 
 namespace GoRouterDesktop;
 
@@ -9,49 +11,64 @@ namespace GoRouterDesktop;
 /// fidelity refresh): palette, typography scale and rounded-rectangle
 /// drawing helpers. Presentation-only; no control semantics live here.
 /// </summary>
+internal enum ThemeMode
+{
+    Light,
+    Dark,
+}
+
 internal static class VisualTheme
 {
+    /// <summary>Visual slice 6b: active theme. Light is the default; dark is
+    /// opt-in via the header toggle and persists in desktop settings.</summary>
+    internal static ThemeMode Mode { get; set; } = ThemeMode.Light;
+
+    private static bool Dark => Mode == ThemeMode.Dark;
+
     // ------------------------------------------------------------------
-    // Palette (target-derived: soft cool gray page, white surfaces,
-    // restrained green/blue accents)
+    // Palette: every token resolves per Mode (light values unchanged from
+    // the V1.5.1 refresh; dark twins keep hue, gain lightness for contrast).
     // ------------------------------------------------------------------
-    internal static readonly Color WindowBack = Color.FromArgb(0xF5, 0xF6, 0xF8);
-    internal static readonly Color SurfaceWhite = Color.FromArgb(0xFF, 0xFF, 0xFF);
-    internal static readonly Color CardBorder = Color.FromArgb(0xE5, 0xE7, 0xEB);
-    internal static readonly Color FieldBorder = Color.FromArgb(0xD1, 0xD5, 0xDB);
-    internal static readonly Color PrimaryText = Color.FromArgb(0x11, 0x18, 0x27);
-    internal static readonly Color SecondaryText = Color.FromArgb(0x6B, 0x72, 0x80);
-    internal static readonly Color MutedText = Color.FromArgb(0x9C, 0xA3, 0xAF);
-    internal static readonly Color AccentGo = Color.FromArgb(0x16, 0xA3, 0x4A);
-    internal static readonly Color AccentZen = Color.FromArgb(0x25, 0x63, 0xEB);
-    internal static readonly Color Healthy = Color.FromArgb(0x22, 0xC5, 0x5E);
-    internal static readonly Color Warning = Color.FromArgb(0xF5, 0x9E, 0x0B);
-    internal static readonly Color Danger = Color.FromArgb(0xDC, 0x26, 0x26);
-    internal static readonly Color ConfirmationBack = Color.FromArgb(0xEC, 0xFD, 0xF5);
-    internal static readonly Color ConfirmationBorder = Color.FromArgb(0xD1, 0xFA, 0xE5);
-    internal static readonly Color ErrorBoxBack = Color.FromArgb(0xFE, 0xF2, 0xF2);
-    internal static readonly Color ErrorBoxBorder = Color.FromArgb(0xFE, 0xCA, 0xCA);
-    internal static readonly Color ErrorBoxText = Color.FromArgb(0xB9, 0x1C, 0x1C);
-    internal static readonly Color AmberBannerBack = Color.FromArgb(0xFF, 0xFB, 0xEB);
-    internal static readonly Color AmberBannerBorder = Color.FromArgb(0xFD, 0xE6, 0x8A);
-    internal static readonly Color AmberBannerText = Color.FromArgb(0x92, 0x40, 0x0E);
-    // Visual slice 6a: every literal color site tokenized (light values
-    // identical; dark twins land with the Mode switch in 6b).
-    internal static readonly Color HoverBack = Color.FromArgb(0xF0, 0xF2, 0xF5);
-    internal static readonly Color SelectedRowBack = Color.FromArgb(0xE8, 0xEF, 0xFB);
-    internal static readonly Color MarkerGoBack = Color.FromArgb(0xE7, 0xF4, 0xEA);
-    internal static readonly Color MarkerGoText = Color.FromArgb(0x16, 0x7A, 0x3A);
-    internal static readonly Color MarkerZenBack = Color.FromArgb(0xE8, 0xEF, 0xFB);
-    internal static readonly Color MarkerZenText = Color.FromArgb(0x1D, 0x4E, 0xD8);
-    internal static readonly Color ChipAttachedBack = Color.FromArgb(0xF1, 0xF2, 0xF4);
-    internal static readonly Color IdleDot = Color.FromArgb(0x61, 0x61, 0x61);
-    internal static readonly Color FeedbackOkText = Color.FromArgb(0x1B, 0x5E, 0x20);
-    internal static readonly Color ErrorText = Color.FromArgb(0xB7, 0x1C, 0x1C);
-    internal static readonly Color WarnText = Color.FromArgb(0x8A, 0x53, 0x00);
+    internal static Color WindowBack => Dark ? C(0x1E1F24) : C(0xF5F6F8);
+    internal static Color SurfaceWhite => Dark ? C(0x26282F) : C(0xFFFFFF);
+    internal static Color CardBorder => Dark ? C(0x3A3D46) : C(0xE5E7EB);
+    internal static Color FieldBorder => Dark ? C(0x4A4E59) : C(0xD1D5DB);
+    internal static Color PrimaryText => Dark ? C(0xE8EAF0) : C(0x111827);
+    internal static Color SecondaryText => Dark ? C(0xA7ADBA) : C(0x6B7280);
+    internal static Color MutedText => Dark ? C(0x6E7482) : C(0x9CA3AF);
+    internal static Color AccentGo => Dark ? C(0x34D399) : C(0x16A34A);
+    internal static Color AccentZen => Dark ? C(0x60A5FA) : C(0x2563EB);
+    internal static Color Healthy => Dark ? C(0x4ADE80) : C(0x22C55E);
+    internal static Color Warning => Dark ? C(0xFBBF24) : C(0xF59E0B);
+    internal static Color Danger => Dark ? C(0xF87171) : C(0xDC2626);
+    internal static Color ConfirmationBack => Dark ? C(0x0C2E22) : C(0xECFDF5);
+    internal static Color ConfirmationBorder => Dark ? C(0x14532D) : C(0xD1FAE5);
+    internal static Color ErrorBoxBack => Dark ? C(0x3A1414) : C(0xFEF2F2);
+    internal static Color ErrorBoxBorder => Dark ? C(0x7F1D1D) : C(0xFECACA);
+    internal static Color ErrorBoxText => Dark ? C(0xFCA5A5) : C(0xB91C1C);
+    internal static Color AmberBannerBack => Dark ? C(0x2E2108) : C(0xFFFBEB);
+    internal static Color AmberBannerBorder => Dark ? C(0x92400E) : C(0xFDE68A);
+    internal static Color AmberBannerText => Dark ? C(0xFDE68A) : C(0x92400E);
+    internal static Color HoverBack => Dark ? C(0x31343D) : C(0xF0F2F5);
+    internal static Color SelectedRowBack => Dark ? C(0x27334D) : C(0xE8EFFB);
+    internal static Color MarkerGoBack => Dark ? C(0x0C2E22) : C(0xE7F4EA);
+    internal static Color MarkerGoText => Dark ? C(0x6EE7B7) : C(0x167A3A);
+    internal static Color MarkerZenBack => Dark ? C(0x17233F) : C(0xE8EFFB);
+    internal static Color MarkerZenText => Dark ? C(0x93C5FD) : C(0x1D4ED8);
+    internal static Color ChipAttachedBack => Dark ? C(0x2E3138) : C(0xF1F2F4);
+    internal static Color IdleDot => Dark ? C(0x9AA0AE) : C(0x616161);
+    internal static Color FeedbackOkText => Dark ? C(0x86EFAC) : C(0x1B5E20);
+    internal static Color ErrorText => Dark ? C(0xFCA5A5) : C(0xB71C1C);
+    internal static Color WarnText => Dark ? C(0xFCD34D) : C(0x8A5300);
     // Structural white (tray glyph ring): taskbar-owned background, not theme paint.
-    internal static readonly Color TrayRing = Color.White;
-    internal static readonly Color RowAltBack = Color.FromArgb(0xF9, 0xFA, 0xFB);
-    internal static readonly Color Separator = Color.FromArgb(0xE5, 0xE7, 0xEB);
+    internal static Color TrayRing => Color.White;
+    internal static Color RowAltBack => Dark ? C(0x202227) : C(0xF9FAFB);
+    internal static Color Separator => Dark ? C(0x3A3D46) : C(0xE5E7EB);
+
+    private static Color C(uint rgb)
+    {
+        return Color.FromArgb((int)(0xFF000000 | rgb));
+    }
 
     // ------------------------------------------------------------------
     // Typography (Segoe UI, native; no bundled fonts)
@@ -143,4 +160,125 @@ internal static class VisualTheme
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.DrawPath(pen, path);
     }
+
+    // ------------------------------------------------------------------
+    // Live theme application (visual slice 6b). Every control color traces
+    // to a token (6a gate), so a toggle re-resolves each control's current
+    // color toward the active Mode: light values become dark twins and vice
+    // versa; already-correct and unknown colors pass through untouched.
+    // ------------------------------------------------------------------
+    // Keyed by ARGB int, not Color: .NET Core Color equality distinguishes
+    // named/system colors from identical ARGB literals (Color.White !=
+    // Color.FromArgb(255,255,255) as dictionary keys), while controls report
+    // OS defaults (SystemColors.*) and our tokens are FromArgb-built.
+    private static Dictionary<int, Color>? _lightToDark;
+    private static Dictionary<int, Color>? _darkToLight;
+
+    private static void EnsureMaps()
+    {
+        if (_lightToDark != null)
+        {
+            return;
+        }
+        var saved = Mode;
+        try
+        {
+            var pairs = new Func<Color>[]
+            {
+                () => WindowBack, () => SurfaceWhite, () => CardBorder, () => FieldBorder,
+                () => PrimaryText, () => SecondaryText, () => MutedText,
+                () => AccentGo, () => AccentZen, () => Healthy, () => Warning, () => Danger,
+                () => ConfirmationBack, () => ConfirmationBorder,
+                () => ErrorBoxBack, () => ErrorBoxBorder, () => ErrorBoxText,
+                () => AmberBannerBack, () => AmberBannerBorder, () => AmberBannerText,
+                () => HoverBack, () => SelectedRowBack,
+                () => MarkerGoBack, () => MarkerGoText, () => MarkerZenBack, () => MarkerZenText,
+                () => ChipAttachedBack, () => IdleDot, () => FeedbackOkText,
+                () => ErrorText, () => WarnText, () => RowAltBack, () => Separator,
+            };
+            _lightToDark = new Dictionary<int, Color>();
+            _darkToLight = new Dictionary<int, Color>();
+            foreach (var token in pairs)
+            {
+                Mode = ThemeMode.Light;
+                var light = token();
+                Mode = ThemeMode.Dark;
+                var dark = token();
+                _lightToDark[light.ToArgb()] = dark;
+                _darkToLight[dark.ToArgb()] = light;
+            }
+        }
+        finally
+        {
+            Mode = saved;
+        }
+    }
+
+    /// <summary>Re-resolve one color toward the active Mode.</summary>
+    internal static Color Map(Color current)
+    {
+        EnsureMaps();
+        var key = current.ToArgb();
+        if (Mode == ThemeMode.Dark)
+        {
+            return _lightToDark!.TryGetValue(key, out var dark) ? dark : current;
+        }
+        return _darkToLight!.TryGetValue(key, out var light) ? light : current;
+    }
+
+    /// <summary>Recursively re-resolve an open surface toward the active Mode.</summary>
+    internal static void ApplyTheme(Control root)
+    {
+        EnsureMaps();
+        ApplyTo(root);
+        root.Invalidate(true);
+    }
+
+    private static void ApplyTo(Control control)
+    {
+        if (control is IThemeAware aware)
+        {
+            aware.RefreshTheme();
+        }
+        else
+        {
+            control.BackColor = Map(control.BackColor);
+            control.ForeColor = Map(control.ForeColor);
+            // Any control still carrying an OS-default text color (labels
+            // default to ControlText, edits to WindowText — neither is a
+            // token): in dark mode only, normalize onto the primary token.
+            // Plain Buttons are excluded — their faces stay OS light gray,
+            // so dark text stays readable on them in both modes. Light
+            // rendering is untouched; toggling back resolves via the pair.
+            if (Dark
+                && !(control is Button)
+                && (control.ForeColor == SystemColors.ControlText
+                    || control.ForeColor == SystemColors.WindowText))
+            {
+                control.ForeColor = PrimaryText;
+            }
+            if (control is ListView lv)
+            {
+                // Non-owner-drawn grids cache item styles at build time.
+                foreach (ListViewItem item in lv.Items)
+                {
+                    foreach (ListViewItem.ListViewSubItem sub in item.SubItems)
+                    {
+                        sub.BackColor = Map(sub.BackColor);
+                        sub.ForeColor = Map(sub.ForeColor);
+                    }
+                }
+            }
+        }
+        foreach (Control child in control.Controls)
+        {
+            ApplyTo(child);
+        }
+    }
+}
+
+/// <summary>Custom controls whose color lives in private fields repaint via this hook.</summary>
+internal interface IThemeAware
+{
+    void RefreshTheme();
 }

@@ -36,11 +36,11 @@ public sealed class ControlCenterForm : Form
     private Label _lblIdentity = null!;
     private StatusDot _statusDot = null!;
     private Label _lblStateBadge = null!;
-    private Label _lblPort = null!;
     private Label _lblVersion = null!;
     private Label _lblRouteSummary = null!;
     private Button _btnStartRouter = null!;
     private Button _btnStopRouter = null!;
+    private ActionButton _btnTheme = null!;
 
     // footer (state, local endpoint port)
     private Panel _footer = null!;
@@ -325,13 +325,14 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Status bar separator",
         };
 
-        // Stable 7-column grid: identity, dot, badge, port, version, spacer,
-        // right. The route summary lives on its own strip below (visual
-        // slice 1) so the band never overflows at any width.
+        // Stable 6-column grid: identity, dot, badge, version, spacer,
+        // right (the port lives in the footer endpoint). The route summary
+        // lives on its own strip below (visual slice 1) so the band never
+        // overflows at any width.
         var bar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 7,
+            ColumnCount = 6,
             RowCount = 1,
             Padding = new Padding(14, 8, 14, 8),
             BackColor = VisualTheme.SurfaceWhite,
@@ -339,10 +340,9 @@ public sealed class ControlCenterForm : Form
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 0 identity
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 1 dot
         bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 2 badge
-        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 3 port
-        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 4 version
-        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); // 5 spacer
-        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 6 right
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 3 version
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); // 4 spacer
+        bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); // 5 right
 
         _lblIdentity = new Label
         {
@@ -365,16 +365,8 @@ public sealed class ControlCenterForm : Form
             ForeColor = VisualTheme.SecondaryText,
             AccessibleName = "Router state",
         };
-        _lblPort = new Label
-        {
-            AutoSize = true,
-            Font = VisualTheme.MonoFont,
-            Margin = new Padding(14, 1, 0, 0),
-            Text = "",
-            ForeColor = VisualTheme.SecondaryText,
-            MaximumSize = new Size(100, 0),
-            AccessibleName = "Router port",
-        };
+        // (Port label retired in 6b: the band overflowed with the theme
+        // toggle aboard, and the footer endpoint already carries the port.)
         _lblVersion = new Label
         {
             AutoSize = true,
@@ -421,16 +413,25 @@ public sealed class ControlCenterForm : Form
         right.Controls.Add(_btnStopRouter);
         right.Controls.Add(_btnStartRouter);
 
+        // Visual slice 6b: manual theme toggle, left of Start in the
+        // RightToLeft flow. Text names the TARGET (Dark while light is
+        // active). Glyph-free by design (no font-fallback risk).
+        _btnTheme = new ActionButton { Text = "Dark" };
+        _btnTheme.Margin = new Padding(6, 0, 0, 0);
+        _btnTheme.TabIndex = 2;
+        _btnTheme.AccessibleName = "Toggle color theme";
+        right.Controls.Add(_btnTheme);
+
         _btnStartRouter.Click += OnStartRouterClicked;
         _btnStopRouter.Click += OnStopRouterClicked;
+        _btnTheme.Click += OnThemeToggleClicked;
 
         // Wide layout: all controls in one row at separate cells.
         bar.Controls.Add(_lblIdentity, 0, 0);
         bar.Controls.Add(_statusDot, 1, 0);
         bar.Controls.Add(_lblStateBadge, 2, 0);
-        bar.Controls.Add(_lblPort, 3, 0);
-        bar.Controls.Add(_lblVersion, 4, 0);
-        bar.Controls.Add(right, 6, 0);
+        bar.Controls.Add(_lblVersion, 3, 0);
+        bar.Controls.Add(right, 5, 0);
 
         // Route-summary strip (visual slice 1): full-width second row of the
         // band answering "where is traffic going". Fixed height like the bar
@@ -471,7 +472,7 @@ public sealed class ControlCenterForm : Form
             {
                 // Narrow: two rows.
                 // Row 0: identity, dot, badge
-                // Row 1: port, version (cols 3-4), right buttons (spanning rows)
+                // Row 1: version, right buttons (spanning rows)
                 // +24 for the route-summary strip below the bar.
                 band.Height = 96;
                 bar.RowCount = 2;
@@ -482,10 +483,9 @@ public sealed class ControlCenterForm : Form
                 bar.SetRow(_lblIdentity, 0); bar.SetColumn(_lblIdentity, 0);
                 bar.SetRow(_statusDot, 0);   bar.SetColumn(_statusDot, 1);
                 bar.SetRow(_lblStateBadge, 0); bar.SetColumn(_lblStateBadge, 2);
-                bar.SetRow(_lblPort, 1);     bar.SetColumn(_lblPort, 3);
-                bar.SetRow(_lblVersion, 1);  bar.SetColumn(_lblVersion, 4);
+                bar.SetRow(_lblVersion, 1);  bar.SetColumn(_lblVersion, 3);
                 bar.SetRow(right, 0);
-                bar.SetColumn(right, 6);
+                bar.SetColumn(right, 5);
                 bar.SetRowSpan(right, 2);
             }
             else if (!narrow && bar.RowCount == 2)
@@ -499,10 +499,9 @@ public sealed class ControlCenterForm : Form
                 bar.SetRow(_lblIdentity, 0); bar.SetColumn(_lblIdentity, 0);
                 bar.SetRow(_statusDot, 0);   bar.SetColumn(_statusDot, 1);
                 bar.SetRow(_lblStateBadge, 0); bar.SetColumn(_lblStateBadge, 2);
-                bar.SetRow(_lblPort, 0);     bar.SetColumn(_lblPort, 3);
-                bar.SetRow(_lblVersion, 0);  bar.SetColumn(_lblVersion, 4);
+                bar.SetRow(_lblVersion, 0);  bar.SetColumn(_lblVersion, 3);
                 bar.SetRow(right, 0);
-                bar.SetColumn(right, 6);
+                bar.SetColumn(right, 5);
                 bar.SetRowSpan(right, 1);
             }
         }
@@ -1874,11 +1873,12 @@ public sealed class ControlCenterForm : Form
         _updating = true;
         try
         {
+            // Theme first: every control below paints from the active Mode.
+            SyncThemeFromSnapshot(snapshot);
             UiText.SetIfChanged(_lblStateBadge, UiText.Truncate(RouterBadgeText(snapshot.Router), 64));
             _lblStateBadge.ForeColor = RouterColor(snapshot.Router.State);
             _statusDot.FillColor = RouterColor(snapshot.Router.State);
             _statusDot.Invalidate();
-            UiText.SetIfChanged(_lblPort, $"Port {snapshot.Settings.Port}");
             // Visual slice 1: route summary in the header band — health +
             // routing answered in the first glance. Cleared lanes show —.
             UiText.SetIfChanged(_lblRouteSummary, UiText.Truncate(
@@ -2154,6 +2154,65 @@ public sealed class ControlCenterForm : Form
     private async void OnStopRouterClicked(object? sender, EventArgs e)
     {
         await RunRouterOpAsync("router.stop", "Router stop requested.", "Router stop failed");
+    }
+
+    /// <summary>Test-only: select a tab by name for selftest evidence.</summary>
+    internal void SelectTabForSelftest(string name)
+    {
+        foreach (TabPage page in _tabs.TabPages)
+        {
+            if (string.Equals(page.Text, name, StringComparison.OrdinalIgnoreCase))
+            {
+                _tabs.SelectedTab = page;
+                return;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Color theme (visual slice 6b): manual Light/Dark, persisted via
+    // desktop.set, applied instantly to every open surface. The snapshot
+    // tick re-syncs from the persisted value (startup included).
+    // ------------------------------------------------------------------
+    private async void OnThemeToggleClicked(object? sender, EventArgs e)
+    {
+        var next = VisualTheme.Mode == ThemeMode.Dark ? ThemeMode.Light : ThemeMode.Dark;
+        ApplyThemeMode(next);
+        try
+        {
+            await _channel.CallAsync("desktop.set", new { theme = next == ThemeMode.Dark ? "dark" : "light" }, 10_000);
+        }
+        catch
+        {
+            // Persistence failed: the visual toggle stands; the next snapshot
+            // tick re-syncs the button from the persisted value.
+        }
+    }
+
+    private void ApplyThemeMode(ThemeMode mode)
+    {
+        VisualTheme.Mode = mode;
+        // This form first: the first snapshot can arrive before Show (empty
+        // OpenForms), and stored control colors must still re-resolve.
+        VisualTheme.ApplyTheme(this);
+        foreach (Form form in Application.OpenForms)
+        {
+            if (!ReferenceEquals(form, this))
+            {
+                VisualTheme.ApplyTheme(form);
+            }
+        }
+        _btnTheme.Text = mode == ThemeMode.Dark ? "Light" : "Dark";
+    }
+
+    private void SyncThemeFromSnapshot(ShellSnapshot snapshot)
+    {
+        var wantDark = string.Equals(snapshot.Desktop.Theme, "dark", StringComparison.OrdinalIgnoreCase);
+        var isDark = VisualTheme.Mode == ThemeMode.Dark;
+        if (wantDark != isDark)
+        {
+            ApplyThemeMode(wantDark ? ThemeMode.Dark : ThemeMode.Light);
+        }
     }
 
     private async Task RunRouterOpAsync(string op, string successText, string failurePrefix)
@@ -2797,7 +2856,7 @@ public sealed class ControlCenterForm : Form
     /// changes ("✓ New requests use ...; in-flight requests keep their
     /// original route."), a red box for failures. Purely presentational.
     /// </summary>
-    private sealed class LaneStatusBox : Panel
+    private sealed class LaneStatusBox : Panel, IThemeAware
     {
         private readonly Label _glyph;
         private readonly TableLayoutPanel _layout;
@@ -2951,6 +3010,21 @@ public sealed class ControlCenterForm : Form
             var bounds = new Rectangle(1, 1, Width - 2, Height - 2);
             VisualTheme.DrawRounded(e.Graphics, bounds, 6, _borderColor, 1f);
         }
+
+        public void RefreshTheme()
+        {
+            BackColor = VisualTheme.Map(BackColor);
+            _borderColor = VisualTheme.Map(_borderColor);
+            _layout.BackColor = VisualTheme.Map(_layout.BackColor);
+            _glyph.BackColor = VisualTheme.Map(_glyph.BackColor);
+            _glyph.ForeColor = VisualTheme.Map(_glyph.ForeColor);
+            foreach (var label in new[] { TitleLabel, FeedbackLabel, ErrorLabel })
+            {
+                label.BackColor = VisualTheme.Map(label.BackColor);
+                label.ForeColor = VisualTheme.Map(label.ForeColor);
+            }
+            Invalidate();
+        }
     }
 
     /// <summary>
@@ -2958,7 +3032,7 @@ public sealed class ControlCenterForm : Form
     /// badge stays authoritative; the dot only adds shape + color emphasis,
     /// never color-only meaning.
     /// </summary>
-    private sealed class StatusDot : Control
+    private sealed class StatusDot : Control, IThemeAware
     {
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
         public Color FillColor { get; set; } = VisualTheme.IdleDot;
@@ -2977,6 +3051,14 @@ public sealed class ControlCenterForm : Form
             using var pen = new Pen(VisualTheme.CardBorder, 1f);
             e.Graphics.FillEllipse(brush, 1, 1, Width - 3, Height - 3);
             e.Graphics.DrawEllipse(pen, 1, 1, Width - 3, Height - 3);
+        }
+
+        // The 1s tick re-derives FillColor from state; this only bridges the
+        // sub-second gap between a toggle and the next tick.
+        public void RefreshTheme()
+        {
+            FillColor = VisualTheme.Map(FillColor);
+            Invalidate();
         }
     }
 }
