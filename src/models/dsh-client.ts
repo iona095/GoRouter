@@ -274,17 +274,25 @@ async function writeFileAtomic(filename: string, content: string, mode: number =
  * Hybrid: revision = (hash48 << 0) ^ (mtimeBucket & 0xFFFF) — formally
  * content-hash + mtime hybrid that cannot collide on same-mtime edits.
  */
-function fileContentRevision(text: string, mtimeMs?: number): number {
+/**
+ * Content-hash + mtime hybrid revision (M1): 48-bit SHA-256 prefix folded with
+ * a 16-bit mtime bucket. Pure integer arithmetic — no bitwise ops, which would
+ * silently truncate the value to 32 bits (the old `(n ^ bucket) >>> 0` did
+ * exactly that, contradicting the 48-bit claim). Result is always an integer
+ * below 2^48, so it round-trips exactly through JSON and SQLite.
+ *
+ * Note: values differ from pre-fix revisions (which were 32-bit). Revisions
+ * are recomputed live from file content on every read, so the only upgrade
+ * effect is a single conservative mismatch, never a false match.
+ */
+export function fileContentRevision(text: string, mtimeMs?: number): number {
   const h = createHash("sha256").update(text, "utf8").digest();
-  // 48 bits = safe integer (< 2^53)
   let n = 0;
   for (let i = 0; i < 6; i++) n = n * 256 + h[i]!;
   if (typeof mtimeMs === "number" && Number.isFinite(mtimeMs)) {
-    const bucket = Math.floor(mtimeMs / 1000) & 0xffff;
-    // fold mtime bucket into low bits without exceeding 2^53
-    n = (n ^ bucket) >>> 0;
-    // re-expand: use hash48 as high entropy, mtime bucket as low salt — still safe integer because we stay within 48 bits
-    // keep n as integer < 2^53 by not shifting beyond 48
+    const bucket = Math.floor(mtimeMs / 1000) % 65536;
+    // Clear the low 16 bits arithmetically, then add the bucket.
+    n = n - (n % 65536) + bucket;
   }
   return n;
 }

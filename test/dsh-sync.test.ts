@@ -1502,4 +1502,24 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
       hung.stop();
     }
   });
+
+  test("fileContentRevision: 48-bit content+mtime hybrid, no 32-bit truncation (M1)", async () => {
+    const { fileContentRevision } = await import("../src/models/dsh-client.ts");
+    const a = fileContentRevision("hello", 1_700_000_000_000);
+    expect(Number.isInteger(a)).toBe(true);
+    expect(a).toBeGreaterThanOrEqual(0);
+    expect(a).toBeLessThan(2 ** 48);
+    // deterministic on identical inputs
+    expect(fileContentRevision("hello", 1_700_000_000_000)).toBe(a);
+    // content sensitivity at the same mtime (the point of the hash hybrid)
+    expect(fileContentRevision("hello!", 1_700_000_000_000)).not.toBe(a);
+    // mtime sensitivity across a second boundary
+    expect(fileContentRevision("hello", 1_700_000_001_000)).not.toBe(a);
+    // the 48-bit range is actually used (pre-fix code capped at 2^32)
+    let seenLarge = false;
+    for (let i = 0; i < 50; i++) {
+      if (fileContentRevision("text-" + i, undefined) >= 2 ** 32) { seenLarge = true; break; }
+    }
+    expect(seenLarge).toBe(true);
+  });
 });
