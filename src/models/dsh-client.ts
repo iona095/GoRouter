@@ -426,13 +426,19 @@ export class FileDshClient implements DshClient {
 
 // --- HttpDshClient (Typert via DSH host) ---
 
+/** Loopback DSH RPC timeout: a hung host must fail fast, never stall the
+ * reconcile single-flight indefinitely (M6). Generous for localhost. */
+export const DSH_HTTP_TIMEOUT_MS = 10_000;
+
 export class HttpDshClient implements DshClient {
   private baseUrl: string;
   private hostHeader: string;
-  constructor(webUrl: string) {
+  private timeoutMs: number;
+  constructor(webUrl: string, opts: { timeoutMs?: number } = {}) {
     const u = validateLoopbackUrl(webUrl);
     this.baseUrl = u.origin;
     this.hostHeader = u.host;
+    this.timeoutMs = opts.timeoutMs ?? DSH_HTTP_TIMEOUT_MS;
   }
 
   private async rpc(endpoint: string, payload: unknown): Promise<unknown> {
@@ -445,6 +451,7 @@ export class HttpDshClient implements DshClient {
       },
       body,
       redirect: "manual",
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (res.status === 403) throw new DshUnavailableError(`dsh host forbidden (loopback fence): ${res.status}`);
     if (res.status !== 200) throw new DshUnavailableError(`dsh host unexpected status ${res.status}`);

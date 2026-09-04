@@ -1488,4 +1488,18 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
       else process.env.DSH_WEB_URL = previous;
     }
   });
+
+  test("HttpDshClient rpc times out against a hung host instead of stalling (M6)", async () => {
+    const { HttpDshClient, DshUnavailableError } = await import("../src/models/dsh-client.ts");
+    const hung = await startMockUpstream(() => new Promise<Response>(() => {}), { idleTimeout: 0 });
+    try {
+      const client = new HttpDshClient(hung.baseUrl, { timeoutMs: 300 });
+      const started = Date.now();
+      await expect(client.read()).rejects.toThrow(DshUnavailableError);
+      // ~300ms client timeout, not an indefinite stall
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      hung.stop();
+    }
+  });
 });
