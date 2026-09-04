@@ -774,7 +774,10 @@ public sealed partial class FirstRunFlow : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        DisarmCredentialClipboardTimer();
+        // Use the disarmed value: after a navigation the timer/retry is the
+        // sole owner of the credential (_shownCredential was nulled), so a
+        // close inside the retry window must attempt the take-back itself.
+        var disarmedFor = DisarmCredentialClipboardTimer();
 
         // Clear every TextBox recursively and unconditionally: the one-time
         // credential box lives nested in a layout panel, so a flat control
@@ -782,10 +785,13 @@ public sealed partial class FirstRunFlow : Form
         // it is read-only, not masked.
         ClearTextBoxes(_content.Controls);
 
-        // Take the credential back from the clipboard if it is still ours.
+        // Take the credential back from the clipboard if it is still ours —
+        // via the shown value or the disarmed timer/retry value (navigation
+        // may have nulled the former while arming the latter).
+        var takeBack = _shownCredential ?? disarmedFor;
         try
         {
-            if (_shownCredential is not null && Clipboard.ContainsText() && Clipboard.GetText() == _shownCredential)
+            if (takeBack is not null && Clipboard.ContainsText() && Clipboard.GetText() == takeBack)
             {
                 Clipboard.Clear();
             }
