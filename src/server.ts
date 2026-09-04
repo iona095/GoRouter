@@ -396,6 +396,21 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     }
   }
 
+  /** Slice B.1: fixed upstream authority, parsed once per settings value. */
+  interface UpstreamParts {
+    origin: string;
+    basePathname: string;
+  }
+  interface UpstreamSlot {
+    raw: string;
+    parts: UpstreamParts;
+  }
+  const upstreamParseCache: { go: UpstreamSlot | null; zen: UpstreamSlot | null } = { go: null, zen: null };
+  function parseUpstreamBase(rawBase: string): UpstreamParts {
+    const u = new URL(rawBase);
+    return { origin: u.origin, basePathname: u.pathname };
+  }
+
   async function dispatch(lane: Lane, suffix: string, search: string, req: Request): Promise<Response> {
     // --- local client auth -------------------------------------------------
     let localCred: string;
@@ -512,9 +527,25 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         upstreamRequestIds,
       });
     };
-    const base = lane === "go" ? deps.state.read().settings.upstreamGo : deps.state.read().settings.upstreamZen;
+    // Slice B.1: the fixed upstream authority parses once per settings value,
+    // not once per request (single state.read + amortized-zero URL parses).
+    // Per-lane lazy: a garbage URL on the idle lane must not break the live
+    // lane, exactly as before (only the requested lane parses).
+    const st = deps.state.read();
+    const rawBase = lane === "go" ? st.settings.upstreamGo : st.settings.upstreamZen;
+    const slot = lane === "go" ? upstreamParseCache.go : upstreamParseCache.zen;
+    const cached = slot !== null && slot.raw === rawBase ? slot : null;
+    const parts = cached !== null
+      ? cached.parts
+      : parseUpstreamBase(rawBase);
+    if (cached === null) {
+      const fresh = { raw: rawBase, parts };
+      if (lane === "go") upstreamParseCache.go = fresh;
+      else upstreamParseCache.zen = fresh;
+    }
+    const base = rawBase;
     const upstreamUrl = new URL(base);
-    const basePathname = new URL(base).pathname;
+    const basePathname = parts.basePathname;
     // join base + suffix without a leading-slash artifact (root base "/" joined
     // with "/models" must stay "/models", never "//models")
     upstreamUrl.pathname = basePathname.endsWith("/")
@@ -539,7 +570,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       if (stripped) log.warn(`local credential stripped from query params (lane=${lane})`);
       upstreamUrl.search = searchParams.toString() ? "?" + searchParams.toString() : "";
     }
-    if (upstreamUrl.origin !== new URL(base).origin) {
+    if (upstreamUrl.origin !== parts.origin) {
       log.error(`refusing upstream URL outside fixed authority (lane=${lane})`);
       completeEntry("local_error", 500, [], monotonicMs() - started);
       const res = localError(500, "GoRouterRouteError", "upstream authority mismatch");

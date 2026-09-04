@@ -1,7 +1,7 @@
 /**
  * Slice A — registry I/O (atomic persistence, validation, TTL/cooldown).
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson, log } from "../util.ts";
 import { MODELS_SCHEMA_VERSION, MODELS_TTL_MS, MODELS_COOLDOWN_MS, type RegistryFile, type LaneSnapshot, type ModelEntry } from "./types.ts";
@@ -78,9 +78,34 @@ export function loadRegistry(paths: Paths): RegistryFile | null {
   return r.file;
 }
 
+// Slice B.2: mtime/size memo, same pattern as state.ts — /models is the only
+// uncached file read on a request path. Keyed by path (tests use many state
+// dirs); absent files are never cached so creation is observed immediately.
+let peekCache: { path: string; mtimeMs: number; size: number; result: { exists: boolean; corrupt: boolean; file: RegistryFile | null } } | null = null;
+
 export function peekRegistry(paths: Paths): { exists: boolean; corrupt: boolean; file: RegistryFile | null } {
   const p = registryPathFor(paths);
-  if (!existsSync(p)) return { exists: false, corrupt: false, file: null };
+  if (!existsSync(p)) {
+    if (peekCache?.path === p) peekCache = null;
+    return { exists: false, corrupt: false, file: null };
+  }
+  let sig: { mtimeMs: number; size: number };
+  try {
+    const st = statSync(p);
+    sig = { mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    if (peekCache?.path === p) peekCache = null;
+    return { exists: false, corrupt: false, file: null };
+  }
+  if (peekCache && peekCache.path === p && peekCache.mtimeMs === sig.mtimeMs && peekCache.size === sig.size) {
+    return peekCache.result;
+  }
+  const result = peekRegistryUncached(p);
+  peekCache = { path: p, mtimeMs: sig.mtimeMs, size: sig.size, result };
+  return result;
+}
+
+function peekRegistryUncached(p: string): { exists: boolean; corrupt: boolean; file: RegistryFile | null } {
   let raw: string;
   try {
     raw = readFileSync(p, "utf8");
