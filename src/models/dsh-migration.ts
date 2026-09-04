@@ -165,21 +165,23 @@ export async function applyMigration(
     !snap2 || !bindings2?.valid ||
     migrationProposalId(deriveCandidates(snap2), bindings2, snap2.revision) !== proposalId;
   if (!drifted) return applied;
-  const rolledBack = await withFileLockAsync(lockPathFor(paths.state), 30_000, () => {
+  const rollback = await withFileLockAsync(lockPathFor(paths.state), 30_000, (): "rolled-back" | "absent" | "kept-foreign" => {
     const live = loadApprovalStore(paths);
-    if (live.state !== "initialized") return true; // nothing to undo
+    if (live.state !== "initialized") return "absent"; // concurrently deleted: nothing to undo
     const ours = new Set(candidates.map((t) => `${t.lane}/${t.dshProviderId}/${t.apiProtocol}/${t.modelId}`));
     const same =
       live.store.approvals.length === ours.size &&
       live.store.approvals.every((r) => r.source === "legacy-migration" && ours.has(`${r.lane}/${r.dshProviderId}/${r.apiProtocol}/${r.modelId}`));
-    if (!same) return false; // someone else wrote: keep, report, never delete
+    if (!same) return "kept-foreign"; // someone else wrote: keep, report, never delete
     tryUnlink(approvalStorePathFor(paths));
-    return true;
+    return "rolled-back";
   });
   return {
     ok: false as const,
-    reason: rolledBack
+    reason: rollback === "rolled-back"
       ? "DSH settings drifted between validation and apply; the migration was rolled back — re-run migration preview and ratify the new proposal"
-      : "DSH settings drifted between validation and apply and the store no longer matches this migration; refusing to roll back foreign writes — inspect the approval store manually",
+      : rollback === "absent"
+        ? "DSH settings drifted between validation and apply, and the approval store was concurrently removed — re-run migration preview and ratify the new proposal"
+        : "DSH settings drifted between validation and apply and the store no longer matches this migration; refusing to roll back foreign writes — inspect the approval store manually",
   };
 }

@@ -163,7 +163,37 @@ public sealed partial class FirstRunFlow : Form
                     Clipboard.Clear();
                 }
             }
-            catch { /* contention: best effort only */ }
+            catch
+            {
+                // Contention at the exact navigation click: the disarm killed
+                // the timer that would have retried, so arm ONE short retry
+                // retaining the value (same bounded shape as the clipboard
+                // timer's own retry — no loop). A second contention strands
+                // only until manual overwrite; vanishingly narrow, accepted.
+                var outstanding = clipboardArmedFor;
+                var retry = new System.Windows.Forms.Timer { Interval = 5_000 };
+                retry.Tick += (_, _) =>
+                {
+                    if (ReferenceEquals(_credentialClipboardTimer, retry))
+                    {
+                        _credentialClipboardTimer = null;
+                        _clipboardArmedFor = null;
+                    }
+                    retry.Stop();
+                    retry.Dispose();
+                    try
+                    {
+                        if (Clipboard.ContainsText() && Clipboard.GetText() == outstanding)
+                        {
+                            Clipboard.Clear();
+                        }
+                    }
+                    catch { /* best effort only */ }
+                };
+                _credentialClipboardTimer = retry;
+                _clipboardArmedFor = outstanding;
+                retry.Start();
+            }
         }
         ClearTextBoxes(_content.Controls);
         DisposeControls(_content.Controls);
@@ -344,6 +374,14 @@ public sealed partial class FirstRunFlow : Form
         }
         catch (Exception ex)
         {
+            // Same stale-continuation guard as the success path: a fetch that
+            // rejects after navigation must not touch disposed controls from
+            // this async void (ObjectDisposedException would escape unhandled
+            // and crash the form over a transient pipe error).
+            if (_step != 2 || status.IsDisposed || btnCopy.IsDisposed)
+            {
+                return;
+            }
             status.Text = "Could not fetch the local credential: " + ex.Message;
             btnCopy.Enabled = false;
         }

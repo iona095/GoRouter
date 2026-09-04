@@ -168,6 +168,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       if (corrupt) {
         log.warn(`state.json absent; clearing corrupt flag (evidence${lastQuarantine ? ` preserved at ${lastQuarantine}` : " was never quarantined — operator reset"}); repair via setup allowed`);
         corrupt = false;
+        lastQuarantine = null;
         cache = null;
       }
       return defaultState();

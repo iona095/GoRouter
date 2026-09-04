@@ -286,13 +286,12 @@ public sealed class ControlClient : IControlChannel
         }
         finally
         {
-            lock (_gate)
-            {
-                if (!ReferenceEquals(_connectCts, linked))
-                {
-                    linked.Dispose();
-                }
-            }
+            // Always dispose: a superseded loop frees its CTS here, and a
+            // loop that ran to completion frees the still-current one (safe:
+            // every _connectCts.Cancel site tolerates ObjectDisposedException,
+            // IsCancellationRequested reads are disposal-safe, and no live
+            // loop awaits on an exited loop's token).
+            try { linked.Dispose(); } catch { /* already disposed */ }
         }
     }
 
