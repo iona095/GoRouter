@@ -77,7 +77,7 @@ public sealed class ControlCenterForm : Form
     private TabPage _tabHome = null!;
     private ListView _lvActivity = null!;
     private Label _lblActivityDegraded = null!;
-    private Label _lblActivityEmpty = null!;
+    private Control _lblActivityEmpty = null!;
     private Button _btnActivityViewAll = null!;
 
     // accounts tab
@@ -93,7 +93,7 @@ public sealed class ControlCenterForm : Form
     private ListView _lvJournal = null!;
     private Label _lblJournalStats = null!;
     private Label _lblJournalDegraded = null!;
-    private Label _lblJournalEmpty = null!;
+    private Control _lblJournalEmpty = null!;
     private Button _btnJournalRefresh = null!;
     private Button _btnJournalBack = null!;
 
@@ -924,20 +924,13 @@ public sealed class ControlCenterForm : Form
         _lvActivity.Columns.Add("Family / Method", 200);
         _lvActivity.Columns.Add("Outcome", 96);
         _lvActivity.Columns.Add("Status", 70);
-        StyleDetailsListView(_lvActivity, alternateRows: true);
+        StyleDetailsListView(_lvActivity, alternateRows: true, outcomeColumn: 4, statusColumn: 5);
         listHost.Controls.Add(_lvActivity);
 
-        // Designed empty state: a centered note covers the (empty) list area.
-        _lblActivityEmpty = new Label
-        {
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleCenter,
-            Font = VisualTheme.BodyFont,
-            BackColor = VisualTheme.SurfaceWhite,
-            ForeColor = VisualTheme.SecondaryText,
-            Text = "No requests yet — recent activity will appear here once the router serves traffic.",
-            AccessibleName = "Empty recent activity note",
-        };
+        // Designed empty state: illustration + note covers the (empty) list.
+        _lblActivityEmpty = MakeEmptyState(
+            "No requests yet — recent activity will appear here once the router serves traffic.",
+            "Empty recent activity note");
         listHost.Controls.Add(_lblActivityEmpty);
 
         layout.Controls.Add(header, 0, 0);
@@ -948,11 +941,64 @@ public sealed class ControlCenterForm : Form
     }
 
     /// <summary>
+    /// Visual slice 4: illustrated empty state — a large muted glyph over the
+    /// one-line copy, vertically centered. Same Dock/Visible contract as the
+    /// label it replaces.
+    /// </summary>
+    private static Control MakeEmptyState(string copy, string accessibleName)
+    {
+        var panel = new Panel
+        {
+            Dock = DockStyle.Fill,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = accessibleName,
+        };
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            BackColor = VisualTheme.SurfaceWhite,
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 50f));
+        var glyph = new Label
+        {
+            Text = "○",
+            AutoSize = true,
+            Anchor = AnchorStyles.None,
+            Font = VisualTheme.EmptyGlyphFont,
+            ForeColor = VisualTheme.MutedText,
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Empty state illustration",
+        };
+        var label = new Label
+        {
+            Text = copy,
+            AutoSize = true,
+            Anchor = AnchorStyles.None,
+            MaximumSize = new Size(460, 0),
+            Font = VisualTheme.BodyFont,
+            ForeColor = VisualTheme.SecondaryText,
+            BackColor = VisualTheme.SurfaceWhite,
+            TextAlign = ContentAlignment.MiddleCenter,
+            AccessibleName = accessibleName + " text",
+        };
+        layout.Controls.Add(glyph, 0, 1);
+        layout.Controls.Add(label, 0, 2);
+        panel.Controls.Add(layout);
+        return panel;
+    }
+
+    /// <summary>
     /// Modern details-list styling: no gridlines, white/alternate row
     /// tinting, small fonts, painted column headers. Accessibility is
     /// unaffected — it is still a standard ListView.
     /// </summary>
-    private static void StyleDetailsListView(ListView lv, bool alternateRows)
+    private static void StyleDetailsListView(ListView lv, bool alternateRows, int outcomeColumn = -1, int statusColumn = -1)
     {
         lv.BackColor = VisualTheme.SurfaceWhite;
         lv.ForeColor = VisualTheme.PrimaryText;
@@ -986,12 +1032,24 @@ public sealed class ControlCenterForm : Form
                 : e.ItemIndex % 2 == 1 ? VisualTheme.RowAltBack : VisualTheme.SurfaceWhite;
             using var brush = new SolidBrush(back);
             e.Graphics.FillRectangle(brush, e.Bounds);
+            // Visual slice 4: outcome/status chips as colored text (selected
+            // rows keep dark-on-tint readability — all three state colors
+            // contrast on both row backgrounds).
+            var fore = VisualTheme.PrimaryText;
+            if (e.ColumnIndex == outcomeColumn)
+            {
+                fore = VisualTheme.OutcomeColor(e.SubItem?.Text);
+            }
+            else if (e.ColumnIndex == statusColumn)
+            {
+                fore = VisualTheme.StatusColor(e.SubItem?.Text);
+            }
             TextRenderer.DrawText(
                 e.Graphics,
                 e.SubItem?.Text ?? string.Empty,
                 VisualTheme.SmallFont,
                 e.Bounds,
-                VisualTheme.PrimaryText,
+                fore,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
         };
     }
@@ -1248,13 +1306,9 @@ public sealed class ControlCenterForm : Form
         _lvJournal.Columns.Add("Duration ms", 80);
         _lvJournal.Columns.Add("Request ID", 210);
 
-        _lblJournalEmpty = new Label
-        {
-            AutoSize = true,
-            Dock = DockStyle.Fill,
-            AccessibleName = "Empty journal note",
-            Text = "No requests recorded yet.",
-        };
+        _lblJournalEmpty = MakeEmptyState(
+            "No requests recorded yet — send traffic to the local endpoint and it will appear here.",
+            "Empty journal note");
 
         layout.Controls.Add(header, 0, 0);
         layout.Controls.Add(_lblJournalDegraded, 0, 1);
@@ -2395,6 +2449,11 @@ public sealed class ControlCenterForm : Form
         item.SubItems.Add(row.HttpStatus?.ToString() ?? "—");
         item.SubItems.Add(row.DurationMs + " ms");
         item.SubItems.Add(row.RouterRequestId);
+        // Visual slice 4: the journal grid is not owner-drawn, so outcome /
+        // status color rides per-subitem fore colors (index 5/6 above).
+        item.UseItemStyleForSubItems = false;
+        item.SubItems[5].ForeColor = VisualTheme.OutcomeColor(row.TerminalOutcome);
+        item.SubItems[6].ForeColor = VisualTheme.StatusColor(row.HttpStatus?.ToString());
         return item;
     }
 

@@ -1,3 +1,4 @@
+using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 
@@ -52,6 +53,29 @@ internal static class VisualTheme
     // with Windows; no bundled fonts.
     internal static Font CaptionFont { get; } = new Font("Segoe UI", 8.5f, FontStyle.Regular);
     internal static Font MonoFont { get; } = new Font("Consolas", 9.5f, FontStyle.Regular);
+    internal static Font EmptyGlyphFont { get; } = new Font("Segoe UI", 22f, FontStyle.Regular);
+
+    /// <summary>Visual slice 4: outcome text color (ok = healthy, anything else = danger).</summary>
+    internal static Color OutcomeColor(string? outcome)
+    {
+        return string.Equals(outcome, "ok", StringComparison.OrdinalIgnoreCase) ? Healthy : Danger;
+    }
+
+    /// <summary>Visual slice 4: HTTP status color (2xx healthy, 4xx warning, else danger; unstarted stays neutral).</summary>
+    internal static Color StatusColor(string? status)
+    {
+        if (!string.IsNullOrEmpty(status) && char.IsDigit(status[0]))
+        {
+            return status[0] switch
+            {
+                '2' => Healthy,
+                '4' => Warning,
+                _ => Danger,
+            };
+        }
+
+        return PrimaryText;
+    }
 
     /// <summary>State color for truthful status rendering.</summary>
     internal static Color StateColor(string state)
