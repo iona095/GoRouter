@@ -687,6 +687,7 @@ describe("deterministic ordering", () => {
     const origRead = (mem as unknown as DshClient).read.bind(mem);
     (mem as { read(): Promise<DshSnapshot> }).read = async () => {
       const snap = await origRead();
+      if (!snap) throw new Error("test setup: DSH snapshot must exist for the reorder probe");
       return { ...snap, go: reorder(snap.go) as ModelEntry[], zen: reorder(snap.zen) as ModelEntry[] };
     };
     const st = await reconcileDshCatalog(reg, mem as unknown as DshClient, { approvalStore: initStore(["go-a"], ["zen-x"]) });

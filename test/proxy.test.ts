@@ -714,6 +714,53 @@ describe("opencode session header", () => {
     upstream.stop();
   });
 
+  test("multi-value / off-grammar inbound session falls back, never forwards garbage", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    // ByteString-safe offenders go through fetch (duplicate headers arrive
+    // comma-joined; spaces/semicolons are outside the shared id grammar).
+    for (const bad of ["a, b", "has space", "semi;colon"]) {
+      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": bad }) });
+      expect(res.status).toBe(200);
+    }
+    // Non-ByteString values (control chars, emoji) cannot be sent via fetch
+    // at all — raw socket. Either layer (parser reject or grammar fallback)
+    // must hold: nothing off-grammar may reach upstream.
+    const { connect } = await import("node:net");
+    const port = router.server.port();
+    for (const raw of ["tab\there", "emoji-\u{1F600}"]) {
+      await new Promise<void>((resolve) => {
+        const sock = connect(port, "127.0.0.1", () => {
+          sock.write(
+            `GET /go/v1/models HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nx-opencode-session: ${raw}\r\nConnection: close\r\n\r\n`,
+            "latin1",
+          );
+        });
+        sock.on("data", () => {});
+        sock.on("close", () => resolve());
+        sock.on("error", () => resolve());
+        setTimeout(() => { sock.destroy(); resolve(); }, 5000);
+      });
+    }
+    for (const req of upstream.requests) {
+      const v = req.headers.get("x-opencode-session")!;
+      expect(v).toMatch(/^[A-Za-z0-9._~-]+$/);
+    }
+    upstream.stop();
+  });
+
+  test("reused correlation id is byte-identical upstream across requests", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    for (let i = 0; i < 3; i++) {
+      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-gorouter-correlation-id": "stable-conv-9" }) });
+      expect(res.status).toBe(200);
+    }
+    const seen = upstream.requests.map((r) => r.headers.get("x-opencode-session"));
+    expect(seen).toEqual(["stable-conv-9", "stable-conv-9", "stable-conv-9"]);
+    upstream.stop();
+  });
+
   test("credential-bearing correlation id not reused as session", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });

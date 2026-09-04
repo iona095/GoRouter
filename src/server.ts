@@ -26,6 +26,7 @@ import {
   validateCorrelationId,
   OPENCODE_SESSION_HEADER,
   resolveUpstreamSessionIdSafe,
+  MIN_SUBSTRING_SECRET_LENGTH,
   extractUpstreamRequestIds,
   classifyEndpointFamily,
   monotonicMs,
@@ -413,8 +414,10 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         selectedAccountAliasSnapshot: null,
         method: req.method,
         endpointFamily: classifyEndpointFamily(suffix),
-        terminalOutcome: "ok",
-        httpStatus: null,
+        // Begin in the terminal state: a crash between begin/complete must
+        // never leave a phantom "ok" row (journalReject does the same).
+        terminalOutcome: "local_error",
+        httpStatus: 401,
         upstreamRequestIds: [],
         model: null,
         clientCorrelationId: validateCorrelationId(req.headers.get("x-gorouter-correlation-id")) ?? null,
@@ -552,7 +555,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     // defense: arbitrary client headers whose value contains the local credential
     // are stripped so they never reach the pinned OpenCode authority
     for (const [name, value] of [...forwardHeaders]) {
-      if (value.includes(localCred)) {
+      if (localCred.length >= MIN_SUBSTRING_SECRET_LENGTH && value.includes(localCred)) {
         log.warn(`local credential stripped from forwarded header ${name} (lane=${lane})`);
         forwardHeaders.delete(name);
       }
@@ -566,6 +569,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       req.headers.get(OPENCODE_SESSION_HEADER),
       correlationId,
       localCred,
+      [snapshot.secret],
     );
     if (replaced) {
       log.warn(`local credential stripped from forwarded header ${OPENCODE_SESSION_HEADER} (lane=${lane})`);

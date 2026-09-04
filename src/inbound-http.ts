@@ -13,7 +13,6 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { Readable } from "node:stream";
 import type { Socket } from "node:net";
 
 /**
@@ -33,6 +32,7 @@ let bodyIdleTimeoutMs = BODY_IDLE_TIMEOUT_MS;
 /** Test hook (precedent: clearDshSyncSingleFlightForTests): shrink the body
  * idle window. Callers must restore with resetInboundBodyIdleTimeoutForTests. */
 export function setInboundBodyIdleTimeoutForTests(ms: number): void {
+  if (!Number.isFinite(ms) || ms <= 0) throw new Error(`invalid test idle timeout: ${String(ms)}`);
   bodyIdleTimeoutMs = ms;
 }
 
@@ -207,6 +207,108 @@ export function validateRawTarget(rawTarget: string): { valid: boolean; reason?:
  * disconnect still fires 'aborted' and socket 'close' (proven). The buffered
  * bytes become the web Request body.
  */
+/**
+ * Content-Length wire grammar: a bare non-negative integer token. Anything
+ * else present (text, sign, embedded whitespace, multi-value array) is a
+ * framing lie — callers fail the request closed rather than guessing.
+ */
+export function isWellFormedContentLength(raw: unknown): boolean {
+  return typeof raw === "string" && /^\d+$/.test(raw);
+}
+
+/** Thrown when a request body exceeds MAX_REQUEST_BODY_BYTES (413, not a crash). */
+export class RequestBodyTooLargeError extends Error {
+  readonly bytes: number;
+  constructor(bytes: number) {
+    super(`request body too large (${bytes} > ${MAX_REQUEST_BODY_BYTES} bytes)`);
+    this.name = "RequestBodyTooLargeError";
+    this.bytes = bytes;
+  }
+}
+
+/**
+ * Consume a Connection:close request body with a byte cap (A1). Close-
+ * declared requests cannot use the held (pause-at-length) path: a post-body
+ * FIN surfaces as 'aborted' on the still-open stream and Bun destroys the
+ * socket pre-response. But streaming the raw message bypassed the size cap.
+ * Measured framing behavior (Bun 1.3.14 node:http): the stream yields exactly
+ * the declared bytes and 'end' for exact bodies, but ALSO emits flood bytes
+ * past a lying declaration — while the parser independently kills the socket
+ * on the pipeline garbage. So: resolve at the declaration (prompt dispatch
+ * wins the race exactly like the old streaming path), slice exact, drain the
+ * tail into the void, and keep a hard cap + idle kill as backstops. Upstream
+ * never receives more than the declared length; the router never buffers more
+ * than the cap.
+ */
+function readCloseBody(req: IncomingMessage, cap: number, stopAt: number): Promise<Uint8Array> {
+  return new Promise<Uint8Array>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const idle = { current: null as unknown as ReturnType<typeof setTimeout> | null };
+    const armIdle = () => {
+      const t = setTimeout(() => {
+        if (settled) return;
+        cleanup();
+        req.destroy();
+        reject(new Error("client body stalled past the idle window"));
+      }, bodyIdleTimeoutMs);
+      (t as unknown as { unref?: () => void }).unref?.();
+      return t;
+    };
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      if (idle.current) clearTimeout(idle.current);
+      req.off("data", onData);
+      req.off("end", onEnd);
+      req.off("aborted", onAbort);
+      req.off("error", onError);
+    };
+    const onData = (chunk: Buffer) => {
+      chunks.push(chunk);
+      total += chunk.length;
+      // Pathological parser variance: more bytes than the whole cap with no
+      // end in sight — 413 like the declared path.
+      if (total > cap) {
+        cleanup();
+        // Pause (do NOT destroy): the caller answers 413 on this same socket
+        // and destroys after flush, so the client reads a clean response.
+        req.pause();
+        reject(new RequestBodyTooLargeError(total));
+        return;
+      }
+      // Declared length reached: resolve promptly (wins the parser-kill race
+      // like the old streaming path), drain the lying tail into the void.
+      if (total >= stopAt) {
+        cleanup();
+        req.resume();
+        resolve(Buffer.concat(chunks).slice(0, stopAt));
+        return;
+      }
+      if (idle.current) clearTimeout(idle.current);
+      idle.current = armIdle();
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("client aborted mid-request body"));
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    idle.current = armIdle();
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("aborted", onAbort);
+    req.once("error", onError);
+  });
+}
+
 function readHeldBody(
   req: IncomingMessage,
   contentLength: number,
@@ -225,11 +327,16 @@ function readHeldBody(
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
-    const armIdle = () => setTimeout(() => {
-      if (settled) return;
-      cleanup();
-      reject(new Error("client body stalled past the idle window"));
-    }, bodyIdleTimeoutMs);
+    // unref: a held body must never pin the event loop / delay process exit.
+    const armIdle = () => {
+      const t = setTimeout(() => {
+        if (settled) return;
+        cleanup();
+        reject(new Error("client body stalled past the idle window"));
+      }, bodyIdleTimeoutMs);
+      (t as unknown as { unref?: () => void }).unref?.();
+      return t;
+    };
     let idleTimer = armIdle();
     const cleanup = () => {
       if (settled) return;
@@ -246,7 +353,9 @@ function readHeldBody(
       if (total >= contentLength) {
         req.pause(); // hold 'end' so client-abort detection stays alive
         cleanup();
-        resolve(Buffer.concat(chunks));
+        // Slice to the declaration: a sender must not smuggle an extra TCP
+        // chunk past the framed length into the forwarded body.
+        resolve(Buffer.concat(chunks).slice(0, contentLength));
         return;
       }
       clearTimeout(idleTimer);
@@ -289,8 +398,7 @@ export function createInboundHttpServer(
     if (terminatedSockets.has(req.socket)) {
       res.writeHead(400, { "content-type": "application/json", connection: "close" });
       res.end(JSON.stringify({
-        error: "GoRouterRouteError",
-        message: "connection terminated after rejected framing",
+        error: { type: "GoRouterRouteError", message: "connection terminated after rejected framing" },
       }));
       return;
     }
@@ -314,8 +422,7 @@ export function createInboundHttpServer(
         connection: "close",
       });
       res.end(JSON.stringify({
-        error: "GoRouterRouteError",
-        message: "chunked request bodies are not supported",
+        error: { type: "GoRouterRouteError", message: "chunked request bodies are not supported" },
       }));
       // Terminate the connection: mark it so any pipelined request already
       // buffered by the parser is refused at entry, and close once the 400 is
@@ -331,8 +438,7 @@ export function createInboundHttpServer(
       journalReject(rawTarget, validation.reason ?? "invalid", req.method ?? "GET");
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({
-        error: "GoRouterRouteError",
-        message: `invalid request target: ${validation.reason}`,
+        error: { type: "GoRouterRouteError", message: `invalid request target: ${validation.reason}` },
       }));
       return;
     }
@@ -399,14 +505,33 @@ export function createInboundHttpServer(
     // content-length on GET/HEAD is rejected pre-dispatch rather than
     // forwarded (the declared body cannot be represented).
     let body: Uint8Array | ReadableStream<Uint8Array> | null = null;
+    // A present-but-malformed Content-Length (non-numeric, negative, or a
+    // multi-value array) leaves unread framing on a reusable connection — a
+    // keep-alive desync primitive. Fail closed like every other framing
+    // reject: 400 + close + gate, never dispatch with body=null. (Bun's
+    // parser rejects most malformed values before this runs; this is the
+    // backstop for runtimes/array forms that pass through.)
+    const rawContentLength: unknown = req.headers["content-length"];
+    if (rawContentLength !== undefined) {
+      if (!isWellFormedContentLength(rawContentLength)) {
+        journalReject(rawTarget, "invalid content-length header", method);
+        res.writeHead(400, { "content-type": "application/json", connection: "close" });
+        res.end(JSON.stringify({
+          error: { type: "GoRouterRouteError", message: "invalid content-length header" },
+        }));
+        activeControllers.delete(abortController);
+        terminatedSockets.add(req.socket);
+        res.once("finish", () => req.socket.destroy());
+        return;
+      }
+    }
     const contentLength = Number(req.headers["content-length"] ?? NaN);
     if (Number.isFinite(contentLength) && contentLength > 0) {
       if (method === "GET" || method === "HEAD") {
         journalReject(rawTarget, "GET/HEAD request bodies are not supported", method);
         res.writeHead(400, { "content-type": "application/json", connection: "close" });
         res.end(JSON.stringify({
-          error: "GoRouterRouteError",
-          message: "GET/HEAD request bodies are not supported",
+          error: { type: "GoRouterRouteError", message: "GET/HEAD request bodies are not supported" },
         }));
         activeControllers.delete(abortController);
         terminatedSockets.add(req.socket);
@@ -417,8 +542,7 @@ export function createInboundHttpServer(
         journalReject(rawTarget, `request body too large (${contentLength} > ${MAX_REQUEST_BODY_BYTES})`, method, 413);
         res.writeHead(413, { "content-type": "application/json", connection: "close" });
         res.end(JSON.stringify({
-          error: "GoRouterRouteError",
-          message: `request body too large (limit ${MAX_REQUEST_BODY_BYTES} bytes)`,
+          error: { type: "GoRouterRouteError", message: `request body too large (limit ${MAX_REQUEST_BODY_BYTES} bytes)` },
         }));
         activeControllers.delete(abortController);
         terminatedSockets.add(req.socket);
@@ -426,7 +550,27 @@ export function createInboundHttpServer(
         return;
       }
       if (/close/i.test(req.headers["connection"] ?? "")) {
-        body = Readable.toWeb(req) as ReadableStream<Uint8Array>;
+        // Capped consume: streaming the close-path raw bypassed the size
+        // bound. Over-cap raises RequestBodyTooLargeError and answers 413
+        // like the declared path.
+        try {
+          body = await readCloseBody(req, MAX_REQUEST_BODY_BYTES, contentLength);
+        } catch (e) {
+          activeControllers.delete(abortController);
+          if (e instanceof RequestBodyTooLargeError) {
+            journalReject(rawTarget, e.message, method, 413);
+            res.writeHead(413, { "content-type": "application/json", connection: "close" });
+            res.end(JSON.stringify({
+              error: { type: "GoRouterRouteError", message: `request body too large (limit ${MAX_REQUEST_BODY_BYTES} bytes)` },
+            }));
+            terminatedSockets.add(req.socket);
+            res.once("finish", () => req.socket.destroy());
+            return;
+          }
+          // client aborted mid-body (or body read error); connection is gone
+          res.destroy();
+          return;
+        }
       } else {
         try {
           body = await readHeldBody(req, contentLength, abortController.signal);

@@ -16,7 +16,7 @@ import {
   type TestRouter,
 } from "./harness.ts";
 import { wrapBodyWithFinalize } from "../src/server.ts";
-import { MAX_REQUEST_BODY_BYTES, setInboundBodyIdleTimeoutForTests, resetInboundBodyIdleTimeoutForTests } from "../src/inbound-http.ts";
+import { MAX_REQUEST_BODY_BYTES, isWellFormedContentLength, setInboundBodyIdleTimeoutForTests, resetInboundBodyIdleTimeoutForTests } from "../src/inbound-http.ts";
 
 const routers: TestRouter[] = [];
 afterEach(() => {
@@ -495,6 +495,9 @@ describe("inbound body limits (F-13)", () => {
       // hold the connection indefinitely.
       expect(closed).toBe(true);
       expect(elapsed).toBeLessThan(5000);
+      // Lower bound: the kill comes from the ~300ms idle window, not an
+      // instant destroy (which would indicate the read path regressed).
+      expect(elapsed).toBeGreaterThanOrEqual(200);
       expect(upstream.requests.length).toBe(0);
       // Destroyed pre-dispatch: no handler ran, so no journal row exists.
       expect(readJournalRows(router.paths.journalDb).length).toBe(0);
@@ -502,5 +505,98 @@ describe("inbound body limits (F-13)", () => {
     } finally {
       resetInboundBodyIdleTimeoutForTests();
     }
+  }, { timeout: 15000 });
+
+  test("close-path lying declaration + flood: upstream never gets past declared", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({
+      upstreamBase: upstream.baseUrl,
+      accounts: [{ alias: "a1", key: "k" }],
+      routes: { go: "a1" },
+    });
+    const port = router.server.port();
+    // Declare 100 bytes, get the response, THEN flood 1MB on the same
+    // closing connection. Measured framing behavior (Bun 1.3.14): the parser
+    // frames the message at the declaration — a simultaneous flood races the
+    // parser kill against dispatch (physics, untestable), so the phases are
+    // sequenced here to pin the deterministic property: the close-path
+    // consume resolves at the declaration, upstream never receives a byte
+    // past it, and the post-response flood cannot corrupt the server.
+    const flood = "x".repeat(1024 * 1024);
+    const first = await new Promise<string>((resolve) => {
+      const sock = net.connect(port, "127.0.0.1", () => {
+        // Phase 1: exact declared body. The server must resolve at the
+        // declaration and dispatch — response arrives before any flood.
+        sock.write(
+          `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n` + "x".repeat(100),
+        );
+      });
+      let acc = "";
+      let flooded = false;
+      sock.setEncoding("utf8");
+      sock.on("data", (d) => {
+        acc += d;
+        // Phase 2: once the full response head has arrived, flood the
+        // (closing) connection with pipeline garbage. Whatever the parser
+        // does with it, the dispatched request and server health are fixed.
+        if (!flooded && acc.includes("\r\n\r\n") && !sock.destroyed) {
+          flooded = true;
+          try { sock.write(flood); } catch { /* already torn down */ }
+        }
+      });
+      sock.on("close", () => resolve(acc));
+      sock.on("error", () => resolve(acc));
+      setTimeout(() => { sock.destroy(); resolve(acc); }, 15000);
+    });
+    expect(first).toMatch(/^HTTP\/1\.1 200/);
+    expect(upstream.requests.length).toBe(1);
+    expect(upstream.requests[0]!.bodyText.length).toBeLessThanOrEqual(100);
+    // And the server is still healthy afterwards.
+    const health = await fetch(`${router.baseUrl}/healthz`);
+    expect(health.status).toBe(200);
+    upstream.stop();
+  }, { timeout: 30000 });
+
+  test("content-length grammar seam rejects framing lies", () => {
+    expect(isWellFormedContentLength("100")).toBe(true);
+    expect(isWellFormedContentLength("0")).toBe(true);
+    expect(isWellFormedContentLength("many")).toBe(false);
+    expect(isWellFormedContentLength("-5")).toBe(false);
+    expect(isWellFormedContentLength("10 ")).toBe(false);
+    expect(isWellFormedContentLength("")).toBe(false);
+    expect(isWellFormedContentLength(["5", "6"])).toBe(false);
+    expect(isWellFormedContentLength(undefined)).toBe(false);
+  });
+
+  test("malformed content-length -> 400 + close, never dispatched", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({
+      upstreamBase: upstream.baseUrl,
+      accounts: [{ alias: "a1", key: "k" }],
+      routes: { go: "a1" },
+    });
+    const port = router.server.port();
+    const raw = await new Promise<string>((resolve) => {
+      const sock = net.connect(port, "127.0.0.1", () => {
+        // Present-but-unparseable framing: must fail closed, not dispatch
+        // with body=null and leave the bytes for the next pipelined request.
+        sock.write(
+          `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: many\r\nConnection: close\r\n\r\n0123456789`,
+        );
+      });
+      let acc = "";
+      sock.setEncoding("utf8");
+      sock.on("data", (d) => { acc += d; });
+      sock.on("close", () => resolve(acc));
+      sock.on("error", () => resolve(acc));
+      setTimeout(() => { sock.destroy(); resolve(acc); }, 10000);
+    });
+    // Layered behavior: Bun's parser rejects the malformed framing before
+    // the handler runs (bare 400, connection closed). What matters is the
+    // fail-closed property: never dispatched, nothing forwarded upstream.
+    expect(raw).toMatch(/^HTTP\/1\.1 400/);
+    expect(raw).toMatch(/close/i);
+    expect(upstream.requests.length).toBe(0);
+    upstream.stop();
   }, { timeout: 15000 });
 });

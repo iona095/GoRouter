@@ -166,12 +166,19 @@ export const OPENCODE_SESSION_HEADER = "x-opencode-session";
  * router correlation id is reused; otherwise a fresh UUID is generated
  * so upstream never sees a missing header.
  */
+/**
+ * Shared id grammar for session and correlation ids forwarded upstream:
+ * URL-safe token chars only (no spaces, commas, quotes — multi-value headers
+ * arrive comma-joined and must fall back, never forward as one garbage id).
+ */
+export const FORWARDED_ID_PATTERN = /^[A-Za-z0-9._~-]+$/;
+
 export function resolveUpstreamSessionId(
   inbound: string | null | undefined,
   correlationId: string | undefined,
 ): string {
   const v = (inbound ?? "").trim();
-  if (v.length > 0 && v.length <= 256 && /^[\x20-\x7E]+$/.test(v)) return v;
+  if (v.length > 0 && v.length <= 256 && FORWARDED_ID_PATTERN.test(v)) return v;
   if (correlationId) return correlationId;
   return randomUUID();
 }
@@ -185,14 +192,28 @@ export function resolveUpstreamSessionId(
  * upstream never-missing guarantee still holds. The caller logs the
  * replacement the same way it logs other credential strips.
  */
+/**
+ * Minimum secret length for substring containment checks: below this only
+ * exact-token equality applies. A short/low-entropy credential would otherwise
+ * substring-match innocent ids (rotating them to fresh UUIDs per request and
+ * spamming the strip log). Router-generated credentials are 43 chars.
+ */
+export const MIN_SUBSTRING_SECRET_LENGTH = 16;
+
 export function resolveUpstreamSessionIdSafe(
   inbound: string | null | undefined,
   correlationId: string | undefined,
   localCred: string,
+  alsoStrip: string[] = [],
 ): { sessionId: string; replaced: boolean } {
   const sessionId = resolveUpstreamSessionId(inbound, correlationId);
-  if (localCred.length > 0 && sessionId.includes(localCred)) {
-    return { sessionId: randomUUID(), replaced: true };
+  // The session header is set AFTER the generic strip loop, so this wrapper
+  // is the sole backstop for it: check the local credential and any extra
+  // secret the caller names (e.g. the account key).
+  for (const secret of [localCred, ...alsoStrip]) {
+    if (secret.length >= MIN_SUBSTRING_SECRET_LENGTH && sessionId.includes(secret)) {
+      return { sessionId: randomUUID(), replaced: true };
+    }
   }
   return { sessionId, replaced: false };
 }

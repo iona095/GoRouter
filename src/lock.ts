@@ -46,8 +46,11 @@ export function isLockHolderAlive(lockPath: string): boolean {
       try {
         process.kill(parsed.pid, 0);
         return true;
-      } catch {
-        return false;
+      } catch (e) {
+        // ESRCH: no such process (dead). Any other error — notably EPERM for
+        // a live but unpermissioned pid (e.g. an elevated sibling) — must read
+        // as ALIVE, or a 10s-old lock is reclaimed from a live holder.
+        return (e as { code?: string }).code !== "ESRCH";
       }
     }
   } catch {
