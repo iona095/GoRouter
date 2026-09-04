@@ -115,7 +115,9 @@ public sealed class TrayIcon : IDisposable
         UpdateIcon(snapshot.Router.State);
         var go = snapshot.Routes.Go.Alias ?? "—";
         var zen = snapshot.Routes.Zen.Alias ?? "—";
-        _notify.Text = $"GoRouter — GO: {go} · ZEN: {zen} · {snapshot.Router.State}";
+        // NotifyIcon.Text is OS-capped (~127 chars, throws beyond): bound the
+        // composition since aliases are attacker-influenced (F-14).
+        _notify.Text = UiText.Truncate($"GoRouter — GO: {go} · ZEN: {zen} · {snapshot.Router.State}", 100);
     }
 
     public void ShowBalloon(string text, bool isError)
@@ -126,7 +128,7 @@ public sealed class TrayIcon : IDisposable
         }
 
         _notify.BalloonTipTitle = "GoRouter";
-        _notify.BalloonTipText = text;
+        _notify.BalloonTipText = UiText.Truncate(text);
         _notify.BalloonTipIcon = isError ? ToolTipIcon.Error : ToolTipIcon.Info;
         _notify.ShowBalloonTip(4000);
     }

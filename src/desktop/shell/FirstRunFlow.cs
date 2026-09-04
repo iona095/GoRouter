@@ -382,7 +382,7 @@ public sealed partial class FirstRunFlow : Form
             {
                 return;
             }
-            status.Text = "Could not fetch the local credential: " + ex.Message;
+            status.Text = UiText.Truncate("Could not fetch the local credential: " + ex.Message);
             btnCopy.Enabled = false;
         }
     }
@@ -487,7 +487,7 @@ public sealed partial class FirstRunFlow : Form
             catch (Exception ex)
             {
                 status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
-                status.Text = "Add account failed: " + ex.Message;
+                status.Text = UiText.Truncate("Add account failed: " + ex.Message);
             }
             finally
             {
@@ -596,7 +596,8 @@ public sealed partial class FirstRunFlow : Form
         }
         catch (Exception ex)
         {
-            return ex.Message;
+            // Returned to a status label upstream: cap before crossing.
+            return UiText.Truncate(ex.Message);
         }
     }
 
@@ -670,7 +671,7 @@ public sealed partial class FirstRunFlow : Form
         }
         catch (Exception ex)
         {
-            _lblError.Text = "Could not finish setup: " + ex.Message;
+            _lblError.Text = UiText.Truncate("Could not finish setup: " + ex.Message);
             _lblError.Visible = true;
             _btnNext.Enabled = true;
             return;

@@ -656,7 +656,9 @@ public sealed class ControlClient : IControlChannel
             _state = state;
             if (error is not null)
             {
-                LastError = error;
+                // LastError surfaces in the UI banner: cap it here so every
+                // SetState caller (reconnect, auth, startup) is covered.
+                LastError = UiText.Truncate(error);
             }
         }
 

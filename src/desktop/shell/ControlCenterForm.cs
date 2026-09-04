@@ -1682,7 +1682,7 @@ public sealed class ControlCenterForm : Form
         _banner.Visible = true;
         _banner.BackColor = VisualTheme.ErrorBoxBack;
         _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
-        _lblBannerText.Text = message;
+        _lblBannerText.Text = UiText.Truncate(message);
         _btnRetry.Visible = true;
         _btnResetCredential.Visible = true;
         _btnResumeOnboarding.Visible = false;
@@ -1754,7 +1754,7 @@ public sealed class ControlCenterForm : Form
         }
 
         _lblDiagnosticsFeedback.ForeColor = isError ? Color.FromArgb(0xB7, 0x1C, 0x1C) : Color.FromArgb(0x1B, 0x5E, 0x20);
-        _lblDiagnosticsFeedback.Text = message;
+        _lblDiagnosticsFeedback.Text = UiText.Truncate(message);
     }
 
     // ------------------------------------------------------------------
@@ -2033,7 +2033,7 @@ public sealed class ControlCenterForm : Form
             feedback.Text = "";
             var route = lane == "go" ? _snapshot.Routes.Go : _snapshot.Routes.Zen;
             FillLaneCombo(cmb, route, feedback, error);
-            error.Text = ex.Message;
+            error.Text = UiText.Truncate(ex.Message);
             UpdateLaneStatusBoxes(_snapshot.Routes.Go, _snapshot.Routes.Zen);
         }
         finally
@@ -2102,7 +2102,7 @@ public sealed class ControlCenterForm : Form
     private void SetAccountsFeedback(string message, bool isError)
     {
         _lblAccountsStatus.ForeColor = isError ? Color.FromArgb(0xB7, 0x1C, 0x1C) : Color.FromArgb(0x1B, 0x5E, 0x20);
-        _lblAccountsStatus.Text = message;
+        _lblAccountsStatus.Text = UiText.Truncate(message);
     }
 
     private async void OnAddAccountClicked(object? sender, EventArgs e)
@@ -2329,9 +2329,9 @@ public sealed class ControlCenterForm : Form
         catch (Exception ex)
         {
             _lblJournalDegraded.Visible = true;
-            _lblJournalDegraded.Text = "Journal unavailable: " + ex.Message;
+            _lblJournalDegraded.Text = UiText.Truncate("Journal unavailable: " + ex.Message);
             _lblJournalEmpty.Visible = false;
-            RenderRecentActivity(Array.Empty<JournalRow>(), true, ex.Message);
+            RenderRecentActivity(Array.Empty<JournalRow>(), true, UiText.Truncate(ex.Message));
         }
         finally
         {
@@ -2442,7 +2442,7 @@ public sealed class ControlCenterForm : Form
         }
         catch (Exception ex)
         {
-            _lblPortError.Text = "Port change failed: " + ex.Message;
+            _lblPortError.Text = UiText.Truncate("Port change failed: " + ex.Message);
         }
     }
 
@@ -2481,7 +2481,7 @@ public sealed class ControlCenterForm : Form
         }
         catch (Exception ex)
         {
-            _lblRetentionError.Text = "Journal settings failed: " + ex.Message;
+            _lblRetentionError.Text = UiText.Truncate("Journal settings failed: " + ex.Message);
         }
     }
 
@@ -2496,7 +2496,7 @@ public sealed class ControlCenterForm : Form
         catch (Exception ex)
         {
             _lblDiagnosticsFeedback.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
-            _lblDiagnosticsFeedback.Text = "Copy failed: " + ex.Message;
+            _lblDiagnosticsFeedback.Text = UiText.Truncate("Copy failed: " + ex.Message);
         }
 
         await Task.CompletedTask;
