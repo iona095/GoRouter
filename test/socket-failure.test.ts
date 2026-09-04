@@ -16,6 +16,7 @@ import {
   type TestRouter,
 } from "./harness.ts";
 import { wrapBodyWithFinalize } from "../src/server.ts";
+import { MAX_REQUEST_BODY_BYTES, setInboundBodyIdleTimeoutForTests, resetInboundBodyIdleTimeoutForTests } from "../src/inbound-http.ts";
 
 const routers: TestRouter[] = [];
 afterEach(() => {
@@ -431,4 +432,75 @@ describe("wrapBodyWithFinalize in-process unit (F-05)", () => {
     // source cancel() in Bun.
     expect(upstreamPulls).toBe(1);
   });
+});
+
+describe("inbound body limits (F-13)", () => {
+  test("oversized declared body -> 413 before buffering, journaled, no upstream call", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({
+      upstreamBase: upstream.baseUrl,
+      accounts: [{ alias: "a1", key: "k" }],
+      routes: { go: "a1" },
+    });
+    const port = router.server.port();
+    const raw = await new Promise<string>((resolve) => {
+      const sock = net.connect(port, "127.0.0.1", () => {
+        // Declare a body past the cap but send none: the rejection must come
+        // from headers alone, before a single body byte is buffered.
+        sock.write(
+          `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: ${MAX_REQUEST_BODY_BYTES + 1}\r\nConnection: close\r\n\r\n`,
+        );
+      });
+      let acc = "";
+      sock.setEncoding("utf8");
+      sock.on("data", (d) => { acc += d; });
+      sock.on("close", () => resolve(acc));
+      setTimeout(() => { sock.destroy(); resolve(acc); }, 5000);
+    });
+    expect(raw).toMatch(/^HTTP\/1\.1 413/);
+    expect(raw).toMatch(/too large/);
+    expect(upstream.requests.length).toBe(0);
+    const rows = await waitForRows(router.paths.journalDb, 1);
+    expect(rows[rows.length - 1]!.http_status).toBe(413);
+    expect(rows[rows.length - 1]!.terminal_outcome).toBe("local_error");
+    upstream.stop();
+  }, { timeout: 15000 });
+
+  test("trickling body past the idle window -> connection destroyed, no upstream call", async () => {
+    setInboundBodyIdleTimeoutForTests(300);
+    try {
+      const upstream = await startMockUpstream();
+      const router = await newRouter({
+        upstreamBase: upstream.baseUrl,
+        accounts: [{ alias: "a1", key: "k" }],
+        routes: { go: "a1" },
+      });
+      const port = router.server.port();
+      const started = Date.now();
+      const closed = await new Promise<boolean>((resolve) => {
+        const sock = net.connect(port, "127.0.0.1", () => {
+          // Keep-alive (no Connection: close) so the held-body path is used:
+          // declare 100 bytes, deliver 10, then stall forever.
+          sock.write(
+            `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n0123456789`,
+          );
+        });
+        sock.setEncoding("utf8");
+        sock.on("data", () => {});
+        sock.on("close", () => resolve(true));
+        setTimeout(() => { sock.destroy(); resolve(false); }, 5000);
+      });
+      const elapsed = Date.now() - started;
+      // Server-side idle kill (~300ms), not the 5s guard: the stall cannot
+      // hold the connection indefinitely.
+      expect(closed).toBe(true);
+      expect(elapsed).toBeLessThan(5000);
+      expect(upstream.requests.length).toBe(0);
+      // Destroyed pre-dispatch: no handler ran, so no journal row exists.
+      expect(readJournalRows(router.paths.journalDb).length).toBe(0);
+      upstream.stop();
+    } finally {
+      resetInboundBodyIdleTimeoutForTests();
+    }
+  }, { timeout: 15000 });
 });

@@ -17,6 +17,30 @@ import { Readable } from "node:stream";
 import type { Socket } from "node:net";
 
 /**
+ * Maximum admitted request-body size (declared or streamed). 25 MiB is
+ * generous for legitimate vision/base64 chat payloads while bounding router
+ * RAM against giant Content-Length POSTs from any local process. Larger
+ * bodies are rejected 413 before a single byte is buffered.
+ */
+export const MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024;
+
+/** Idle window while reading a held request body: no bytes for this long
+ * means a trickling sender holding the connection — give up and destroy it.
+ * (server.requestTimeout stays 0 to preserve long-gap response streaming.) */
+const BODY_IDLE_TIMEOUT_MS = 30_000;
+let bodyIdleTimeoutMs = BODY_IDLE_TIMEOUT_MS;
+
+/** Test hook (precedent: clearDshSyncSingleFlightForTests): shrink the body
+ * idle window. Callers must restore with resetInboundBodyIdleTimeoutForTests. */
+export function setInboundBodyIdleTimeoutForTests(ms: number): void {
+  bodyIdleTimeoutMs = ms;
+}
+
+export function resetInboundBodyIdleTimeoutForTests(): void {
+  bodyIdleTimeoutMs = BODY_IDLE_TIMEOUT_MS;
+}
+
+/**
  * Dot-segment core: a segment is traversal-capable when its semicolon-
  * parameter core is `.` or `..` (e.g. `..;foo`, `.;bar`). Matrix-parameter-
  * aware backends may strip parameters and then resolve the dot segment, so
@@ -201,9 +225,16 @@ function readHeldBody(
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
+    const armIdle = () => setTimeout(() => {
+      if (settled) return;
+      cleanup();
+      reject(new Error("client body stalled past the idle window"));
+    }, bodyIdleTimeoutMs);
+    let idleTimer = armIdle();
     const cleanup = () => {
       if (settled) return;
       settled = true;
+      clearTimeout(idleTimer);
       req.off("data", onData);
       req.off("aborted", onAbort);
       req.off("error", onError);
@@ -216,7 +247,10 @@ function readHeldBody(
         req.pause(); // hold 'end' so client-abort detection stays alive
         cleanup();
         resolve(Buffer.concat(chunks));
+        return;
       }
+      clearTimeout(idleTimer);
+      idleTimer = armIdle();
     };
     const onAbort = () => {
       cleanup();
@@ -245,7 +279,7 @@ function readHeldBody(
 export function createInboundHttpServer(
   handler: (req: Request) => Promise<Response>,
   opts: { hostname: string; port: number },
-  journalReject: (rawTarget: string, reason: string, method?: string) => void,
+  journalReject: (rawTarget: string, reason: string, method?: string, httpStatus?: number) => void,
 ): Server {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const rawTarget = req.url ?? "/";
@@ -373,6 +407,18 @@ export function createInboundHttpServer(
         res.end(JSON.stringify({
           error: "GoRouterRouteError",
           message: "GET/HEAD request bodies are not supported",
+        }));
+        activeControllers.delete(abortController);
+        terminatedSockets.add(req.socket);
+        res.once("finish", () => req.socket.destroy());
+        return;
+      }
+      if (contentLength > MAX_REQUEST_BODY_BYTES) {
+        journalReject(rawTarget, `request body too large (${contentLength} > ${MAX_REQUEST_BODY_BYTES})`, method, 413);
+        res.writeHead(413, { "content-type": "application/json", connection: "close" });
+        res.end(JSON.stringify({
+          error: "GoRouterRouteError",
+          message: `request body too large (limit ${MAX_REQUEST_BODY_BYTES} bytes)`,
         }));
         activeControllers.delete(abortController);
         terminatedSockets.add(req.socket);

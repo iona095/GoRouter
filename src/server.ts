@@ -731,7 +731,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       const host = st.settings.host;
       const port = st.settings.port;
 
-      const journalReject = (rawTarget: string, reason: string, method?: string) => {
+      const journalReject = (rawTarget: string, reason: string, method?: string, httpStatus?: number) => {
         // Create a synthetic journal entry for the rejected request
         const correlationId = null; // no correlation id for rejected requests
         const rejectedPath = rawTarget.split("?")[0] ?? "";
@@ -750,7 +750,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
           method: method ?? 'GET', // default; actual method unknown
           endpointFamily: 'unknown',
           terminalOutcome: 'local_error',
-          httpStatus: 400,
+          httpStatus: httpStatus ?? 400,
           upstreamRequestIds: [],
           model: null,
           clientCorrelationId: correlationId,
@@ -759,7 +759,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
           completedAtUtc: utcNow(),
           durationMs: 0,
           terminalOutcome: 'local_error',
-          httpStatus: 400,
+          httpStatus: httpStatus ?? 400,
           upstreamRequestIds: [],
         });
         // The raw target may carry a known credential (the local key, a lane
