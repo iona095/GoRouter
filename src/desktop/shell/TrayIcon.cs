@@ -183,7 +183,7 @@ public sealed class TrayIcon : IDisposable
             g.SmoothingMode = SmoothingMode.AntiAlias;
             using var fill = new SolidBrush(color);
             g.FillEllipse(fill, 3, 3, 26, 26);
-            using var ring = new Pen(Color.White, 3f);
+            using var ring = new Pen(VisualTheme.TrayRing, 3f);
             g.DrawEllipse(ring, 7, 7, 18, 18);
         }
 

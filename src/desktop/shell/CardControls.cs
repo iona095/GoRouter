@@ -133,7 +133,7 @@ internal class StyledSelector : ComboBox
         }
 
         var hover = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
-        var back = hover ? Color.FromArgb(0xF0, 0xF2, 0xF5) : VisualTheme.SurfaceWhite;
+        var back = hover ? VisualTheme.HoverBack : VisualTheme.SurfaceWhite;
         using (var brush = new SolidBrush(back))
         {
             e.Graphics.FillRectangle(brush, e.Bounds);
@@ -168,8 +168,8 @@ internal class ActionButton : Button
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 1;
         FlatAppearance.BorderColor = VisualTheme.CardBorder;
-        FlatAppearance.MouseOverBackColor = Color.FromArgb(0xF0, 0xF2, 0xF5);
-        FlatAppearance.MouseDownBackColor = Color.FromArgb(0xE5, 0xE7, 0xEB);
+        FlatAppearance.MouseOverBackColor = VisualTheme.HoverBack;
+        FlatAppearance.MouseDownBackColor = VisualTheme.CardBorder;
         BackColor = VisualTheme.SurfaceWhite;
         ForeColor = VisualTheme.PrimaryText;
         Font = VisualTheme.BodyFont;

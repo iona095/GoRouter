@@ -35,6 +35,21 @@ internal static class VisualTheme
     internal static readonly Color AmberBannerBack = Color.FromArgb(0xFF, 0xFB, 0xEB);
     internal static readonly Color AmberBannerBorder = Color.FromArgb(0xFD, 0xE6, 0x8A);
     internal static readonly Color AmberBannerText = Color.FromArgb(0x92, 0x40, 0x0E);
+    // Visual slice 6a: every literal color site tokenized (light values
+    // identical; dark twins land with the Mode switch in 6b).
+    internal static readonly Color HoverBack = Color.FromArgb(0xF0, 0xF2, 0xF5);
+    internal static readonly Color SelectedRowBack = Color.FromArgb(0xE8, 0xEF, 0xFB);
+    internal static readonly Color MarkerGoBack = Color.FromArgb(0xE7, 0xF4, 0xEA);
+    internal static readonly Color MarkerGoText = Color.FromArgb(0x16, 0x7A, 0x3A);
+    internal static readonly Color MarkerZenBack = Color.FromArgb(0xE8, 0xEF, 0xFB);
+    internal static readonly Color MarkerZenText = Color.FromArgb(0x1D, 0x4E, 0xD8);
+    internal static readonly Color ChipAttachedBack = Color.FromArgb(0xF1, 0xF2, 0xF4);
+    internal static readonly Color IdleDot = Color.FromArgb(0x61, 0x61, 0x61);
+    internal static readonly Color FeedbackOkText = Color.FromArgb(0x1B, 0x5E, 0x20);
+    internal static readonly Color ErrorText = Color.FromArgb(0xB7, 0x1C, 0x1C);
+    internal static readonly Color WarnText = Color.FromArgb(0x8A, 0x53, 0x00);
+    // Structural white (tray glyph ring): taskbar-owned background, not theme paint.
+    internal static readonly Color TrayRing = Color.White;
     internal static readonly Color RowAltBack = Color.FromArgb(0xF9, 0xFA, 0xFB);
     internal static readonly Color Separator = Color.FromArgb(0xE5, 0xE7, 0xEB);
 

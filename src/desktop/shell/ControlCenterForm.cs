@@ -618,13 +618,13 @@ public sealed class ControlCenterForm : Form
         lanes.Controls.Add(BuildLaneCard(
             "GO", "go/v1",
             VisualTheme.AccentGo,
-            Color.FromArgb(0xE7, 0xF4, 0xEA), Color.FromArgb(0x16, 0x7A, 0x3A),
+            VisualTheme.MarkerGoBack, VisualTheme.MarkerGoText,
             new Padding(0, 0, 10, 0), 0,
             out _cmbGo, out _lblGoFeedback, out _lblGoError, out _goStatusBox), 0, 0);
         lanes.Controls.Add(BuildLaneCard(
             "ZEN", "zen/v1",
             VisualTheme.AccentZen,
-            Color.FromArgb(0xE8, 0xEF, 0xFB), Color.FromArgb(0x1D, 0x4E, 0xD8),
+            VisualTheme.MarkerZenBack, VisualTheme.MarkerZenText,
             new Padding(10, 0, 0, 0), 1,
             out _cmbZen, out _lblZenFeedback, out _lblZenError, out _zenStatusBox), 1, 0);
 
@@ -1028,7 +1028,7 @@ public sealed class ControlCenterForm : Form
         {
             var selected = (e.ItemState & ListViewItemStates.Selected) != 0;
             var back = selected
-                ? Color.FromArgb(0xE8, 0xEF, 0xFB)
+                ? VisualTheme.SelectedRowBack
                 : e.ItemIndex % 2 == 1 ? VisualTheme.RowAltBack : VisualTheme.SurfaceWhite;
             using var brush = new SolidBrush(back);
             e.Graphics.FillRectangle(brush, e.Bounds);
@@ -1457,7 +1457,7 @@ public sealed class ControlCenterForm : Form
         {
             Text = "Applies to the next router start.",
             AutoSize = true,
-            ForeColor = Color.FromArgb(0x61, 0x61, 0x61),
+            ForeColor = VisualTheme.IdleDot,
             AccessibleName = "Port change note",
         };
         settingsLayout.Controls.Add(lblPortNote, 0, 3);
@@ -1466,7 +1466,7 @@ public sealed class ControlCenterForm : Form
         _lblPortError = new Label
         {
             AutoSize = true,
-            ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C),
+            ForeColor = VisualTheme.ErrorText,
             AccessibleName = "Port validation error",
         };
         settingsLayout.Controls.Add(_lblPortError, 0, 4);
@@ -1502,7 +1502,7 @@ public sealed class ControlCenterForm : Form
         _lblRetentionError = new Label
         {
             AutoSize = true,
-            ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C),
+            ForeColor = VisualTheme.ErrorText,
             AccessibleName = "Journal settings validation error",
         };
         settingsLayout.Controls.Add(_lblRetentionError, 0, 7);
@@ -1841,7 +1841,7 @@ public sealed class ControlCenterForm : Form
             return;
         }
 
-        _lblDiagnosticsFeedback.ForeColor = isError ? Color.FromArgb(0xB7, 0x1C, 0x1C) : Color.FromArgb(0x1B, 0x5E, 0x20);
+        _lblDiagnosticsFeedback.ForeColor = isError ? VisualTheme.ErrorText : VisualTheme.FeedbackOkText;
         _lblDiagnosticsFeedback.Text = UiText.Truncate(message);
     }
 
@@ -2022,14 +2022,14 @@ public sealed class ControlCenterForm : Form
         if (string.Equals(mode, "managed", StringComparison.Ordinal))
         {
             chip.Text = "Managed";
-            chip.BackColor = Color.FromArgb(0xE7, 0xF4, 0xEA);
-            chip.ForeColor = Color.FromArgb(0x16, 0x7A, 0x3A);
+            chip.BackColor = VisualTheme.MarkerGoBack;
+            chip.ForeColor = VisualTheme.MarkerGoText;
             chip.Visible = true;
         }
         else if (string.Equals(mode, "attached", StringComparison.Ordinal))
         {
             chip.Text = "Attached";
-            chip.BackColor = Color.FromArgb(0xF1, 0xF2, 0xF4);
+            chip.BackColor = VisualTheme.ChipAttachedBack;
             chip.ForeColor = VisualTheme.SecondaryText;
             chip.Visible = true;
         }
@@ -2191,7 +2191,7 @@ public sealed class ControlCenterForm : Form
 
     private void SetAccountsFeedback(string message, bool isError)
     {
-        _lblAccountsStatus.ForeColor = isError ? Color.FromArgb(0xB7, 0x1C, 0x1C) : Color.FromArgb(0x1B, 0x5E, 0x20);
+        _lblAccountsStatus.ForeColor = isError ? VisualTheme.ErrorText : VisualTheme.FeedbackOkText;
         _lblAccountsStatus.Text = UiText.Truncate(message);
     }
 
@@ -2602,12 +2602,12 @@ public sealed class ControlCenterForm : Form
         try
         {
             Clipboard.SetText(BuildDiagnosticsText());
-            _lblDiagnosticsFeedback.ForeColor = Color.FromArgb(0x1B, 0x5E, 0x20);
+            _lblDiagnosticsFeedback.ForeColor = VisualTheme.FeedbackOkText;
             _lblDiagnosticsFeedback.Text = "Redacted diagnostics copied to the clipboard.";
         }
         catch (Exception ex)
         {
-            _lblDiagnosticsFeedback.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
+            _lblDiagnosticsFeedback.ForeColor = VisualTheme.ErrorText;
             _lblDiagnosticsFeedback.Text = UiText.Truncate("Copy failed: " + ex.Message);
         }
 
@@ -2961,7 +2961,7 @@ public sealed class ControlCenterForm : Form
     private sealed class StatusDot : Control
     {
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
-        public Color FillColor { get; set; } = Color.FromArgb(0x61, 0x61, 0x61);
+        public Color FillColor { get; set; } = VisualTheme.IdleDot;
 
         public StatusDot()
         {

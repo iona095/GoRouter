@@ -37,7 +37,7 @@ public sealed partial class FirstRunFlow : Form
     private readonly Label _lblError = new()
     {
         AutoSize = true,
-        ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C),
+        ForeColor = VisualTheme.ErrorText,
         MaximumSize = new Size(500, 0),
         AccessibleName = "Onboarding error",
     };
@@ -310,14 +310,14 @@ public sealed partial class FirstRunFlow : Form
         {
             Text = $"Treat this like a password. OMP sends it only to 127.0.0.1:{_snapshot.Settings.Port}.",
             AutoSize = true,
-            ForeColor = Color.FromArgb(0x8A, 0x53, 0x00),
+            ForeColor = VisualTheme.WarnText,
             MaximumSize = new Size(520, 0),
             AccessibleName = "Local credential handling warning",
         };
         var status = new Label
         {
             AutoSize = true,
-            ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C),
+            ForeColor = VisualTheme.ErrorText,
             MaximumSize = new Size(520, 0),
             AccessibleName = "Local credential availability",
         };
@@ -445,21 +445,21 @@ public sealed partial class FirstRunFlow : Form
             var secret = txtSecret.Text;
             if (alias.Length == 0)
             {
-                status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
+                status.ForeColor = VisualTheme.ErrorText;
                 status.Text = "Enter an alias.";
                 return;
             }
 
             if (!AliasRegex.IsMatch(alias))
             {
-                status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
+                status.ForeColor = VisualTheme.ErrorText;
                 status.Text = "Alias must match [A-Za-z0-9._-]{1,64}.";
                 return;
             }
 
             if (secret.Length == 0)
             {
-                status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
+                status.ForeColor = VisualTheme.ErrorText;
                 status.Text = "Enter the provider secret.";
                 return;
             }
@@ -472,7 +472,7 @@ public sealed partial class FirstRunFlow : Form
                 if (response.Ok)
                 {
                     _accountsAdded++;
-                    status.ForeColor = Color.FromArgb(0x1B, 0x5E, 0x20);
+                    status.ForeColor = VisualTheme.FeedbackOkText;
                     status.Text = $"Account '{alias}' added.";
                     _btnNext.Enabled = true;
                     txtAlias.Clear();
@@ -480,13 +480,13 @@ public sealed partial class FirstRunFlow : Form
                 }
                 else
                 {
-                    status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
+                    status.ForeColor = VisualTheme.ErrorText;
                     status.Text = UiText.Truncate(response.ErrorMessage ?? "Add account failed.");
                 }
             }
             catch (Exception ex)
             {
-                status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
+                status.ForeColor = VisualTheme.ErrorText;
                 status.Text = UiText.Truncate("Add account failed: " + ex.Message);
             }
             finally
