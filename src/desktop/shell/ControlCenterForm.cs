@@ -1008,6 +1008,18 @@ public sealed class ControlCenterForm : Form
         lv.ForeColor = VisualTheme.PrimaryText;
         lv.GridLines = false;
         lv.Font = VisualTheme.TableFont;
+        // WinForms derives Details row height from the native font metrics,
+        // which can leave owner-drawn glyphs clipped at the current DPI. A
+        // transparent small-image slot reserves a taller native row without
+        // changing the visible table or its accessibility tree.
+        var rowHeight = TextRenderer.MeasureText("Ag", VisualTheme.TableFont).Height + 8;
+        var rowImages = new ImageList
+        {
+            ImageSize = new Size(1, rowHeight),
+            ColorDepth = ColorDepth.Depth32Bit,
+        };
+        rowImages.Images.Add(new Bitmap(1, rowHeight));
+        lv.SmallImageList = rowImages;
         if (!alternateRows)
         {
             return;
