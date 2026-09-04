@@ -674,7 +674,7 @@ public sealed class ControlCenterForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 3 hint
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 4 spacer
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 1f));  // 5 separator
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36f));      // 6 status box
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66f));      // 6 status box (title + detail)
 
         // Header row: bold lane title + textual lane-surface marker badge,
         // and a right-aligned truthful mode chip (Managed / Attached) that
@@ -1942,15 +1942,13 @@ public sealed class ControlCenterForm : Form
         {
             box.SetError(error.Text);
         }
-        else if (feedback.Text.Length > 0)
+        else if (!string.IsNullOrEmpty(route.Alias))
         {
-            box.SetSuccess(feedback.Text);
+            box.SetRouted(route.Alias, feedback.Text.Length > 0 ? feedback.Text : "New requests use this account.");
         }
         else
         {
-            box.SetResting(string.IsNullOrEmpty(route.Alias)
-                ? "No account"
-                : "New route; in-flight same.");
+            box.SetCleared(feedback.Text.Length > 0 ? feedback.Text : "New requests are not routed.");
         }
     }
 
@@ -2747,7 +2745,7 @@ public sealed class ControlCenterForm : Form
 
         public LaneStatusBox()
         {
-            Height = 36;
+            Height = 66;
             AutoSize = false;
             DoubleBuffered = true;
             Visible = false;
@@ -2763,6 +2761,18 @@ public sealed class ControlCenterForm : Form
                 AccessibleName = "Status glyph",
             };
 
+            // Visual slice 2: boarding-pass title line carrying the route
+            // identity ("Routed to alpha"), with the transient/resting copy
+            // as the detail line beneath it.
+            TitleLabel = new Label
+            {
+                AutoSize = true,
+                MaximumSize = new Size(360, 0),
+                Font = VisualTheme.StatusFont,
+                TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = VisualTheme.ConfirmationBack,
+                AccessibleName = "Route state title",
+            };
             FeedbackLabel = new Label
             {
                 AutoSize = false,
@@ -2790,26 +2800,47 @@ public sealed class ControlCenterForm : Form
             {
                 Dock = DockStyle.Fill,
                 ColumnCount = 2,
-                RowCount = 1,
-                Padding = new Padding(10, 5, 10, 5),
+                RowCount = 2,
+                Padding = new Padding(10, 4, 10, 4),
                 BackColor = VisualTheme.ConfirmationBack,
             };
             _layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             _layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            _layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            _layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             _layout.Controls.Add(_glyph, 0, 0);
-            _layout.Controls.Add(FeedbackLabel, 1, 0);
-            _layout.Controls.Add(ErrorLabel, 1, 0); // same cell; visibility toggles
+            _layout.SetRowSpan(_glyph, 2);
+            _layout.Controls.Add(TitleLabel, 1, 0);
+            _layout.Controls.Add(FeedbackLabel, 1, 1);
+            _layout.Controls.Add(ErrorLabel, 1, 1); // same cell; visibility toggles
             Controls.Add(_layout);
         }
+
+        public Label TitleLabel { get; }
 
         public Label FeedbackLabel { get; }
 
         public Label ErrorLabel { get; }
 
-        public void SetSuccess(string text)
+        /// <summary>Routed state: the title carries the account identity.</summary>
+        public void SetRouted(string alias, string detail)
         {
-            SetState(VisualTheme.ConfirmationBack, VisualTheme.ConfirmationBorder, "✓", VisualTheme.AccentGo, VisualTheme.PrimaryText);
-            FeedbackLabel.Text = text;
+            SetState(VisualTheme.ConfirmationBack, VisualTheme.ConfirmationBorder, "●", VisualTheme.Healthy, VisualTheme.PrimaryText);
+            TitleLabel.Text = UiText.Truncate($"Routed to {alias}", 96);
+            TitleLabel.Visible = true;
+            FeedbackLabel.Text = detail;
+            FeedbackLabel.Visible = true;
+            ErrorLabel.Visible = false;
+            Visible = true;
+        }
+
+        /// <summary>Cleared state: no account serves the lane.</summary>
+        public void SetCleared(string detail)
+        {
+            SetState(VisualTheme.RowAltBack, VisualTheme.CardBorder, "○", VisualTheme.SecondaryText, VisualTheme.SecondaryText);
+            TitleLabel.Text = "Lane cleared";
+            TitleLabel.Visible = true;
+            FeedbackLabel.Text = detail;
             FeedbackLabel.Visible = true;
             ErrorLabel.Visible = false;
             Visible = true;
@@ -2818,25 +2849,17 @@ public sealed class ControlCenterForm : Form
         public void SetError(string text)
         {
             SetState(VisualTheme.ErrorBoxBack, VisualTheme.ErrorBoxBorder, "!", VisualTheme.ErrorBoxText, VisualTheme.ErrorBoxText);
+            TitleLabel.Visible = false;
             ErrorLabel.Text = text;
             ErrorLabel.Visible = true;
             FeedbackLabel.Visible = false;
             Visible = true;
         }
 
-        /// <summary>Neutral resting state showing the truthful current-route text.</summary>
-        public void SetResting(string text)
-        {
-            SetState(VisualTheme.RowAltBack, VisualTheme.CardBorder, "•", VisualTheme.SecondaryText, VisualTheme.SecondaryText);
-            FeedbackLabel.Text = text;
-            FeedbackLabel.Visible = true;
-            ErrorLabel.Visible = false;
-            Visible = true;
-        }
-
         public void Clear()
         {
             Visible = false;
+            TitleLabel.Visible = false;
             FeedbackLabel.Visible = false;
             ErrorLabel.Visible = false;
         }
