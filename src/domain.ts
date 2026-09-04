@@ -666,10 +666,10 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
 
     async approvalsMigrateApply(proposalId: string, opts: { dshClient?: DshClient } = {}) {
       const client = opts.dshClient ?? createDshClient();
-      const snap = await client.read();
-      if (!snap) throw new Error("DSH settings not found or llm-pi-ai namespace missing");
       const port = state.read().settings.port;
-      const res = applyMigration(paths, snap, proposalId, port);
+      // The snapshot is read inside applyMigration, immediately before the
+      // proposal check — a caller-supplied snapshot could be stale or forged.
+      const res = await applyMigration(paths, () => client.read(), proposalId, port);
       if (!res.ok) throw new Error(res.reason);
       let dshSync: DshSyncStatus | null = null;
       try {

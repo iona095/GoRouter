@@ -86,14 +86,18 @@ export function computeMigrationPreview(snapshot: DshSnapshot, expectedPort: num
  * store, valid owned bindings, and an unchanged candidate set/bindings/
  * revision at apply time. Anything material changed => reject, write nothing.
  * One-time: refuses once the store exists in any state.
+ *
+ * The snapshot is read INSIDE apply (via readSnapshot) immediately before the
+ * check-then-init sequence — callers cannot supply a stale or forged snapshot,
+ * so the proposal comparison always runs against live DSH state.
  */
-export function applyMigration(
+export async function applyMigration(
   paths: Paths,
-  snapshot: DshSnapshot,
+  readSnapshot: () => Promise<DshSnapshot | null>,
   proposalId: string,
   expectedPort: number,
   opts: { nowIso?: string } = {},
-): MigrationApplyResult {
+): Promise<MigrationApplyResult> {
   if (typeof proposalId !== "string" || proposalId.length === 0) {
     return { ok: false, reason: "missing --proposal identifier" };
   }
@@ -106,6 +110,10 @@ export function applyMigration(
   }
   if (store.state === "unsupported-version") {
     return { ok: false, reason: `approval store schema version ${store.version} unsupported; refusing to migrate` };
+  }
+  const snapshot = await readSnapshot();
+  if (!snapshot) {
+    return { ok: false, reason: "DSH settings not found or llm-pi-ai namespace missing" };
   }
   const bindings = checkOwnedProviderBindings(snapshot, expectedPort);
   if (!bindings.valid) {

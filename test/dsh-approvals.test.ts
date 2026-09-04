@@ -477,11 +477,11 @@ describe("migration", () => {
     expect(migrationProposalId(base.candidates, base.bindings, 4)).not.toBe(base.proposalId);
   });
 
-  test("apply initializes exactly the previewed tuples with source legacy-migration", () => {
+  test("apply initializes exactly the previewed tuples with source legacy-migration", async () => {
     const { paths } = freshPaths();
     const snap = snapshotOf([makeModel("b-g"), makeModel("a-g")], [makeModel("z1")], 2);
     const preview = computeMigrationPreview(snap, 8787, BASE_ISO);
-    const res = applyMigration(paths, snap, preview.proposalId, 8787, { nowIso: BASE_ISO });
+    const res = await applyMigration(paths, async () => snap, preview.proposalId, 8787, { nowIso: BASE_ISO });
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(res.candidates).toEqual(preview.candidates);
@@ -491,37 +491,37 @@ describe("migration", () => {
     expect(loaded.store.approvals).toEqual(preview.candidates.map((c) => ({ ...c, approvedAtUtc: BASE_ISO, source: "legacy-migration" })));
   });
 
-  test("apply refuses when store exists in any state", () => {
+  test("apply refuses when store exists in any state", async () => {
     const snap = snapshotOf([makeModel("g1")], [makeModel("z1")], 2);
     const id = computeMigrationPreview(snap, 8787, BASE_ISO).proposalId;
 
     const a = freshPaths();
     initializeApprovalStore(a.paths, [], "operator");
-    expect(applyMigration(a.paths, snap, id, 8787).ok).toBe(false);
+    expect((await applyMigration(a.paths, async () => snap, id, 8787)).ok).toBe(false);
 
     const b = freshPaths();
     writeFileSync(approvalStorePathFor(b.paths), "junk{");
-    expect(applyMigration(b.paths, snap, id, 8787).ok).toBe(false);
+    expect((await applyMigration(b.paths, async () => snap, id, 8787)).ok).toBe(false);
 
     const c = freshPaths();
     writeFileSync(approvalStorePathFor(c.paths), JSON.stringify({ version: 3, initializedAtUtc: BASE_ISO, approvals: [] }));
-    const res = applyMigration(c.paths, snap, id, 8787);
+    const res = await applyMigration(c.paths, async () => snap, id, 8787);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toMatch(/3/);
     expect(existsSync(approvalStorePathFor(a.paths))).toBe(true); // untouched one-time store
   });
 
-  test("apply fail-closed on invalid bindings (before any store write)", () => {
+  test("apply fail-closed on invalid bindings (before any store write)", async () => {
     const { paths } = freshPaths();
     const bad = snapshotOf([], [], 1, { go: { ...GO_BIND, baseURL: "http://10.0.0.5:8787/go/v1" }, zen: { ...ZEN_BIND } });
     const id = computeMigrationPreview(bad, 8787, BASE_ISO).proposalId;
-    const res = applyMigration(paths, bad, id, 8787);
+    const res = await applyMigration(paths, async () => bad, id, 8787);
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.reason).toMatch(/binding invalid/);
     expect(existsSync(approvalStorePathFor(paths))).toBe(false);
   });
 
-  test("TOCTOU drift invalidates apply: candidates, bindings and revision each reject with zero writes", () => {
+  test("TOCTOU drift invalidates apply: candidates, bindings and revision each reject with zero writes", async () => {
     const driftCases: Array<[DshSnapshot, RegExp]> = [
       [snapshotOf([makeModel("g1"), makeModel("g-NEW")], [makeModel("z1")], 5), /mismatch|drifted/],
       [snapshotOf([makeModel("g1")], [makeModel("z1")], 5, { go: { ...GO_BIND, baseURL: "http://127.0.0.1:9999/go/v1" }, zen: { ...ZEN_BIND } }), /binding invalid/],
@@ -531,11 +531,34 @@ describe("migration", () => {
       const { paths } = freshPaths();
       const previewSnap = snapshotOf([makeModel("g1")], [makeModel("z1")], 5);
       const id = computeMigrationPreview(previewSnap, 8787, BASE_ISO).proposalId;
-      const res = applyMigration(paths, applySnap, id, 8787);
+      const res = await applyMigration(paths, async () => applySnap, id, 8787);
       expect(res.ok).toBe(false);
       if (!res.ok) expect(res.reason).toMatch(reason);
       expect(existsSync(approvalStorePathFor(paths))).toBe(false);
     }
+  });
+
+  test("apply reads live state itself: a forged caller snapshot cannot smuggle candidates", async () => {
+    const { paths } = freshPaths();
+    const previewSnap = snapshotOf([makeModel("g1")], [makeModel("z1")], 5);
+    const id = computeMigrationPreview(previewSnap, 8787, BASE_ISO).proposalId;
+    // The live DSH state drifted after preview; there is no snapshot parameter
+    // to smuggle the previewed state through — the reader is the authority.
+    let reads = 0;
+    const drifted = snapshotOf([makeModel("g1"), makeModel("g-NEW")], [makeModel("z1")], 5);
+    const res = await applyMigration(paths, async () => { reads++; return drifted; }, id, 8787);
+    expect(reads).toBe(1);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/mismatch|drifted/);
+    expect(existsSync(approvalStorePathFor(paths))).toBe(false);
+  });
+
+  test("apply rejects a missing DSH snapshot with zero writes", async () => {
+    const { paths } = freshPaths();
+    const res = await applyMigration(paths, async () => null, "some-proposal", 8787);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/not found/);
+    expect(existsSync(approvalStorePathFor(paths))).toBe(false);
   });
 
   test("domain preview/apply TOCTOU: mutating DSH between preview and apply throws, store stays absent", async () => {
