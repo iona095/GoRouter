@@ -596,10 +596,14 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Lane selection and recent activity",
         };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        // Lane cards expand to fill the available main area; the activity card
-        // below stays compact at its bounded absolute height.
+        // Lane cards expand to fill the available main area; the activity
+        // card below is sized to fit list header + 5 rows exactly (29px
+        // rows probe-measured at 100% DPI): 34 card header + 20 padding +
+        // 25 list header + 5*29 rows + 4 slack. Smaller clips row 5 (seen
+        // live); larger starves the lane cards above into overlap.
+        // (The rare degraded banner steals from the rows row while shown.)
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
-        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 180f));
+        grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 228f));
 
         var lanes = new TableLayoutPanel
         {
@@ -783,7 +787,9 @@ public sealed class ControlCenterForm : Form
         statusBox = new LaneStatusBox
         {
             Dock = DockStyle.Fill,
-            Margin = new Padding(0, 0, 0, 0),
+            // 6px top breathing room: with the lane spacer collapsed the
+            // mint box would otherwise kiss the separator above it.
+            Margin = new Padding(0, 6, 0, 0),
             AccessibleName = $"{title} route confirmation",
         };
         feedback = statusBox.FeedbackLabel;
