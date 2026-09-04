@@ -12,11 +12,6 @@ export function dshSyncStatePathFor(paths: Paths): string {
   return (paths as unknown as { dshSyncStateJson?: string }).dshSyncStateJson ?? join(paths.state, "dsh-sync-state.json");
 }
 
-function pathFor(paths: Paths): string {
-  const p = (paths as unknown as { dshSyncStateJson?: string }).dshSyncStateJson;
-  if (p) return p;
-  return join(paths.state, "dsh-sync-state.json");
-}
 
 const VALID_OUTCOMES: readonly DshSyncOutcome[] = ["current", "no-op", "pending", "error", "blocked"];
 
@@ -55,7 +50,7 @@ function isValidDshSyncStatus(s: Record<string, unknown>): boolean {
 }
 
 export function loadDshSyncStatus(paths: Paths): DshSyncStatus | null {
-  const p = pathFor(paths);
+  const p = dshSyncStatePathFor(paths);
   if (!existsSync(p)) return null;
   try {
     const raw = readFileSync(p, "utf8");
@@ -85,7 +80,7 @@ export function loadDshSyncStatus(paths: Paths): DshSyncStatus | null {
  * contract honest for callers that need to know.
  */
 export function storeDshSyncStatus(paths: Paths, status: DshSyncStatus): void {
-  atomicWriteJson(pathFor(paths), status as unknown as Record<string, unknown>);
+  atomicWriteJson(dshSyncStatePathFor(paths), status as unknown as Record<string, unknown>);
 }
 
 export function defaultDshSyncStatus(): DshSyncStatus {

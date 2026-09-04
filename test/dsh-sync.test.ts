@@ -856,6 +856,19 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
     expect(readdirSync(dir).filter((f) => f.startsWith("dsh-sync-state.json.corrupt-"))).toHaveLength(5);
   });
 
+  test("legacy file without B.1 optional fields still loads (M9 undefined-tolerance)", async () => {
+    const { paths } = freshPaths();
+    const p = dshSyncStatePathFor(paths);
+    const legacy = { ...emptyDshSyncStatus() };
+    for (const k of ["approvalsInitialized", "migrationRequired", "bindingValid", "bindingError", "approvedAbsentGoCount", "approvedAbsentZenCount"] as const) {
+      delete (legacy as Record<string, unknown>)[k];
+    }
+    writeFileSync(p, JSON.stringify(legacy));
+    const loaded = loadDshSyncStatus(paths);
+    expect(loaded?.outcome).toBe("pending");
+    expect(existsSync(p)).toBe(true); // accepted, not quarantined
+  });
+
   test("store failure throws instead of warn-swallowing (M9 honest persist)", async () => {
     // Point the state path at a directory: atomic write must fail loudly.
     const { dir } = freshPaths();
