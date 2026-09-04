@@ -17,7 +17,7 @@
  *  auth, routing regression — all deterministic.
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
@@ -63,7 +63,7 @@ import {
 import { deriveApprovalDesiredDshState, isSemanticNoOp, sanitizeRegistryEntryForDsh } from "../src/models/dsh-eligibility.ts";
 import { OWNED_DSH_PROVIDERS, type ApprovalStoreLoad } from "../src/models/dsh-approvals.ts";
 import { reconcileDshCatalog, clearDshSyncSingleFlightForTests } from "../src/models/dsh-sync.ts";
-import { loadDshSyncStatus, storeDshSyncStatus } from "../src/models/dsh-sync-state.ts";
+import { loadDshSyncStatus, storeDshSyncStatus, dshSyncStatePathFor } from "../src/models/dsh-sync-state.ts";
 import { redact } from "../src/util.ts";
 
 // ---------------------------------------------------------------------------
@@ -730,6 +730,22 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
     const reloaded = loadDshSyncStatus(paths);
     expect(reloaded!.outcome).toBe("pending");
     expect(reloaded!.lastError).toMatch(/verification mismatch/);
+  });
+
+  test("corrupt sync-state file is quarantined as evidence, then reads null (F-23)", async () => {
+    const { paths, dir } = freshPaths();
+    const p = dshSyncStatePathFor(paths);
+    writeFileSync(p, "{corrupt!!");
+    expect(loadDshSyncStatus(paths)).toBeNull();
+    // Original moved away; the evidence survives with its bytes intact.
+    expect(existsSync(p)).toBe(false);
+    const backups = readdirSync(dir).filter((f) => f.startsWith("dsh-sync-state.json.corrupt-"));
+    expect(backups.length).toBe(1);
+    expect(readFileSync(join(dir, backups[0]!), "utf8")).toBe("{corrupt!!");
+    // A later store writes fresh state without touching the evidence.
+    storeDshSyncStatus(paths, emptyDshSyncStatus());
+    expect(existsSync(p)).toBe(true);
+    expect(readdirSync(dir).filter((f) => f.startsWith("dsh-sync-state.json.corrupt-"))).toEqual(backups);
   });
 });
 

@@ -8,7 +8,8 @@
  * file per request, so a CLI route change takes effect for the next request
  * without a router restart while every request uses one coherent snapshot.
  */
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync, renameSync, readdirSync, unlinkSync } from "node:fs";
+import { dirname, basename } from "node:path";
 import { randomUUID } from "node:crypto";
 import { atomicWriteJson, log } from "./util.ts";
 import type { SecretStore } from "./secret-store.ts";
@@ -128,6 +129,30 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
   let cache: { mtimeMs: number; size: number; state: StateFile } | null = null;
   let corrupt = false;
 
+  /**
+   * Quarantine corrupt/unreadable state.json evidence (F-19): move the bad
+   * file to a timestamped backup (bounded to the newest few) so a later
+   * mutation cannot silently overwrite the only copy. Best effort — serving
+   * defaults must never fail because the backup did.
+   */
+  function quarantine(p: string): void {
+    try {
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const backup = `${p}.corrupt-${ts}`;
+      renameSync(p, backup);
+      log.warn(`state.json quarantined to ${backup}`);
+      try {
+        const prefix = `${basename(p)}.corrupt-`;
+        const olds = readdirSync(dirname(p)).filter((f) => f.startsWith(prefix)).sort();
+        for (const f of olds.slice(0, Math.max(0, olds.length - 5))) {
+          try { unlinkSync(`${dirname(p)}/${f}`); } catch { /* best effort */ }
+        }
+      } catch { /* pruning is optional */ }
+    } catch (e) {
+      log.warn(`state.json quarantine failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   function load(): StateFile {
     const p = paths.stateJson;
     if (!existsSync(p)) return defaultState();
@@ -138,6 +163,8 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
       raw = readFileSync(p, "utf8");
     } catch {
       corrupt = true;
+      quarantine(p);
+      cache = null;
       log.warn(`state read failed; using defaults (path=${p})`);
       return defaultState();
     }
@@ -146,7 +173,9 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
       parsed = JSON.parse(raw);
     } catch {
       corrupt = true;
-      log.error(`state.json corrupt; failing closed to defaults (path=${p})`);
+      quarantine(p);
+      cache = null;
+      log.error(`state.json corrupt; evidence quarantined, serving defaults (path=${p})`);
       return defaultState();
     }
     const state = normalizeState(parsed);
@@ -158,6 +187,9 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
   function write(state: StateFile): void {
     atomicWriteJson(paths.stateJson, state);
     cache = null; // force a fresh read next time
+    // A completed atomic write means the on-disk state is known-good again:
+    // clear a stale corruption flag (a failed write throws, leaving it set).
+    corrupt = false;
   }
 
   return {
