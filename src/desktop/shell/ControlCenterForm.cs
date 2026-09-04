@@ -2345,7 +2345,7 @@ public sealed class ControlCenterForm : Form
         var journal = _snapshot.Journal;
         var oldest = string.IsNullOrEmpty(journal.OldestRecordAtUtc) ? "—" : FormatTime(journal.OldestRecordAtUtc);
         var newest = string.IsNullOrEmpty(journal.NewestRecordAtUtc) ? "—" : FormatTime(journal.NewestRecordAtUtc);
-        _lblJournalStats.Text = $"records {journal.Records} · oldest {oldest} · newest {newest} · retention {journal.RetentionDays} days · max {journal.MaxRecords}";
+        UiText.SetIfChanged(_lblJournalStats, $"records {journal.Records} · oldest {oldest} · newest {newest} · retention {journal.RetentionDays} days · max {journal.MaxRecords}");
     }
 
     private static ListViewItem MakeJournalItem(JournalRow row)
@@ -2368,8 +2368,22 @@ public sealed class ControlCenterForm : Form
     /// credentials, request ids or durations. The empty state is designed and
     /// the degraded state is explicit; the full Journal tab stays authoritative.
     /// </summary>
+    // Slice C: fingerprint of the activity payload — the ~1s tick skips the
+    // clear+rebuild while nothing changed (newest id/completion covers new
+    // rows and in-flight completions; degraded text is part of the key).
+    private string? _activityFingerprint;
+
     private void RenderRecentActivity(IReadOnlyList<JournalRow> rows, bool degraded, string? error)
     {
+        var fingerprint = degraded
+            ? "degraded:" + (error ?? "")
+            : rows.Count + "|" + (rows.Count > 0 ? rows[0].RouterRequestId + "|" + rows[0].CompletedAtUtc : "");
+        if (fingerprint == _activityFingerprint)
+        {
+            return;
+        }
+
+        _activityFingerprint = fingerprint;
         _lvActivity.BeginUpdate();
         _lvActivity.Items.Clear();
         foreach (var row in rows.Take(5))

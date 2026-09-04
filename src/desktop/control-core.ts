@@ -153,14 +153,82 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   // read-only journal access (WAL-compatible, never blocks routing)
   // ------------------------------------------------------------------
 
-  function openReadonly(): Database | null {
-    if (!existsSync(paths.journalDb)) return null
+  // Slice C: one persistent readonly handle + compiled statements for the
+  // service lifetime. Reopened when the DB file is replaced/reset (sig
+  // mismatch) or after any query error; closed on stop(). Readers never
+  // block the routing writer (WAL), and each query is its own read so no
+  // stale snapshot is held across checkpoints.
+  interface RoHandle {
+    db: Database;
+    sig: string;
+    metaStmt: ReturnType<Database['query']>;
+    countStmt: ReturnType<Database['query']>;
+    oldestStmt: ReturnType<Database['query']>;
+    newestStmt: ReturnType<Database['query']>;
+    recentStmt: ReturnType<Database['query']>;
+  }
+  let roHandle: RoHandle | null = null
+
+  function dbSig(): string | null {
     try {
-      return new Database(paths.journalDb, { readonly: true })
+      const st = statSync(paths.journalDb)
+      return `${st.mtimeMs}:${st.size}`
     } catch {
       return null
     }
   }
+
+  function closeRoHandle(): void {
+    if (roHandle) {
+      try {
+        roHandle.db.close()
+      } catch {
+        /* already closed */
+      }
+      roHandle = null
+    }
+  }
+
+  function openReadonly(): RoHandle | null {
+    const sig = dbSig()
+    if (sig === null) {
+      closeRoHandle() // DB deleted/reset: drop the stale handle
+      return null
+    }
+    if (roHandle && roHandle.sig === sig) return roHandle
+    closeRoHandle() // replaced under us: reopen against the new file
+    // NB: the file EXISTS here, so open/prepare failure is corruption, not
+    // absence — it throws and callers report degraded (never null).
+    try {
+      const db = new Database(paths.journalDb, { readonly: true })
+      const h: RoHandle = {
+        db,
+        sig,
+        metaStmt: db.query('SELECT value FROM journal_meta WHERE key = ?'),
+        countStmt: db.query('SELECT COUNT(*) AS n FROM request_journal'),
+        oldestStmt: db.query('SELECT MIN(started_at_utc) AS v FROM request_journal'),
+        newestStmt: db.query('SELECT MAX(started_at_utc) AS v FROM request_journal'),
+        recentStmt: db.query(
+          `SELECT router_request_id, started_at_utc, completed_at_utc, duration_ms, lane,
+                  selected_account_alias_snapshot, method, endpoint_family, terminal_outcome,
+                  http_status, upstream_request_ids, model, client_correlation_id
+           FROM request_journal
+           ORDER BY started_at_utc DESC, id DESC
+           LIMIT ?`,
+        ),
+      }
+      roHandle = h
+      return h
+    } catch (e) {
+      throw e
+    }
+  }
+
+  // Aggregate TTL: the poll already samples at 1s + 250ms debounce, so a 2s
+  // stats cache is invisible in the UI and skips the COUNT(*) scan per tick.
+  // Only successes cache — degraded results always re-probe next tick.
+  const STATS_TTL_MS = 2000
+  let statsCache: { at: number; value: SnapshotJournal } | null = null
 
   function journalStats(): SnapshotJournal {
     const settings = domain.configShow()
@@ -174,44 +242,48 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       retentionDays: settings.journalRetentionDays,
       maxRecords: settings.journalMaxRecords,
     }
-    const db = openReadonly()
-    if (!db) return base
+    const now = Date.now()
+    if (statsCache && now - statsCache.at < STATS_TTL_MS) {
+      return { ...statsCache.value, retentionDays: base.retentionDays, maxRecords: base.maxRecords }
+    }
+    let h: RoHandle | null
     try {
-      const meta = db.query('SELECT value FROM journal_meta WHERE key = ?').get('schema_version') as
-        | { value: string }
-        | undefined
-      const count = db.query('SELECT COUNT(*) AS n FROM request_journal').get() as { n: number }
-      const oldest = db.query('SELECT MIN(started_at_utc) AS v FROM request_journal').get() as { v: string | null }
-      const newest = db.query('SELECT MAX(started_at_utc) AS v FROM request_journal').get() as { v: string | null }
-      return {
+      h = openReadonly()
+    } catch (e) {
+      return { ...base, degraded: true, lastError: e instanceof Error ? e.message : String(e) }
+    }
+    if (!h) return base
+    try {
+      const meta = h.metaStmt.get('schema_version') as { value: string } | undefined
+      const count = h.countStmt.get() as { n: number }
+      const oldest = h.oldestStmt.get() as { v: string | null }
+      const newest = h.newestStmt.get() as { v: string | null }
+      const value: SnapshotJournal = {
         ...base,
         schemaVersion: meta ? Number(meta.value) || 1 : 1,
         records: count.n,
         oldestRecordAtUtc: oldest.v,
         newestRecordAtUtc: newest.v,
       }
+      statsCache = { at: now, value }
+      return value
     } catch (e) {
+      closeRoHandle() // poisoned handle (e.g. schema mid-migration): reopen next tick
       return { ...base, degraded: true, lastError: e instanceof Error ? e.message : String(e) }
-    } finally {
-      db.close()
     }
   }
 
   function journalRecent(limit: number): { rows: JournalRowView[]; degraded: boolean; error: string | null } {
     const n = Math.max(1, Math.min(JOURNAL_RECENT_LIMIT_MAX, Number.isFinite(limit) ? Math.floor(limit) : 100))
-    const db = openReadonly()
-    if (!db) return { rows: [], degraded: false, error: null }
+    let h: RoHandle | null
     try {
-      const rows = db
-        .query(
-          `SELECT router_request_id, started_at_utc, completed_at_utc, duration_ms, lane,
-                  selected_account_alias_snapshot, method, endpoint_family, terminal_outcome,
-                  http_status, upstream_request_ids, model, client_correlation_id
-           FROM request_journal
-           ORDER BY started_at_utc DESC, id DESC
-           LIMIT ?`,
-        )
-        .all(n) as unknown as JournalDbRow[]
+      h = openReadonly()
+    } catch (e) {
+      return { rows: [], degraded: true, error: e instanceof Error ? e.message : String(e) }
+    }
+    if (!h) return { rows: [], degraded: false, error: null }
+    try {
+      const rows = h.recentStmt.all(n) as unknown as JournalDbRow[]
       const out: JournalRowView[] = rows.map((r) => ({
         routerRequestId: r.router_request_id,
         startedAtUtc: r.started_at_utc,
@@ -229,9 +301,8 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       }))
       return { rows: out, degraded: false, error: null }
     } catch (e) {
+      closeRoHandle()
       return { rows: [], degraded: true, error: e instanceof Error ? e.message : String(e) }
-    } finally {
-      db.close()
     }
   }
 
@@ -448,6 +519,10 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       emitTimer = null
     }
     emitScheduled = false
+    // Slice C: drop the persistent journal handle + stats TTL with the
+    // lifecycle so a restart reopens against the live file.
+    closeRoHandle()
+    statsCache = null
     // Reset dedup state with the lifecycle: a stop->start cycle whose first
     // snapshot serializes identically to pre-stop must still emit to
     // (possibly re-attached) listeners, or the UI goes stale silently.
