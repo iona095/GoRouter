@@ -654,6 +654,49 @@ describe('transport hello-gate (F-29)', () => {
     raw.destroy()
     await transport.close()
   })
+
+  test('failed hello never subscribes; prior success survives a later failure', async () => {
+    const { serveControlPipe } = await import('../src/desktop/transport.ts')
+    const pipeName = `\\\\.\\pipe\\gorouter-hello-fail-${randomUUID()}`
+    const token = 'test-token'
+    let failHello = true
+    const transport = serveControlPipe(pipeName, token, async (op) => {
+      if (op === 'hello') {
+        if (failHello) throw Object.assign(new Error('hello denied'), { code: 'unavailable' })
+        return { version: '1.5.0' }
+      }
+      throw Object.assign(new Error('unsupported op'), { code: 'unsupported' })
+    })
+    await transport.listening
+    const frames: string[] = []
+    const raw = net.connect({ path: pipeName })
+    await new Promise<void>((res, rej) => {
+      raw.once('connect', () => res())
+      raw.once('error', rej)
+    })
+    raw.on('data', (d: Buffer) => frames.push(d.toString('utf8')))
+    const blob = () => frames.join('')
+    // Failed hello: error response, socket stays open, no subscription.
+    raw.write(JSON.stringify({ id: 1, token, op: 'hello', params: {} }) + '\n')
+    await waitFor(() => blob().includes('"id":1,"ok":false'), 5_000)
+    transport.push('snap', { n: 1 })
+    await sleep(300)
+    expect(blob()).not.toContain('"event":"snap"')
+    // Retry after the handler recovers: subscribes, pushes arrive.
+    failHello = false
+    raw.write(JSON.stringify({ id: 2, token, op: 'hello', params: {} }) + '\n')
+    await waitFor(() => blob().includes('"id":2,"ok":true'), 5_000)
+    transport.push('snap', { n: 2 })
+    await waitFor(() => blob().includes('"n":2'), 5_000)
+    // A later failed hello must not evict the completed subscription.
+    failHello = true
+    raw.write(JSON.stringify({ id: 3, token, op: 'hello', params: {} }) + '\n')
+    await waitFor(() => blob().includes('"id":3,"ok":false'), 5_000)
+    transport.push('snap', { n: 3 })
+    await waitFor(() => blob().includes('"n":3'), 5_000)
+    raw.destroy()
+    await transport.close()
+  })
 })
 
 describe('real pipe integration', () => {

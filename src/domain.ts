@@ -607,10 +607,13 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const cur = loadApprovalStore(paths);
       const reg = loadRegistry(paths);
       const port = state.read().settings.port;
-      const client = opts.dshClient ?? createDshClient();
       let binding: ApprovalStatusView["binding"] = null;
       let migrationCandidateCount: number | null = null;
       try {
+        // Factory inside the boundary (M7): an ambient invalid DSH_WEB_URL
+        // must degrade to binding:null like any read failure, never hard-
+        // fail this read-only status view.
+        const client = opts.dshClient ?? createDshClient();
         const snap = await client.read();
         if (snap) {
           const b = checkOwnedProviderBindings(snap, port);

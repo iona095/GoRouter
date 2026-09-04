@@ -18,7 +18,7 @@ export interface TransportHandle {
 }
 
 export interface ControlTransport {
-  /** Broadcast an event to all authenticated clients. */
+  /** Broadcast an event to all hello-completed clients. */
   push(event: string, data: unknown): void
   /** Stop accepting, destroy sockets, resolve when fully closed. */
   close(): Promise<void>
@@ -63,6 +63,10 @@ export function serveControlPipe(
     // streaming data without '\n' cannot grow memory without limit.
     let buf = Buffer.alloc(0)
     let helloSeen = false
+    // A hello that completed keeps the subscription even if a LATER hello
+    // fails (out-of-order pipelined hellos, stray retries): only a hello
+    // that never succeeded leaves the socket unsubscribed.
+    let helloOk = false
 
     function send(obj: unknown): void {
       if (socket.destroyed) return
@@ -134,14 +138,16 @@ export function serveControlPipe(
             (data) => {
               send({ id, ok: true, data })
               if (msg.op === 'hello') {
+                helloOk = true
                 clients.add(socket)
                 if (onHello) onHello()
               }
             },
             (err) => {
               // A FAILED hello must not subscribe (F-29): the socket stays
-              // usable for a retry, but receives no pushes until one succeeds.
-              if (msg.op === 'hello') clients.delete(socket)
+              // usable for a retry, but receives no pushes until one succeeds
+              // — unless an earlier hello already completed (helloOk).
+              if (msg.op === 'hello' && !helloOk) clients.delete(socket)
               const e = err as { code?: unknown; message?: unknown }
               const code =
                 typeof e.code === 'string' && ERROR_CODES[e.code as ErrorCode] ? (e.code as ErrorCode) : 'internal'

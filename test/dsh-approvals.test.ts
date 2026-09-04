@@ -135,6 +135,24 @@ async function reconcile(
   return reconcileDshCatalog(reg, client, { approvalStore, expectedPort });
 }
 
+test("approvalsStatus degrades (not throws) on ambient invalid DSH_WEB_URL (M7 isolation)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "gorouter-statusiso-"));
+  try {
+    const { domain } = domainFor(dir);
+    const previous = process.env.DSH_WEB_URL;
+    try {
+      process.env.DSH_WEB_URL = "http://evil.example/api";
+      const view = await domain.approvalsStatus();
+      expect(view.binding).toBeNull(); // degraded view, same as any read failure
+    } finally {
+      if (previous === undefined) delete process.env.DSH_WEB_URL;
+      else process.env.DSH_WEB_URL = previous;
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /** Domain wired to a temp state dir (registry fixtures via storeRegistry). */
 function domainFor(dir: string) {
   const paths = resolvePaths(dir);
