@@ -1826,7 +1826,7 @@ public sealed class ControlCenterForm : Form
                 ? "ok"
                 : "unavailable — restart the desktop app or check the state directory";
             _lblJournalInfoValue.Text = $"{snapshot.Journal.Records} records · retention {snapshot.Journal.RetentionDays}d · max {snapshot.Journal.MaxRecords}";
-            _lblRouterInfoValue.Text = $"{snapshot.Router.State} · {snapshot.Router.Mode} · pid {(snapshot.Router.Pid > 0 ? snapshot.Router.Pid.ToString() : "—")} · restarts {snapshot.Router.RestartCount}";
+            _lblRouterInfoValue.Text = UiText.Truncate($"{snapshot.Router.State} · {snapshot.Router.Mode} · pid {(snapshot.Router.Pid > 0 ? snapshot.Router.Pid.ToString() : "—")} · restarts {snapshot.Router.RestartCount}", 128);
 
             _txtPort.Text = snapshot.Settings.Port.ToString();
             _txtRetentionDays.Text = snapshot.Settings.JournalRetentionDays.ToString();

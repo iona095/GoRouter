@@ -100,7 +100,8 @@ public sealed class TrayIcon : IDisposable
         _updating = true;
         try
         {
-            _miRouterState.Text = $"Router: {snapshot.Router.State} ({snapshot.Router.Mode})";
+            // Wire State/Mode echo: same 64-cap as the badge/footer (F-14).
+            _miRouterState.Text = UiText.Truncate($"Router: {snapshot.Router.State} ({snapshot.Router.Mode})", 64);
             _miStart.Enabled = snapshot.Router.State is not ("running" or "starting");
             _miStop.Enabled = snapshot.Router.State is "running" or "starting" or "degraded" or "port_conflict";
             _miStartAtLogin.Checked = snapshot.Desktop.StartAtLogin;
