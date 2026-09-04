@@ -597,11 +597,11 @@ public sealed class ControlCenterForm : Form
         };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         // Lane cards expand to fill the available main area; the activity
-        // card below is sized to fit list header + 5 rows exactly (29px
-        // rows probe-measured at 100% DPI): 34 card header + 20 padding +
-        // 25 list header + 5*29 rows + 4 slack. Smaller clips row 5 (seen
-        // live); larger starves the lane cards above into overlap.
-        // (The rare degraded banner steals from the rows row while shown.)
+        // card below reserves room for its header and five taller native
+        // ListView rows. With the transparent image slot, rows are ~29px: the
+        // 228px bound covers card padding, header, list header, five rows, and
+        // bottom slack without starving the lane cards above.
+        // (The rare degraded banner consumes some of that bottom slack.)
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
         grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 228f));
 
