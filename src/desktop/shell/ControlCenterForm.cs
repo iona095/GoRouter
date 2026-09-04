@@ -1786,17 +1786,17 @@ public sealed class ControlCenterForm : Form
         _updating = true;
         try
         {
-            _lblStateBadge.Text = UiText.Truncate(RouterBadgeText(snapshot.Router), 64);
+            UiText.SetIfChanged(_lblStateBadge, UiText.Truncate(RouterBadgeText(snapshot.Router), 64));
             _lblStateBadge.ForeColor = RouterColor(snapshot.Router.State);
             _statusDot.FillColor = RouterColor(snapshot.Router.State);
             _statusDot.Invalidate();
-            _lblPort.Text = $"Port {snapshot.Settings.Port}";
+            UiText.SetIfChanged(_lblPort, $"Port {snapshot.Settings.Port}");
             _lblVersion.Text = string.IsNullOrEmpty(PresentationVersion) ? "" : $"v{PresentationVersion}";
-            _lblFooterState.Text = UiText.Truncate(FooterStateText(snapshot.Router), 64);
+            UiText.SetIfChanged(_lblFooterState, UiText.Truncate(FooterStateText(snapshot.Router), 64));
             _lblFooterState.ForeColor = RouterColor(snapshot.Router.State);
             _footerDot.FillColor = RouterColor(snapshot.Router.State);
             _footerDot.Invalidate();
-            _lblFooter.Text = $"Local: http://127.0.0.1:{snapshot.Settings.Port}";
+            UiText.SetIfChanged(_lblFooter, $"Local: http://127.0.0.1:{snapshot.Settings.Port}");
             UpdateLifecycleButtons();
 
             _localCredentialWarning = snapshot.Initialized && !snapshot.LocalCredentialConfigured;
@@ -1825,8 +1825,8 @@ public sealed class ControlCenterForm : Form
             _lblSecretStoreValue.Text = snapshot.SecretStore == "ok"
                 ? "ok"
                 : "unavailable — restart the desktop app or check the state directory";
-            _lblJournalInfoValue.Text = $"{snapshot.Journal.Records} records · retention {snapshot.Journal.RetentionDays}d · max {snapshot.Journal.MaxRecords}";
-            _lblRouterInfoValue.Text = UiText.Truncate($"{snapshot.Router.State} · {snapshot.Router.Mode} · pid {(snapshot.Router.Pid > 0 ? snapshot.Router.Pid.ToString() : "—")} · restarts {snapshot.Router.RestartCount}", 128);
+            UiText.SetIfChanged(_lblJournalInfoValue, $"{snapshot.Journal.Records} records · retention {snapshot.Journal.RetentionDays}d · max {snapshot.Journal.MaxRecords}");
+            UiText.SetIfChanged(_lblRouterInfoValue, UiText.Truncate($"{snapshot.Router.State} · {snapshot.Router.Mode} · pid {(snapshot.Router.Pid > 0 ? snapshot.Router.Pid.ToString() : "—")} · restarts {snapshot.Router.RestartCount}", 128));
 
             _txtPort.Text = snapshot.Settings.Port.ToString();
             _txtRetentionDays.Text = snapshot.Settings.JournalRetentionDays.ToString();
@@ -2383,9 +2383,9 @@ public sealed class ControlCenterForm : Form
         _lvActivity.Visible = showList;
         _lblActivityEmpty.Visible = !showList;
         _lblActivityDegraded.Visible = degraded;
-        _lblActivityDegraded.Text = degraded
+        UiText.SetIfChanged(_lblActivityDegraded, degraded
             ? $"Recent activity unavailable: {error ?? "journal degraded"} — recent requests may be missing."
-            : "";
+            : "");
     }
 
     private static ListViewItem MakeActivityItem(JournalRow row)

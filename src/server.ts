@@ -524,16 +524,21 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
     // Deliberately no entropy floor here (unlike the header/session substring
     // scans): a query-param delete has no innocent-id rotation/spam vector,
     // so exact-or-substring always strips.
-    const searchParams = new URLSearchParams(search);
-    let stripped = false;
-    for (const [k, v] of [...searchParams]) {
-      if (v === localCred || v.includes(localCred)) {
-        searchParams.delete(k);
-        stripped = true;
+    // Slice A.2: empty query (the common case) skips parse/serialize entirely.
+    if (!search) {
+      upstreamUrl.search = "";
+    } else {
+      const searchParams = new URLSearchParams(search);
+      let stripped = false;
+      for (const [k, v] of [...searchParams]) {
+        if (v === localCred || v.includes(localCred)) {
+          searchParams.delete(k);
+          stripped = true;
+        }
       }
+      if (stripped) log.warn(`local credential stripped from query params (lane=${lane})`);
+      upstreamUrl.search = searchParams.toString() ? "?" + searchParams.toString() : "";
     }
-    if (stripped) log.warn(`local credential stripped from query params (lane=${lane})`);
-    upstreamUrl.search = searchParams.toString() ? "?" + searchParams.toString() : "";
     if (upstreamUrl.origin !== new URL(base).origin) {
       log.error(`refusing upstream URL outside fixed authority (lane=${lane})`);
       completeEntry("local_error", 500, [], monotonicMs() - started);

@@ -149,6 +149,12 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
       http_status = ?, upstream_request_ids = ?
     WHERE router_request_id = ?
   `);
+  // Slice A.1: stats() ran 4 fresh prepares per call; hoisted next to the
+  // insert/update statements so every statement in this module is compiled once.
+  const statsMetaStmt = db.prepare("SELECT value FROM journal_meta WHERE key = ?");
+  const statsCountStmt = db.prepare("SELECT COUNT(*) AS n FROM request_journal");
+  const statsOldestStmt = db.prepare("SELECT MIN(started_at_utc) AS v FROM request_journal");
+  const statsNewestStmt = db.prepare("SELECT MAX(started_at_utc) AS v FROM request_journal");
 
   const journal: Journal = {
     begin(init) {
@@ -195,16 +201,10 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
     },
     stats() {
       try {
-        const meta = db.prepare("SELECT value FROM journal_meta WHERE key = ?").get("schema_version") as
-          | { value: string }
-          | undefined;
-        const count = db.prepare("SELECT COUNT(*) AS n FROM request_journal").get() as { n: number };
-        const oldest = db
-          .prepare("SELECT MIN(started_at_utc) AS v FROM request_journal")
-          .get() as { v: string | null };
-        const newest = db
-          .prepare("SELECT MAX(started_at_utc) AS v FROM request_journal")
-          .get() as { v: string | null };
+        const meta = statsMetaStmt.get("schema_version") as { value: string } | undefined;
+        const count = statsCountStmt.get() as { n: number };
+        const oldest = statsOldestStmt.get() as { v: string | null };
+        const newest = statsNewestStmt.get() as { v: string | null };
         return {
           schemaVersion: meta ? Number(meta.value) : JOURNAL_SCHEMA_VERSION,
           records: count.n,

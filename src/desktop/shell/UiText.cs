@@ -29,4 +29,25 @@ internal static class UiText
         }
         return flat.Substring(0, maxLength - 1) + "\u2026";
     }
+
+    /// <summary>
+    /// Assigns Text only when it changes (slice A.3): the ~1s snapshot tick
+    /// must not pay layout/invalidate on every pass while state is steady.
+    /// </summary>
+    internal static void SetIfChanged(System.Windows.Forms.Control control, string value)
+    {
+        if (control.Text != value)
+        {
+            control.Text = value;
+        }
+    }
+
+    /// <summary>Same guard for menu items (ToolStripItem is not a Control).</summary>
+    internal static void SetIfChanged(System.Windows.Forms.ToolStripItem item, string value)
+    {
+        if (item.Text != value)
+        {
+            item.Text = value;
+        }
+    }
 }
