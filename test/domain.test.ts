@@ -245,3 +245,45 @@ describe("domain mutations apply exactly once", () => {
     }
   });
 });
+
+describe("secret I/O outside the lock (F-08)", () => {
+  function sharedPair() {
+    const stateDir = mkdtempSync(join(tmpdir(), "gorouter-domain-"));
+    dirs.push(stateDir);
+    const paths = resolvePaths(stateDir);
+    ensureStateDirs(paths);
+    const backing = memSecrets();
+    const failingSecrets = { ...backing, put(_ref: string, _v: string) { throw new Error("DPAPI down"); } };
+    return {
+      domain: createDomain(paths, backing),
+      failing: createDomain(paths, failingSecrets),
+    };
+  }
+
+  test("rotate failure before claim leaves the old credential live", () => {
+    const { domain, failing } = sharedPair();
+    domain.setup();
+    const before = domain.localCredential();
+    expect(before.length).toBeGreaterThan(0);
+    // DPAPI fails before any state is touched: the operator sees an error,
+    // the old credential stays live, and no lock was ever held.
+    expect(() => failing.rotateLocalCredential()).toThrow(/DPAPI down/);
+    expect(domain.localCredential()).toBe(before);
+  });
+
+  test("account update failure before mutate leaves state untouched", () => {
+    const { domain, failing } = sharedPair();
+    domain.setup();
+    domain.accountAdd("alpha", "sk-one");
+    expect(() => failing.accountUpdate("alpha", "sk-two")).toThrow(/DPAPI down/);
+    expect(domain.accountList().map((a) => a.alias)).toEqual(["alpha"]);
+  });
+
+  test("duplicate account add still throws the same error", () => {
+    const { domain } = fresh();
+    domain.setup();
+    domain.accountAdd("alpha", "sk-one");
+    expect(() => domain.accountAdd("alpha", "sk-two")).toThrow(/already exists/);
+    expect(domain.accountList().length).toBe(1);
+  });
+});

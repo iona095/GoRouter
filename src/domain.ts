@@ -227,10 +227,13 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         const cred = generateLocalCredential();
         credential = cred;
         const ref = newRef();
+        // DPAPI spawn OUTSIDE the lock (F-08): a slow protect cycle must not
+        // hold the cross-process lock. An orphan blob on lock loss is benign
+        // (no ref points to it); the re-check under the lock stays authoritative.
+        secrets.put(ref, cred);
         mutateLocked((s) => {
           // re-check under the lock: a concurrent setup may have won
           if (s.localCredentialRef !== null) return;
-          secrets.put(ref, cred);
           s.localCredentialRef = ref;
         });
         created = state.read().localCredentialRef === ref;
@@ -243,15 +246,18 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
     },
 
     rotateLocalCredential() {
-      let credential = "";
+      // New secret is stored BEFORE claiming it (F-08: DPAPI outside the lock).
+      // A put failure leaves the old credential untouched; a mutate failure
+      // leaves a benign orphan blob while the old credential stays live.
+      const credential = generateLocalCredential();
+      const ref = newRef();
+      secrets.put(ref, credential);
+      let oldRef: string | null = null;
       mutateLocked((s) => {
-        const oldRef = s.localCredentialRef;
-        credential = generateLocalCredential();
-        const ref = newRef();
-        secrets.put(ref, credential);
+        oldRef = s.localCredentialRef;
         s.localCredentialRef = ref;
-        if (oldRef) secrets.delete(oldRef);
       });
+      if (oldRef) secrets.delete(oldRef);
       return credential;
     },
 
@@ -259,11 +265,16 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const aliasErr = validateAlias(alias);
       if (aliasErr) throw new Error(aliasErr);
       if (secret.length === 0 || secret.length > 1024) throw new Error("invalid secret");
+      // Fast-path duplicate check before touching DPAPI (the in-lock check
+      // below stays authoritative for races).
+      if (findAccount(state.read(), alias)) throw new Error(`account '${alias}' already exists`);
+      // DPAPI spawn OUTSIDE the lock (F-08); a duplicate-alias race leaves a
+      // benign orphan blob, never a dangling ref.
+      const ref = newRef();
+      secrets.put(ref, secret);
       let account: AccountRecord | null = null;
       mutateLocked((s) => {
         if (findAccount(s, alias)) throw new Error(`account '${alias}' already exists`);
-        const ref = newRef();
-        secrets.put(ref, secret);
         account = makeAccount(alias, ref);
         s.accounts.push(account);
       });
@@ -272,12 +283,16 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
 
     accountUpdate(alias, secret) {
       if (secret.length === 0 || secret.length > 1024) throw new Error("invalid secret");
+      // Resolve the ref outside the lock so the DPAPI spawn (F-08) does not
+      // hold it; the id-keyed re-check below stays authoritative for races
+      // (a concurrent removal surfaces as not-found, never a dangling write).
+      const existing = findAccount(state.read(), alias);
+      if (!existing) throw new Error(`account '${alias}' not found`);
+      secrets.put(existing.secretRef, secret);
       let updated: AccountRecord | null = null;
       mutateLocked((s) => {
-        const account = findAccount(s, alias);
-        if (!account) throw new Error(`account '${alias}' not found`);
-        secrets.put(account.secretRef, secret);
-        const a = s.accounts.find((x) => x.id === account.id)!;
+        const a = s.accounts.find((x) => x.id === existing.id);
+        if (!a) throw new Error(`account '${alias}' not found`);
         a.updatedAtUtc = new Date().toISOString();
         updated = a;
       });
