@@ -212,6 +212,15 @@ public sealed class ControlClient : IControlChannel
                 {
                     SetState(ClientState.AuthFailed, hello.ErrorMessage ?? "Authentication with the control service failed.");
                 }
+                else
+                {
+                    // Non-auth rejection (e.g. version mismatch): the pipe never
+                    // completed authentication, so it must not stay usable for
+                    // later CallAsync writes. Close it; the read loop exits and
+                    // ConnectAsync retries with backoff.
+                    SetState(ClientState.Reconnecting, hello.ErrorMessage ?? "Control service rejected the connection.");
+                    ClosePipe();
+                }
 
                 return false;
             }
