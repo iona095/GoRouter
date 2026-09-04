@@ -196,8 +196,13 @@ internal class ActionButton : Button, IThemeAware
         Font = VisualTheme.BodyFont;
         UseVisualStyleBackColor = false;
         Cursor = Cursors.Hand;
-        Height = 30;
-        MinimumSize = new Size(0, 30);
+        // Breathing room: generous side padding so labels never sit on
+        // the border; content-sized width with a 32px height floor for an
+        // easy pointer target.
+        Padding = new Padding(14, 0, 14, 0);
+        AutoSize = true;
+        AutoSizeMode = AutoSizeMode.GrowAndShrink;
+        MinimumSize = new Size(0, 32);
     }
 
     internal static ActionButton Danger(string text)

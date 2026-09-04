@@ -398,14 +398,15 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Router controls",
         };
         // Outlined action buttons: Stop is danger-red, Start neutral-blue.
-        // Enablement stays truthful (UpdateLifecycleButtons); the labels and
-        // operations are the existing V1.5 semantics (there is no router.restart).
-        _btnStopRouter = ActionButton.Danger("Stop router");
-        _btnStopRouter.Margin = new Padding(6, 0, 0, 0);
+        // Short labels (the AccessibleNames carry the full verbs) so the
+        // band never overflows: state context sits right beside them in the
+        // badge. Enablement stays truthful (UpdateLifecycleButtons).
+        _btnStopRouter = ActionButton.Danger("Stop");
+        _btnStopRouter.Margin = new Padding(8, 0, 0, 0);
         _btnStopRouter.TabIndex = 4;
         _btnStopRouter.AccessibleName = "Stop router";
-        _btnStartRouter = ActionButton.Neutral("Start router");
-        _btnStartRouter.Margin = new Padding(6, 0, 0, 0);
+        _btnStartRouter = ActionButton.Neutral("Start");
+        _btnStartRouter.Margin = new Padding(8, 0, 0, 0);
         _btnStartRouter.TabIndex = 3;
         _btnStartRouter.AccessibleName = "Start router";
         right.Controls.Add(_btnStopRouter);
@@ -415,7 +416,7 @@ public sealed class ControlCenterForm : Form
         // RightToLeft flow. Text names the TARGET (Dark while light is
         // active). Glyph-free by design (no font-fallback risk).
         _btnTheme = new ActionButton { Text = "Dark" };
-        _btnTheme.Margin = new Padding(6, 0, 0, 0);
+        _btnTheme.Margin = new Padding(8, 0, 0, 0);
         _btnTheme.TabIndex = 2;
         _btnTheme.AccessibleName = "Toggle color theme";
         right.Controls.Add(_btnTheme);
