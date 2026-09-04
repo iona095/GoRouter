@@ -22,6 +22,30 @@ Contract: `gorouter-v1-long-horizon-r4` (see `Notes/OpenCode_GoRouter_V1_Long_Ho
 
 ---
 
+## Status
+
+- **V1 router (complete)** — loopback proxy, DPAPI secret store, SQLite
+  request journal, full CLI. Single-user loopback threat model:
+  credential-in-memory, pipe-auth, availability-only residual risks.
+- **V1.5 desktop (complete)** — system tray, control center, router
+  supervision, per-user start-at-login. The CLI remains authoritative;
+  every GUI action runs the same shared domain operations.
+- **Models catalog + DSH sync (complete)** — upstream catalog refresh
+  with cross-process single-flight, approval-gated sync of owned-provider
+  model lists into the DSH settings file (one-time init, legacy-migration
+  ratification, per-tuple approve/revoke), probe-based account testing
+  with quota-aware classification.
+- **Quality gates (all passing)** — `bun test`: 472 tests across 21
+  files, 0 failures; `bun run typecheck` clean; desktop shell Release
+  build with 0 errors.
+- **Adversarial review (closed)** — hostile read-only review loops over
+  the control plane, data plane, models sync and C# shell all verified
+  to CONFIRMED with behavior-seam regression tests. Two findings were
+  deliberately declined (shutdown-path-only teardown block; verbatim
+  lane-id matching that fails closed) — see git history.
+
+---
+
 ## Requirements
 
 - Windows 10/11, PowerShell 5.1 (Windows PowerShell — ships with Windows).
@@ -149,6 +173,12 @@ selected account's key at the upstream boundary.
 | `journal stats` | journal schema/records/retention/degraded |
 | `config show` / `config set <key> <value>` | settings (port, host, upstreams, retention) |
 | `serve [--port N] [--host H]` | run the router |
+| `models refresh [--json]` | refresh upstream model catalog (single-flight, cross-process claim) |
+| `models diff [--json]` | model changes since last publish |
+| `models approvals status [--json]` | approval store + eligibility state |
+| `models approvals approve <id> --lane go\|zen` | approve a model (first approval initializes the store) |
+| `models approvals revoke <id> --lane go\|zen` | revoke a model approval |
+| `models approvals migrate --apply` | ratify legacy DSH entries into approvals |
 | `reset --yes` | remove all accounts, secrets and the local credential (settings and the journal are retained) |
 
 > V1.5 CLI behavior notes: `account rename` now prints the truthful
