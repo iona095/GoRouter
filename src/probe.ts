@@ -45,6 +45,10 @@ function classify(lane: "go" | "zen", status: number | null, errorType: string |
   if (status === 429 && (errorType === "GoUsageLimitError" || errorType === "CreditsError")) {
     return "AUTH_PASS_QUOTA_STATE";
   }
+  // 404 is routing failure, not key evidence (D-10): a retired probe-model
+  // id, a wrong endpoint path, or an unknown model all 404 — none of them
+  // says anything about the credential, so UNKNOWN, never AUTH_PASS_*.
+  if (status === 404) return "UNKNOWN";
   // Any other credential-dependent upstream/provider state: the gateway
   // accepted the key (an invalid key is always 401 AuthError on this surface).
   if (status >= 400 && errorType && errorType !== "AuthError") return "AUTH_PASS_UPSTREAM_STATE";

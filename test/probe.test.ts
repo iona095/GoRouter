@@ -47,6 +47,13 @@ describe("probe classification", () => {
     expect(r.verdict).toBe("AUTH_PASS_UPSTREAM_STATE");
   });
 
+  test("404 with structured error type -> UNKNOWN (routing failure, not key evidence; D-10)", async () => {
+    const r = await probeWith(() =>
+      Response.json({ error: { type: "NotFoundError", message: "Model mimo-v2.5-free does not exist." } }, { status: 404 }),
+    );
+    expect(r.verdict).toBe("UNKNOWN");
+  });
+
   test("generic 500 without error type -> UNKNOWN (not proof)", async () => {
     const r = await probeWith(() => new Response("boom", { status: 500 }));
     expect(r.verdict).toBe("UNKNOWN");
