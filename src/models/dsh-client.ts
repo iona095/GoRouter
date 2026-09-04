@@ -209,12 +209,16 @@ async function renderSettingsYaml(
     const check = await parseSettingsYaml(out);
     const ns = (check[DSH_NAMESPACE] as Record<string, unknown> | undefined) ?? {};
     const provs = (ns["providers"] as Record<string, unknown> | undefined) ?? {};
-    const ids = (lane: string): string[] =>
-      (((provs[lane] as Record<string, unknown> | undefined)?.["models"] as ModelEntry[] | undefined) ?? []).map((m) => m.id);
-    const wantGo = desiredGo.map((m) => m.id);
-    const wantZen = desiredZen.map((m) => m.id);
-    if (JSON.stringify(ids("gorouter-go")) !== JSON.stringify(wantGo)) return fallback;
-    if (JSON.stringify(ids("gorouter-zen")) !== JSON.stringify(wantZen)) return fallback;
+    // Full-entry comparison (not ids only): blind to field loss otherwise,
+    // and vacuous when both lanes are empty. Parsed-value comparison, so
+    // YAML scalar styling (quotes, flow) cannot false-trigger.
+    const modelsOf = (lane: string): ModelEntry[] =>
+      ((provs[lane] as Record<string, unknown> | undefined)?.["models"] as ModelEntry[] | undefined) ?? [];
+    // JSON-normalized both sides: undefined-valued keys (dropped by JSON,
+    // possibly nulled by YAML) must not false-trigger the fallback.
+    const norm = (v: unknown): string => JSON.stringify(JSON.parse(JSON.stringify(v)));
+    if (norm(modelsOf("gorouter-go")) !== norm(desiredGo)) return fallback;
+    if (norm(modelsOf("gorouter-zen")) !== norm(desiredZen)) return fallback;
     return out;
   } catch {
     return fallback;
