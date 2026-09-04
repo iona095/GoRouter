@@ -447,9 +447,19 @@ export const DSH_HTTP_TIMEOUT_MS = 10_000;
  * spuriously under load, and 0/negative/NaN abort immediately or throw. */
 export const MIN_DSH_TIMEOUT_MS = 1_000;
 
+/**
+ * Ceiling: AbortSignal.timeout throws RangeError past ~2^31-1ms (misreported
+ * as 'unreachable' by the catch below), and anything past minutes on a
+ * localhost RPC is a config smell. Oversize budgets clamp to the default.
+ */
+export const MAX_DSH_TIMEOUT_MS = 300_000;
+
 /** Clamp an explicit timeout to the sane range (test seam: pure). */
 export function clampDshTimeoutMs(t: number | undefined): number {
-  return Number.isFinite(t) && (t as number) >= MIN_DSH_TIMEOUT_MS ? Math.floor(t as number) : DSH_HTTP_TIMEOUT_MS;
+  if (!Number.isFinite(t)) return DSH_HTTP_TIMEOUT_MS;
+  const ms = Math.floor(t as number);
+  if (ms < MIN_DSH_TIMEOUT_MS || ms > MAX_DSH_TIMEOUT_MS) return DSH_HTTP_TIMEOUT_MS;
+  return ms;
 }
 
 export class HttpDshClient implements DshClient {

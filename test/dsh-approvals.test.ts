@@ -518,6 +518,23 @@ describe("migration", () => {
     expect(loaded.store.approvals).toEqual(preview.candidates.map((c) => ({ ...c, approvedAtUtc: BASE_ISO, source: "legacy-migration" })));
   });
 
+  test("validation->init DSH drift rolls back instead of keeping stale approvals", async () => {
+    const { paths } = freshPaths();
+    const snap = snapshotOf([makeModel("g1")], [makeModel("z1")], 2);
+    const preview = computeMigrationPreview(snap, 8787, BASE_ISO);
+    // A concurrent DSH writer lands between validation and the post-apply
+    // re-read: the second read sees a new model (new revision), so the
+    // ratified proposal no longer describes reality.
+    let calls = 0;
+    const drifting = async () => (++calls === 1 ? snap : snapshotOf([makeModel("g1"), makeModel("g2")], [makeModel("z1")], 3));
+    const res = await applyMigration(paths, drifting, preview.proposalId, 8787, { nowIso: BASE_ISO });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.reason).toMatch(/drifted|rolled back/);
+    // Rolled back: no stale-approval store survives the drifted apply.
+    expect(loadApprovalStore(paths).state).toBe("absent");
+  });
+
   test("apply refuses when store exists in any state", async () => {
     const snap = snapshotOf([makeModel("g1")], [makeModel("z1")], 2);
     const id = computeMigrationPreview(snap, 8787, BASE_ISO).proposalId;

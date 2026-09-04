@@ -124,7 +124,11 @@ export interface StateStore {
   health(): { corrupt: boolean };
 }
 
-export function createStateStore(paths: Paths, secrets: SecretStore): StateStore {
+export function createStateStore(paths: Paths, secrets: SecretStore, opts: { quarantine?: typeof quarantineCorruptFile } = {}): StateStore {
+  // Test seam (precedent: setInboundBodyIdleTimeoutForTests): inject a
+  // failing quarantine to pin the refuse-while-unpreserved path, which real
+  // filesystems trigger only on rare rename failures.
+  const quarantineFile = opts.quarantine ?? quarantineCorruptFile;
   let cache: { mtimeMs: number; size: number; state: StateFile } | null = null;
   let corrupt = false;
 
@@ -132,7 +136,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
   let lastQuarantine: string | null = null;
 
   function quarantine(p: string): void {
-    const backup = quarantineCorruptFile(p, "state.json");
+    const backup = quarantineFile(p, "state.json");
     if (backup) lastQuarantine = backup;
   }
 
@@ -140,10 +144,11 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
    * Fail-closed writes (B0): once load() has seen corruption, the in-memory
    * state is defaults — committing it would wipe the only good copy
    * (accounts, routes, refs) the moment any mutation runs. Refuse until the
-   * operator restores a backup or deletes state.json and re-runs setup
-   * (fresh processes have no flag, so the documented repair path works).
-   * Healing happens only via load(): an externally restored file parses and
-   * clears the flag on the next read.
+   * operator restores a backup or deletes state.json and re-runs setup.
+   * Healing happens via load(): an externally restored file parses and
+   * clears the flag on the next read, and a missing file clears it too (the
+   * evidence was quarantined away or deliberately deleted — no good copy
+   * remains on disk, so re-setup is the repair, in-process or fresh).
    */
   function refuseIfCorrupt(): void {
     if (!corrupt) return;
@@ -155,7 +160,18 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
 
   function load(): StateFile {
     const p = paths.stateJson;
-    if (!existsSync(p)) return defaultState();
+    if (!existsSync(p)) {
+      // Missing file heals the corrupt flag in-process: no good copy remains
+      // on disk (we quarantined it away, or the operator deleted it per the
+      // refusal message), so serving defaults and allowing re-setup is the
+      // documented repair — the same-process delete+setup path must not wedge.
+      if (corrupt) {
+        log.warn(`state.json absent; clearing corrupt flag (evidence${lastQuarantine ? ` preserved at ${lastQuarantine}` : " was never quarantined — operator reset"}); repair via setup allowed`);
+        corrupt = false;
+        cache = null;
+      }
+      return defaultState();
+    }
     const st = statSync(p);
     if (cache && cache.mtimeMs === st.mtimeMs && cache.size === st.size) return cache.state;
     let raw: string;
@@ -180,6 +196,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
     }
     const state = normalizeState(parsed);
     corrupt = false;
+    lastQuarantine = null; // healed: prior evidence is superseded, never name it again
     cache = { mtimeMs: st.mtimeMs, size: st.size, state };
     return state;
   }

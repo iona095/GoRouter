@@ -13,8 +13,9 @@
  * material drift rejects the apply with zero writes.
  */
 import { createHash } from "node:crypto";
-import { OWNED_DSH_PROVIDERS, initializeApprovalStore, loadApprovalStore } from "./dsh-approvals.ts";
-import { withFileLock, lockPathFor } from "../lock.ts";
+import { OWNED_DSH_PROVIDERS, initializeApprovalStore, loadApprovalStore, approvalStorePathFor } from "./dsh-approvals.ts";
+import { withFileLockAsync, lockPathFor } from "../lock.ts";
+import { tryUnlink } from "../util.ts";
 import { checkOwnedProviderBindings, type BindingCheck } from "./dsh-binding.ts";
 import type { ApprovalTuple } from "./dsh-approvals.ts";
 import type { Lane } from "../state.ts";
@@ -136,7 +137,9 @@ export async function applyMigration(
   }
   // Authoritative gate under the lock: re-read the store AFTER validation,
   // immediately before init, so a concurrent apply cannot slip through.
-  return withFileLock(lockPathFor(paths.state), 30_000, () => {
+  // Async lock: this runs on the live server loop, where the sync variant's
+  // busy-spin would freeze request handling for up to 30s on contention.
+  const applied = await withFileLockAsync(lockPathFor(paths.state), 30_000, () => {
     const live = loadApprovalStore(paths);
     if (live.state === "initialized") {
       return { ok: false as const, reason: "approval store initialized concurrently; legacy migration is one-time and refuses to import additional entries" };
@@ -150,4 +153,33 @@ export async function applyMigration(
     initializeApprovalStore(paths, candidates, "legacy-migration", opts);
     return { ok: true as const, candidates, proposalId };
   });
+  if (!applied.ok) return applied;
+  // Post-apply DSH re-validation (verify-after-mutate): the snapshot was
+  // read BEFORE the lock, so a concurrent DSH writer could have changed
+  // settings between validation and init. Re-read now; on drift, roll back
+  // OUR store (tuple-set match proves no one else wrote) and report — never
+  // keep stale approvals the operator never ratified.
+  const snap2 = await readSnapshot();
+  const bindings2 = snap2 ? checkOwnedProviderBindings(snap2, expectedPort) : null;
+  const drifted =
+    !snap2 || !bindings2?.valid ||
+    migrationProposalId(deriveCandidates(snap2), bindings2, snap2.revision) !== proposalId;
+  if (!drifted) return applied;
+  const rolledBack = await withFileLockAsync(lockPathFor(paths.state), 30_000, () => {
+    const live = loadApprovalStore(paths);
+    if (live.state !== "initialized") return true; // nothing to undo
+    const ours = new Set(candidates.map((t) => `${t.lane}/${t.dshProviderId}/${t.apiProtocol}/${t.modelId}`));
+    const same =
+      live.store.approvals.length === ours.size &&
+      live.store.approvals.every((r) => r.source === "legacy-migration" && ours.has(`${r.lane}/${r.dshProviderId}/${r.apiProtocol}/${r.modelId}`));
+    if (!same) return false; // someone else wrote: keep, report, never delete
+    tryUnlink(approvalStorePathFor(paths));
+    return true;
+  });
+  return {
+    ok: false as const,
+    reason: rolledBack
+      ? "DSH settings drifted between validation and apply; the migration was rolled back — re-run migration preview and ratify the new proposal"
+      : "DSH settings drifted between validation and apply and the store no longer matches this migration; refusing to roll back foreign writes — inspect the approval store manually",
+  };
 }

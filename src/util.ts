@@ -100,7 +100,11 @@ export function tryUnlink(file: string): void {
 export function quarantineCorruptFile(p: string, label: string, keepNewest = 5): string | null {
   try {
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    const backup = `${p}.corrupt-${ts}`;
+    // Random suffix: two quarantines within the same ISO-ms must not collide
+    // (a failed second rename would leave the refusal message naming stale
+    // evidence). Sort order stays chronological (ts prefix dominates).
+    const nonce = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, "0");
+    const backup = `${p}.corrupt-${ts}-${nonce}`;
     renameSync(p, backup);
     log.warn(`${label} quarantined to ${backup}`);
     try {

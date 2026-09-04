@@ -97,7 +97,45 @@ export function withFileLock<T>(lockPath: string, timeoutMs: number, fn: () => T
   }
 }
 
-/** Best-effort removal (used by reset/cleanup paths). */
+/**
+ * Async variant of withFileLock: identical exclusive-create + liveness
+ * semantics, but the wait yields the event loop (Bun.sleep) instead of
+ * busy-spinning it. REQUIRED for callers on a live server loop (e.g. an
+ * async migration racing routine state writers): the sync variant would
+ * freeze all request handling for up to timeoutMs on contention. Sync
+ * contexts (domain mutations) keep withFileLock.
+ */
+export async function withFileLockAsync<T>(lockPath: string, timeoutMs: number, fn: () => T): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let fd: number | null = null;
+  for (;;) {
+    try {
+      fd = openSync(lockPath, "wx");
+      writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+      break;
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code !== "EEXIST") throw e;
+      try {
+        const st = statSync(lockPath);
+        if (!isLockHolderAlive(lockPath) && Date.now() - st.mtimeMs > STALE_MS) {
+          try { unlinkSync(lockPath); } catch { /* raced */ }
+          continue;
+        }
+      } catch { continue; }
+      if (Date.now() >= deadline) throw new Error("state lock timeout");
+      await Bun.sleep(RETRY_INTERVAL_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* ignore */ }
+      try { unlinkSync(lockPath); } catch { /* ignore */ }
+    }
+  }
+}
 export function removeStaleLock(lockPath: string): void {
   try {
     if (existsSync(lockPath)) unlinkSync(lockPath);

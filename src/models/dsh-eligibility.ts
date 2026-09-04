@@ -97,7 +97,9 @@ function deriveLane(
   // Upstream -> DSH-file boundary (H2): newly-eligible entries are copied from
   // upstream registry data, so sanitize before they reach another application's
   // config file. Survivors below come from the operator's own DSH file and keep
-  // their overrides verbatim by contract. Sanitizer refusals are collected
+  // their overrides verbatim by contract — the guard is deliberately
+  // one-directional: pre-existing DSH-file content is trusted implicitly, so
+  // a deep/oversize survivor stays desired and never appears in sanitizedOut. Sanitizer refusals are collected
   // (not silently dropped) so the id appears in sanitizedOut with a reason.
   const newlyEntries: ModelEntry[] = [];
   const sanitizedOut: string[] = [];

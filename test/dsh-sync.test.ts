@@ -1593,6 +1593,11 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
     expect(clampDshTimeoutMs(NaN)).toBe(10_000);
     expect(clampDshTimeoutMs(undefined)).toBe(10_000);
     expect(clampDshTimeoutMs(1500)).toBe(1500);
+    expect(clampDshTimeoutMs(300_000)).toBe(300_000);
+    // Oversize budgets (incl. past AbortSignal.timeout's RangeError range)
+    // clamp to the default instead of misreporting as unreachable.
+    expect(clampDshTimeoutMs(300_001)).toBe(10_000);
+    expect(clampDshTimeoutMs(2 ** 31)).toBe(10_000);
     const hung = await startMockUpstream(() => new Promise<Response>(() => {}), { idleTimeout: 0 });
     try {
       const client = new HttpDshClient(hung.baseUrl, { timeoutMs: 1500 });

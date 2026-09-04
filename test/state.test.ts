@@ -40,27 +40,45 @@ describe("corrupt state quarantine (F-19)", () => {
     expect(readFileSync(join(dir, backups[0]!), "utf8")).toBe(garbage);
   });
 
-  test("a later mutation REFUSES while corrupt (no silent wipe of the good copy)", () => {
+  test("a later mutation REFUSES while corrupt (no silent wipe of the good copy)", async () => {
     const { dir, stateJson } = freshStateDir();
     writeFileSync(stateJson, "{corrupt");
     const paths = resolvePaths(dir);
-    const store = createStateStore(paths, memSecrets());
-    store.read(); // triggers quarantine
-    // Committing defaults-derived state would wipe the only good copy the
-    // moment any mutation runs — refuse with recovery instructions instead.
+    // Failing quarantine (rare on real filesystems: rename failure) leaves
+    // the corrupt bytes in place with no preserved copy — mutations must
+    // refuse rather than commit defaults over the only copy.
+    const store = createStateStore(paths, memSecrets(), { quarantine: () => null });
+    store.read();
+    expect(store.health()).toEqual({ corrupt: true });
+    expect(existsSync(stateJson)).toBe(true); // quarantine could not move it
     expect(() => store.mutate((s) => { s.settings.port = 9999; }))
       .toThrow(/refusing to write: state\.json is corrupt.*restore a backup or delete state\.json/);
     expect(() => store.write(store.read())).toThrow(/refusing to write/);
-    const backups = readdirSync(dir).filter((f) => f.startsWith("state.json.corrupt-"));
-    expect(backups.length).toBe(1);
-    expect(readFileSync(join(dir, backups[0]!), "utf8")).toBe("{corrupt");
-    expect(existsSync(stateJson)).toBe(false); // nothing committed over it
-    expect(store.health()).toEqual({ corrupt: true }); // still flagged
+    expect(readFileSync(stateJson, "utf8")).toBe("{corrupt"); // untouched
     // Documented repair: operator restores a backup (or deletes the file),
     // and the next load heals the flag.
     writeFileSync(stateJson, JSON.stringify({ schemaVersion: 1, localCredentialRef: null, accounts: [], routes: {}, settings: { port: 9999 } }));
     store.mutate((s) => { s.settings.host = "127.0.0.1"; });
     expect(store.health()).toEqual({ corrupt: false });
+  });
+
+  test("same-process delete+setup repairs: missing file heals the flag (B0)", () => {
+    const { dir, stateJson } = freshStateDir();
+    writeFileSync(stateJson, "{corrupt");
+    const paths = resolvePaths(dir);
+    const store = createStateStore(paths, memSecrets());
+    store.read(); // quarantine moves the only copy away; file now absent
+    expect(existsSync(stateJson)).toBe(false);
+    // The operator follows the refusal message (nothing left to delete — the
+    // quarantine already moved it): the next read finds no file, clears the
+    // flag, and setup-grade mutations work WITHOUT a process restart.
+    store.read();
+    expect(store.health()).toEqual({ corrupt: false });
+    store.mutate((s) => { s.settings.port = 9999; });
+    expect(existsSync(stateJson)).toBe(true);
+    expect(store.read().settings.port).toBe(9999);
+    // Evidence survived the repair for forensics.
+    expect(readdirSync(dir).filter((f) => f.startsWith("state.json.corrupt-"))).toHaveLength(1);
   });
 
   test("valid state never quarantines", () => {

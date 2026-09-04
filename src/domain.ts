@@ -298,11 +298,24 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const ref = newRef();
       secrets.put(ref, secret);
       let account: AccountRecord | null = null;
-      mutateLocked((s) => {
-        if (findAccount(s, alias)) throw new Error(`account '${alias}' already exists`);
-        account = makeAccount(alias, ref);
-        s.accounts.push(account);
-      });
+      try {
+        mutateLocked((s) => {
+          if (findAccount(s, alias)) throw new Error(`account '${alias}' already exists`);
+          account = makeAccount(alias, ref);
+          s.accounts.push(account);
+        });
+      } catch (e) {
+        // The ref is claimed only by the push: a null marker proves no commit
+        // (duplicate race, lock loss) and the blob is a pure orphan — reap.
+        // A non-null marker means the push ran (a later write failure must
+        // keep the blob: the in-memory state references it).
+        if (!account) {
+          try {
+            secrets.delete(ref);
+          } catch { /* best effort */ }
+        }
+        throw e;
+      }
       return viewAccount(state.read(), secrets, account!);
     },
 

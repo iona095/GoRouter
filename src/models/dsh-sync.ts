@@ -252,14 +252,19 @@ async function doReconcile(
       approvedZenIds: approvedZen,
     });
 
-  let derived = deriveFor(snapshot);
-  let observedRevision = snapshot.revision;
   // Sanitizer refusals are operator-visible: without this an approved id
   // would sit in no bucket (not desired, withheld, or absent) and the sync
-  // would perpetually withhold it for no visible reason.
-  if (derived.sanitizedOutGo.length > 0 || derived.sanitizedOutZen.length > 0) {
-    log.warn(`dsh sync withheld by sanitizer (approved but unrepresentable): go=[${derived.sanitizedOutGo.join(",")}] zen=[${derived.sanitizedOutZen.join(",")}]`);
-  }
+  // would perpetually withhold it for no visible reason. Warned on every
+  // fresh derive (initial + conflict-retry re-derives), so an id that becomes
+  // unrepresentable only on a later view cannot go silent.
+  const warnSanitizedOut = (d: { sanitizedOutGo: string[]; sanitizedOutZen: string[] }): void => {
+    if (d.sanitizedOutGo.length > 0 || d.sanitizedOutZen.length > 0) {
+      log.warn(`dsh sync withheld by sanitizer (approved but unrepresentable): go=[${d.sanitizedOutGo.join(",")}] zen=[${d.sanitizedOutZen.join(",")}]`);
+    }
+  };
+  let derived = deriveFor(snapshot);
+  let observedRevision = snapshot.revision;
+  warnSanitizedOut(derived);
 
   // Semantic no-op -> zero mutation
   if (isSemanticNoOp(snapshot.go, snapshot.zen, derived.desiredGo, derived.desiredZen)) {
@@ -476,6 +481,7 @@ async function doReconcile(
           snapshot = fresh;
           observedRevision = fresh.revision;
           derived = deriveFor(fresh);
+          warnSanitizedOut(derived);
           if (isSemanticNoOp(fresh.go, fresh.zen, derived.desiredGo, derived.desiredZen)) {
             const status: DshSyncStatus = {
               enabled: true,
