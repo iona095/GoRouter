@@ -619,6 +619,10 @@ describe("dsh entry boundary guard", () => {
     expect(sanitizeRegistryEntryForDsh({ id: "" })).toBeNull();
     expect(sanitizeRegistryEntryForDsh({ id: "x".repeat(257) })).toBeNull();
     expect(sanitizeRegistryEntryForDsh({ id: "ok" })).toEqual({ id: "ok" });
+    // L1: surrounding whitespace normalizes; blank-after-trim refuses; case kept.
+    expect(sanitizeRegistryEntryForDsh({ id: "  padded  " })).toEqual({ id: "padded" });
+    expect(sanitizeRegistryEntryForDsh({ id: "   " })).toBeNull();
+    expect(sanitizeRegistryEntryForDsh({ id: "Go-A" })).toEqual({ id: "Go-A" });
   });
 
   test("sanitizer refuses adversarial depth before the size bound engages (B4)", () => {

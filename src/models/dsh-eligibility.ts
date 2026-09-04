@@ -152,9 +152,15 @@ function sanitizeValue(value: unknown, depth: number): unknown {
  */
 export function sanitizeRegistryEntryForDsh(entry: ModelEntry): ModelEntry | null {
   if (typeof entry.id !== "string" || entry.id.length === 0 || entry.id.length > 256) return null;
+  // L1: surrounding whitespace is normalized at the boundary (a padded id
+  // from upstream JSON or operator input must meet its approval, not
+  // silently withhold). Case stays significant: provider model ids are
+  // case-sensitive, and lowercasing could merge distinct models.
+  const id = entry.id.trim();
+  if (id.length === 0) return null;
   let clean: unknown;
   try {
-    clean = sanitizeValue(entry, 0);
+    clean = sanitizeValue({ ...entry, id }, 0);
   } catch {
     return null; // depth budget exceeded: refuse, caller records the id
   }
