@@ -128,6 +128,11 @@ public sealed class ControlClient : IControlChannel
     private readonly Dictionary<int, TaskCompletionSource<ControlResponse>> _pending = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
+    // Maximum pipe frame length (F-06): mirrors the service-side 1 MiB line cap
+    // (transport MAX_LINE_BYTES). An unbounded ReadLineAsync lets a corrupt or
+    // hostile peer grow the line string without limit.
+    private const int MaxLineChars = 1 << 20;
+
     private NamedPipeClientStream? _pipe;
     private CancellationTokenSource? _connectCts;
     private int _nextId;
@@ -429,13 +434,64 @@ public sealed class ControlClient : IControlChannel
         }
     }
 
+    /// <summary>Reads one newline-terminated frame with a length cap.
+    /// Returns null on end-of-stream (mirroring ReadLineAsync: a partial final
+    /// line without a terminator is delivered first). Throws
+    /// InvalidDataException when the frame exceeds <see cref="MaxLineChars"/>.
+    /// </summary>
+    private static async Task<string?> ReadBoundedLineAsync(StreamReader reader, CancellationToken ct)
+    {
+        var sb = new StringBuilder();
+        var buf = new char[4096];
+        for (;;)
+        {
+            ct.ThrowIfCancellationRequested();
+            // No char[]/CT overload: pipe disposal surfaces as IOException,
+            // which the caller already treats as a connection error.
+            int n = await reader.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false);
+            if (n == 0)
+            {
+                return sb.Length == 0 ? null : sb.ToString();
+            }
+
+            int start = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (buf[i] != '\n') continue;
+                sb.Append(buf, start, i - start);
+                if (sb.Length > 0 && sb[sb.Length - 1] == '\r') sb.Length--;
+                return sb.ToString();
+            }
+
+            sb.Append(buf, 0, n);
+            if (sb.Length > MaxLineChars)
+            {
+                throw new InvalidDataException($"Control frame exceeded {MaxLineChars} chars.");
+            }
+        }
+    }
+
     private async Task ReadLoopAsync(NamedPipeClientStream pipe, StreamReader reader, CancellationToken ct)
     {
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+                string? line;
+                try
+                {
+                    line = await ReadBoundedLineAsync(reader, ct).ConfigureAwait(false);
+                }
+                catch (InvalidDataException ex)
+                {
+                    // Hostile/corrupt over-cap frame: drop the connection (state
+                    // stays Connected so the finally below reconnects) and record
+                    // why. The unread remainder is discarded with the pipe.
+                    ClosePipe();
+                    SetState(ClientState.Connected, ex.Message);
+                    break;
+                }
+
                 if (line is null)
                 {
                     break;
