@@ -35,14 +35,22 @@ Contract: `gorouter-v1-long-horizon-r4` (see `Notes/OpenCode_GoRouter_V1_Long_Ho
   model lists into the DSH settings file (one-time init, legacy-migration
   ratification, per-tuple approve/revoke), probe-based account testing
   with quota-aware classification.
-- **Quality gates (all passing)** — `bun test`: 472 tests across 21
+- **Performance pass (complete)** — hot-path memos (upstream parse,
+  registry, state), hoisted SQLite prepares, persistent control-plane
+  journal handle with TTL'd aggregates, single-pass header sanitize +
+  credential strip, deferred WAL checkpoint, UI dirty-checks and
+  activity-render throttling. No behavior change; gains are per-request
+  µs-to-ms and per-tick connection/scan elimination.
+- **Quality gates (all passing)** — `bun test`: 475 tests across 21
   files, 0 failures; `bun run typecheck` clean; desktop shell Release
   build with 0 errors.
 - **Adversarial review (closed)** — hostile read-only review loops over
   the control plane, data plane, models sync and C# shell all verified
-  to CONFIRMED with behavior-seam regression tests. Two findings were
-  deliberately declined (shutdown-path-only teardown block; verbatim
-  lane-id matching that fails closed) — see git history.
+  to CONFIRMED with behavior-seam regression tests, including the perf
+  slices (two genuine review catches fixed and re-verified). Three
+  findings were deliberately declined (shutdown-path-only teardown
+  block; verbatim lane-id matching that fails closed; per-account
+  status stats batching, small at current scale) — see git history.
 
 ---
 
