@@ -38,6 +38,7 @@ public sealed class ControlCenterForm : Form
     private Label _lblStateBadge = null!;
     private Label _lblPort = null!;
     private Label _lblVersion = null!;
+    private Label _lblRouteSummary = null!;
     private Button _btnStartRouter = null!;
     private Button _btnStopRouter = null!;
 
@@ -312,7 +313,7 @@ public sealed class ControlCenterForm : Form
         var band = new Panel
         {
             Dock = DockStyle.Top,
-            Height = 52,
+            Height = 76,
             BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = "Status bar",
         };
@@ -324,7 +325,9 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Status bar separator",
         };
 
-        // Stable 7-column grid: identity, dot, badge, port, version, spacer, right
+        // Stable 7-column grid: identity, dot, badge, port, version, spacer,
+        // right. The route summary lives on its own strip below (visual
+        // slice 1) so the band never overflows at any width.
         var bar = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -381,6 +384,18 @@ public sealed class ControlCenterForm : Form
             ForeColor = VisualTheme.SecondaryText,
             AccessibleName = "Desktop version",
         };
+        _lblRouteSummary = new Label
+        {
+            AutoSize = true,
+            Dock = DockStyle.Fill,
+            Font = VisualTheme.BodyFont,
+            Text = "",
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = VisualTheme.SecondaryText,
+            AccessibleName = "Route summary",
+            // own strip below the bar: full width available, no crowding
+
+        };
 
         var right = new FlowLayoutPanel
         {
@@ -417,7 +432,24 @@ public sealed class ControlCenterForm : Form
         bar.Controls.Add(_lblVersion, 4, 0);
         bar.Controls.Add(right, 6, 0);
 
+        // Route-summary strip (visual slice 1): full-width second row of the
+        // band answering "where is traffic going". Fixed height like the bar
+        // (explicit geometry, no mid-layout mutation), aligned to the bar's
+        // 14px left padding.
+        var summaryStrip = new Panel
+        {
+            Dock = DockStyle.Bottom,
+            Height = 24,
+            Padding = new Padding(14, 0, 14, 4),
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = "Route summary strip",
+        };
+        summaryStrip.Controls.Add(_lblRouteSummary);
+
+        // Bottom stack: separator owns the bottom pixel, the strip sits
+        // above it, the bar fills the rest on top.
         band.Controls.Add(bar);
+        band.Controls.Add(summaryStrip);
         band.Controls.Add(separator); // docked last so it owns the top strip
 
         // Responsive two-row layout at narrow widths.
@@ -440,7 +472,8 @@ public sealed class ControlCenterForm : Form
                 // Narrow: two rows.
                 // Row 0: identity, dot, badge
                 // Row 1: port, version (cols 3-4), right buttons (spanning rows)
-                band.Height = 72;
+                // +24 for the route-summary strip below the bar.
+                band.Height = 96;
                 bar.RowCount = 2;
                 bar.RowStyles.Clear();
                 bar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -457,8 +490,8 @@ public sealed class ControlCenterForm : Form
             }
             else if (!narrow && bar.RowCount == 2)
             {
-                // Wide: single row.
-                band.Height = 52;
+                // Wide: single row (+24 summary strip).
+                band.Height = 76;
                 bar.RowCount = 1;
                 bar.RowStyles.Clear();
                 bar.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -1791,6 +1824,10 @@ public sealed class ControlCenterForm : Form
             _statusDot.FillColor = RouterColor(snapshot.Router.State);
             _statusDot.Invalidate();
             UiText.SetIfChanged(_lblPort, $"Port {snapshot.Settings.Port}");
+            // Visual slice 1: route summary in the header band — health +
+            // routing answered in the first glance. Cleared lanes show —.
+            UiText.SetIfChanged(_lblRouteSummary, UiText.Truncate(
+                $"Go \u2192 {(string.IsNullOrEmpty(snapshot.Routes.Go.Alias) ? "\u2014" : snapshot.Routes.Go.Alias)} · Zen \u2192 {(string.IsNullOrEmpty(snapshot.Routes.Zen.Alias) ? "\u2014" : snapshot.Routes.Zen.Alias)}", 44));
             _lblVersion.Text = string.IsNullOrEmpty(PresentationVersion) ? "" : $"v{PresentationVersion}";
             UiText.SetIfChanged(_lblFooterState, UiText.Truncate(FooterStateText(snapshot.Router), 64));
             _lblFooterState.ForeColor = RouterColor(snapshot.Router.State);
