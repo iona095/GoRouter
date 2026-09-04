@@ -62,6 +62,10 @@ function tryClaimRefreshLock(lockPath: string): string | null {
     if ((e as { code?: string }).code !== "EEXIST") throw e;
   }
   // Held: reclaim only when the holder is gone (or the claim is ancient).
+  // Policy note: unlike withFileLock (which never displaces a live holder),
+  // a refresh claim past REFRESH_CLAIM_STALE_MS is reclaimed even if its pid
+  // is alive — a crashed refresh that kept its pid slot (PID reuse) must not
+  // wedge the catalog forever. Double-fetch is the bounded, safe fallout.
   try {
     const st = statSync(lockPath);
     const ageMs = Date.now() - st.mtimeMs;
@@ -84,7 +88,15 @@ function releaseRefreshLock(lockPath: string, nonce: string): void {
         if (Date.now() - st.mtimeMs <= REFRESH_CLAIM_STALE_MS) return;
       } catch { return; }
     }
-  } catch { /* unreadable: fall through to best-effort removal */ }
+  } catch {
+    // Unreadable (EACCES, transient): the claim may be another process's
+    // LIVE file — deleting blind reopens the double-fetch window the claim
+    // exists to close. Only an ancient file may go; otherwise leave it.
+    try {
+      const st = statSync(lockPath);
+      if (Date.now() - st.mtimeMs <= REFRESH_CLAIM_STALE_MS) return;
+    } catch { return; }
+  }
   try { unlinkSync(lockPath); } catch { /* raced or already gone */ }
 }
 
@@ -139,18 +151,32 @@ export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promi
       if (cleared && cur && isFresh(cur, now)) {
         return { success: true, registry: cur, error: null, fromCache: true, diff: cur.lastDiff };
       }
-      return {
-        success: false,
-        registry: cur,
-        error: "another models refresh is in progress; retry shortly",
-        fromCache: true,
-        diff: [],
-      };
+      if (opts.forced) {
+        // Explicit user action outranks dedup: the holder published stale
+        // data, published nothing, or the wait timed out — try to take the
+        // claim ourselves instead of reporting busy.
+        try {
+          nonce = tryClaimRefreshLock(lockPath);
+        } catch {
+          nonce = null;
+        }
+      }
+      if (nonce === null) {
+        return {
+          success: false,
+          registry: cur,
+          error: "another models refresh is in progress; retry shortly",
+          // Not from cache: this is a busy-failure, and callers branch on
+          // fromCache to decide cache-vs-failure handling.
+          fromCache: false,
+          diff: [],
+        };
+      }
     }
     try {
       return await doRefresh(paths, opts);
     } finally {
-      releaseRefreshLock(lockPath, nonce);
+      if (nonce !== null) releaseRefreshLock(lockPath, nonce);
     }
   })().finally(() => {
     inFlight = null;

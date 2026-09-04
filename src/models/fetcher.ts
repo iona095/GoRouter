@@ -63,9 +63,13 @@ function normalizeModelsResponse(raw: unknown, lane: Lane): ModelEntry[] {
     const rec = el as Record<string, unknown>;
     const id = rec.id;
     if (typeof id !== "string" || id.trim().length === 0) throw new Error(`lane ${lane}: data[${i}] missing non-empty string id`);
-    if (id.trim().length > MAX_MODEL_ID_LENGTH) throw new Error(`lane ${lane}: data[${i}] id too long (over ${MAX_MODEL_ID_LENGTH} chars)`);
-    if (seen.has(id)) throw new Error(`lane ${lane}: duplicate model id '${id}'`);
-    seen.add(id);
+    // Validate AND dedup on the trimmed form (storage stays verbatim):
+    // "m" vs " m " would otherwise bypass the duplicate gate yet denote
+    // the same model downstream.
+    const norm = id.trim();
+    if (norm.length > MAX_MODEL_ID_LENGTH) throw new Error(`lane ${lane}: data[${i}] id too long (over ${MAX_MODEL_ID_LENGTH} chars)`);
+    if (seen.has(norm)) throw new Error(`lane ${lane}: duplicate model id '${norm}'`);
+    seen.add(norm);
     // preserve verbatim but guarantee id is present
     out.push(el as ModelEntry);
   }

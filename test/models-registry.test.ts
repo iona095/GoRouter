@@ -351,6 +351,12 @@ describe("fetcher normalization", () => {
 
   test("duplicate ids within one lane cause failure", () => {
     expect(() => normalizeModelsResponse({ object: "list", data: [{ id: "dup" }, { id: "dup" }] }, "go")).toThrow(/duplicate/);
+    // Whitespace variants denote the same model: the gate compares trimmed.
+    expect(() => normalizeModelsResponse({ object: "list", data: [{ id: "m" }, { id: " m " }] }, "go")).toThrow(/duplicate/);
+    expect(() => normalizeModelsResponse({ object: "list", data: [{ id: "m" }, { id: "m" }] }, "zen")).toThrow(/duplicate/);
+    // Storage itself stays verbatim (only the gate normalizes).
+    const kept = normalizeModelsResponse({ object: "list", data: [{ id: " m ", extra: 1 }] }, "go");
+    expect((kept[0] as unknown as { id: string }).id).toBe(" m ");
   });
 
   test("duplicate across lanes is fine (per-lane validation only)", () => {
@@ -752,9 +758,29 @@ describe("cross-process refresh claim (M2)", () => {
     expect(Date.now() - started).toBeLessThan(10000);
     expect(fetchCalled).toBe(0);
     expect(res.success).toBe(false);
-    expect(res.fromCache).toBe(true);
+    // Busy-failure is not from cache: fromCache:true would mislead
+    // cache-vs-failure branching into treating this as usable data.
+    expect(res.fromCache).toBe(false);
     expect(res.error).toMatch(/in progress/);
     rmSync(lock, { force: true });
+  }, { timeout: 15000 });
+
+  test("forced waiter re-claims when the holder vanishes without publishing", async () => {
+    clearRefreshSingleFlightForTests();
+    const { paths } = freshPaths();
+    const lock = refreshLockPath(paths);
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, ts: Date.now(), nonce: "squatter" }));
+    let fetchCalled = 0;
+    const fetchFn: FetchFn = async () => { fetchCalled++; return Response.json({ object: "list", data: [{ id: "m1" }] }); };
+    const p = refreshRegistry(paths, { upstreamGo: UGO, upstreamZen: UZEN, fetchFn, forced: true, refreshWaitMs: 5000 });
+    // Holder vanishes mid-wait having published nothing: an explicit user
+    // action must take the claim itself, not report busy.
+    await new Promise((r) => setTimeout(r, 200));
+    rmSync(lock, { force: true });
+    const res = await p;
+    expect(fetchCalled).toBe(2); // one fetch per lane: the waiter did its own refresh
+    expect(res.success).toBe(true);
+    expect(res.fromCache).toBe(false);
   }, { timeout: 15000 });
 });
 

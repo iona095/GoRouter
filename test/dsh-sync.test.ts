@@ -620,6 +620,36 @@ describe("dsh entry boundary guard", () => {
     expect(sanitizeRegistryEntryForDsh({ id: "x".repeat(257) })).toBeNull();
     expect(sanitizeRegistryEntryForDsh({ id: "ok" })).toEqual({ id: "ok" });
   });
+
+  test("sanitizer refuses adversarial depth before the size bound engages (B4)", () => {
+    // 200 nested levels, tiny serialized size: without a depth budget the
+    // traversal recurses 200 deep before the 8KiB check can engage.
+    let deep: Record<string, unknown> = { leaf: "x" };
+    for (let i = 0; i < 200; i++) deep = { nest: deep };
+    expect(sanitizeRegistryEntryForDsh({ id: "deep", ...deep } as unknown as ModelEntry)).toBeNull();
+    // Sane depth still passes.
+    let shallow: Record<string, unknown> = { leaf: "x" };
+    for (let i = 0; i < 10; i++) shallow = { nest: shallow };
+    expect(sanitizeRegistryEntryForDsh({ id: "shallow", ...shallow } as unknown as ModelEntry)).not.toBeNull();
+  });
+
+  test("sanitizer refusals surface as sanitizedOut, never a silent hole (B4)", () => {
+    const big = { id: "huge", pad: "x".repeat(9 * 1024) } as unknown as ModelEntry;
+    const res = deriveApprovalDesiredDshState({
+      currentGo: [],
+      currentZen: [],
+      registryGo: [makeModel("small"), big],
+      registryZen: [],
+      approvedGoIds: new Set(["small", "huge"]),
+      approvedZenIds: new Set(),
+    });
+    // huge is approved + registry-present but unrepresentable: it must not
+    // vanish between buckets — desired excludes it, sanitizedOut names it.
+    expect(res.desiredGo.map((m) => m.id)).toEqual(["small"]);
+    expect(res.sanitizedOutGo).toEqual(["huge"]);
+    expect(res.withheldGo).toEqual([]);
+    expect(res.approvedAbsentGo).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -664,6 +694,16 @@ describe("deterministic ordering", () => {
     expect(isSemanticNoOp(cur, [], reordered, [])).toBe(true);
     const changed = [makeModel("a", { meta: { x: 2, y: [1, 2] } })];
     expect(isSemanticNoOp(cur, [], changed, [])).toBe(false);
+  });
+
+  test("own __proto__ data properties compare by value, never via the prototype (B6)", () => {
+    // JSON.parse installs __proto__ as an OWN data property that shadows
+    // Object.prototype — the comparator must read the value, not the proto.
+    const a = [JSON.parse(`{ "id": "a", "__proto__": { "x": 1 } }`) as unknown as ModelEntry];
+    const same = [JSON.parse(`{ "__proto__": { "x": 1 }, "id": "a" }`) as unknown as ModelEntry];
+    expect(isSemanticNoOp(a, [], same, [])).toBe(true);
+    const different = [JSON.parse(`{ "id": "a", "__proto__": { "x": 2 } }`) as unknown as ModelEntry];
+    expect(isSemanticNoOp(a, [], different, [])).toBe(false);
   });
 
   test("key-reordered commit verifies clean: current, not a phantom pending (M4)", async () => {
@@ -1545,14 +1585,24 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
   });
 
   test("HttpDshClient rpc times out against a hung host instead of stalling (M6)", async () => {
-    const { HttpDshClient, DshUnavailableError } = await import("../src/models/dsh-client.ts");
+    const { HttpDshClient, DshUnavailableError, clampDshTimeoutMs } = await import("../src/models/dsh-client.ts");
+    // Clamp seam: sub-second/degenerate budgets floor to the sane default.
+    expect(clampDshTimeoutMs(300)).toBe(10_000);
+    expect(clampDshTimeoutMs(0)).toBe(10_000);
+    expect(clampDshTimeoutMs(-5)).toBe(10_000);
+    expect(clampDshTimeoutMs(NaN)).toBe(10_000);
+    expect(clampDshTimeoutMs(undefined)).toBe(10_000);
+    expect(clampDshTimeoutMs(1500)).toBe(1500);
     const hung = await startMockUpstream(() => new Promise<Response>(() => {}), { idleTimeout: 0 });
     try {
-      const client = new HttpDshClient(hung.baseUrl, { timeoutMs: 300 });
+      const client = new HttpDshClient(hung.baseUrl, { timeoutMs: 1500 });
       const started = Date.now();
       await expect(client.read()).rejects.toThrow(DshUnavailableError);
-      // ~300ms client timeout, not an indefinite stall
-      expect(Date.now() - started).toBeLessThan(5000);
+      // ~1500ms client timeout honored (lower bound: not an instant abort;
+      // upper bound: not an indefinite stall).
+      const elapsed = Date.now() - started;
+      expect(elapsed).toBeGreaterThanOrEqual(1000);
+      expect(elapsed).toBeLessThan(8000);
     } finally {
       hung.stop();
     }

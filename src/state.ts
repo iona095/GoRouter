@@ -8,10 +8,9 @@
  * file per request, so a CLI route change takes effect for the next request
  * without a router restart while every request uses one coherent snapshot.
  */
-import { readFileSync, existsSync, statSync, renameSync, readdirSync, unlinkSync } from "node:fs";
-import { dirname, basename } from "node:path";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { atomicWriteJson, log } from "./util.ts";
+import { atomicWriteJson, log, quarantineCorruptFile } from "./util.ts";
 import type { SecretStore } from "./secret-store.ts";
 import type { Paths } from "./paths.ts";
 
@@ -129,28 +128,29 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
   let cache: { mtimeMs: number; size: number; state: StateFile } | null = null;
   let corrupt = false;
 
-  /**
-   * Quarantine corrupt/unreadable state.json evidence (F-19): move the bad
-   * file to a timestamped backup (bounded to the newest few) so a later
-   * mutation cannot silently overwrite the only copy. Best effort — serving
-   * defaults must never fail because the backup did.
-   */
+  // Path of the most recent quarantine backup (for refusal messages).
+  let lastQuarantine: string | null = null;
+
   function quarantine(p: string): void {
-    try {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      const backup = `${p}.corrupt-${ts}`;
-      renameSync(p, backup);
-      log.warn(`state.json quarantined to ${backup}`);
-      try {
-        const prefix = `${basename(p)}.corrupt-`;
-        const olds = readdirSync(dirname(p)).filter((f) => f.startsWith(prefix)).sort();
-        for (const f of olds.slice(0, Math.max(0, olds.length - 5))) {
-          try { unlinkSync(`${dirname(p)}/${f}`); } catch { /* best effort */ }
-        }
-      } catch { /* pruning is optional */ }
-    } catch (e) {
-      log.warn(`state.json quarantine failed: ${e instanceof Error ? e.message : String(e)}`);
-    }
+    const backup = quarantineCorruptFile(p, "state.json");
+    if (backup) lastQuarantine = backup;
+  }
+
+  /**
+   * Fail-closed writes (B0): once load() has seen corruption, the in-memory
+   * state is defaults — committing it would wipe the only good copy
+   * (accounts, routes, refs) the moment any mutation runs. Refuse until the
+   * operator restores a backup or deletes state.json and re-runs setup
+   * (fresh processes have no flag, so the documented repair path works).
+   * Healing happens only via load(): an externally restored file parses and
+   * clears the flag on the next read.
+   */
+  function refuseIfCorrupt(): void {
+    if (!corrupt) return;
+    throw new Error(
+      `refusing to write: state.json is corrupt${lastQuarantine ? ` (evidence at ${lastQuarantine})` : ""}; ` +
+      `restore a backup or delete state.json and re-run setup`,
+    );
   }
 
   function load(): StateFile {
@@ -185,11 +185,9 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
   }
 
   function write(state: StateFile): void {
+    refuseIfCorrupt();
     atomicWriteJson(paths.stateJson, state);
     cache = null; // force a fresh read next time
-    // A completed atomic write means the on-disk state is known-good again:
-    // clear a stale corruption flag (a failed write throws, leaving it set).
-    corrupt = false;
   }
 
   return {
@@ -197,6 +195,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore): StateStore
     write,
     mutate(fn) {
       const state = load();
+      refuseIfCorrupt();
       fn(state);
       write(state);
       return state;

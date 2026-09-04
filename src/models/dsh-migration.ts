@@ -14,6 +14,7 @@
  */
 import { createHash } from "node:crypto";
 import { OWNED_DSH_PROVIDERS, initializeApprovalStore, loadApprovalStore } from "./dsh-approvals.ts";
+import { withFileLock, lockPathFor } from "../lock.ts";
 import { checkOwnedProviderBindings, type BindingCheck } from "./dsh-binding.ts";
 import type { ApprovalTuple } from "./dsh-approvals.ts";
 import type { Lane } from "../state.ts";
@@ -87,9 +88,16 @@ export function computeMigrationPreview(snapshot: DshSnapshot, expectedPort: num
  * revision at apply time. Anything material changed => reject, write nothing.
  * One-time: refuses once the store exists in any state.
  *
- * The snapshot is read INSIDE apply (via readSnapshot) immediately before the
- * check-then-init sequence — callers cannot supply a stale or forged snapshot,
- * so the proposal comparison always runs against live DSH state.
+ * The snapshot is read INSIDE apply (via readSnapshot) immediately before
+ * validation — callers cannot supply a stale or forged snapshot, so the
+ * proposal comparison always runs against live DSH state. The final
+ * check-then-init runs under the cross-process file lock with a FRESH store
+ * re-check inside: two concurrent applies cannot both pass the one-time gate
+ * (the loser sees the winner's store and refuses without writing).
+ *
+ * Port drift between preview and apply is fail-closed by construction: the
+ * proposal binds the owned baseURLs (port included) and the bindings gate
+ * names an explicit port mismatch, so drift rejects — never misapplies.
  */
 export async function applyMigration(
   paths: Paths,
@@ -101,15 +109,16 @@ export async function applyMigration(
   if (typeof proposalId !== "string" || proposalId.length === 0) {
     return { ok: false, reason: "missing --proposal identifier" };
   }
-  const store = loadApprovalStore(paths);
-  if (store.state === "initialized") {
+  // Fast pre-check outside the lock (exact error for the common cases).
+  const pre = loadApprovalStore(paths);
+  if (pre.state === "initialized") {
     return { ok: false, reason: "approval store already initialized; legacy migration is one-time and refuses to import additional entries" };
   }
-  if (store.state === "corrupt") {
-    return { ok: false, reason: `approval store corrupt (${store.reason}); refusing to migrate — fix or remove the file manually` };
+  if (pre.state === "corrupt") {
+    return { ok: false, reason: `approval store corrupt (${pre.reason}); refusing to migrate — fix or remove the file manually` };
   }
-  if (store.state === "unsupported-version") {
-    return { ok: false, reason: `approval store schema version ${store.version} unsupported; refusing to migrate` };
+  if (pre.state === "unsupported-version") {
+    return { ok: false, reason: `approval store schema version ${pre.version} unsupported; refusing to migrate` };
   }
   const snapshot = await readSnapshot();
   if (!snapshot) {
@@ -125,6 +134,20 @@ export async function applyMigration(
   if (recomputed !== proposalId) {
     return { ok: false, reason: "proposal mismatch: DSH settings, provider bindings or revision drifted since preview — re-run migration preview and ratify the new proposal" };
   }
-  initializeApprovalStore(paths, candidates, "legacy-migration", opts);
-  return { ok: true, candidates, proposalId };
+  // Authoritative gate under the lock: re-read the store AFTER validation,
+  // immediately before init, so a concurrent apply cannot slip through.
+  return withFileLock(lockPathFor(paths.state), 30_000, () => {
+    const live = loadApprovalStore(paths);
+    if (live.state === "initialized") {
+      return { ok: false as const, reason: "approval store initialized concurrently; legacy migration is one-time and refuses to import additional entries" };
+    }
+    if (live.state === "corrupt") {
+      return { ok: false as const, reason: `approval store corrupt (${live.reason}); refusing to migrate — fix or remove the file manually` };
+    }
+    if (live.state === "unsupported-version") {
+      return { ok: false as const, reason: `approval store schema version ${live.version} unsupported; refusing to migrate` };
+    }
+    initializeApprovalStore(paths, candidates, "legacy-migration", opts);
+    return { ok: true as const, candidates, proposalId };
+  });
 }

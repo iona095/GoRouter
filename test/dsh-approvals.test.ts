@@ -343,10 +343,14 @@ if (process.env.ROLE === "a") {
 `,
     );
 
-    // Hermeticity (F-07): keep the ambient DSH_WEB_URL out of the workers'
-    // environment so file-seam tests cannot flip to the HTTP DSH client.
+    // Hermeticity (F-07): keep the ambient DSH_WEB_URL and DSH_HOME out of
+    // the workers' environment so file-seam tests cannot flip to the HTTP
+    // DSH client or resolve the operator's real settings file. Ambient
+    // DSH_HOME is inert for today's workers (approval store only), but the
+    // suite claims cross-application exclusion — scrub it to keep the claim.
     const baseEnv: Record<string, string | undefined> = { ...process.env, GOROUTER_REPO: repo, GOROUTER_STATE_DIR: st.dir };
     delete baseEnv.DSH_WEB_URL;
+    delete baseEnv.DSH_HOME;
     const pa = Bun.spawn([process.execPath, script], { env: { ...baseEnv, ROLE: "a" }, stdout: "pipe", stderr: "pipe" });
     const pb = Bun.spawn([process.execPath, script], { env: { ...baseEnv, ROLE: "b" }, stdout: "pipe", stderr: "pipe" });
     const [ca, cb] = await Promise.all([pa.exited, pb.exited]);
@@ -488,6 +492,26 @@ describe("migration", () => {
     expect(res.ok).toBe(true);
     if (!res.ok) return;
     expect(res.candidates).toEqual(preview.candidates);
+    const loaded = loadApprovalStore(paths);
+    expect(loaded.state).toBe("initialized");
+    if (loaded.state !== "initialized") return;
+    expect(loaded.store.approvals).toEqual(preview.candidates.map((c) => ({ ...c, approvedAtUtc: BASE_ISO, source: "legacy-migration" })));
+  });
+
+  test("concurrent double-apply: exactly one wins, the loser refuses without writing", async () => {
+    const { paths } = freshPaths();
+    const snap = snapshotOf([makeModel("g1")], [makeModel("z1")], 2);
+    const preview = computeMigrationPreview(snap, 8787, BASE_ISO);
+    // Same proposal racing from two processes: the locked re-check admits
+    // exactly one initializer; the loser refuses (no double import).
+    const [r1, r2] = await Promise.all([
+      applyMigration(paths, async () => snap, preview.proposalId, 8787, { nowIso: BASE_ISO }),
+      applyMigration(paths, async () => snap, preview.proposalId, 8787, { nowIso: BASE_ISO }),
+    ]);
+    const oks = [r1.ok, r2.ok].filter(Boolean).length;
+    expect(oks).toBe(1);
+    const loser = !r1.ok ? r1 : r2;
+    if (!loser.ok) expect(loser.reason).toMatch(/concurrently|already initialized/);
     const loaded = loadApprovalStore(paths);
     expect(loaded.state).toBe("initialized");
     if (loaded.state !== "initialized") return;

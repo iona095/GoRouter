@@ -2,9 +2,9 @@
  * Slice B — narrow persisted DSH sync status (separate from authoritative registry).
  */
 
-import { existsSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { atomicWriteJson, log } from "../util.ts";
+import { atomicWriteJson, log, quarantineCorruptFile } from "../util.ts";
 import type { Paths } from "../paths.ts";
 import { emptyDshSyncStatus, type DshSyncStatus } from "./dsh-types.ts";
 
@@ -30,16 +30,10 @@ export function loadDshSyncStatus(paths: Paths): DshSyncStatus | null {
     return parsed as unknown as DshSyncStatus;
   } catch (e) {
     log.warn(`dsh sync state read failed: ${e instanceof Error ? e.message : String(e)}`);
-    // Quarantine the evidence (F-23) so the next store cannot silently
-    // overwrite the only copy of the corrupt file. Best effort only.
-    try {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      const backup = `${p}.corrupt-${ts}`;
-      renameSync(p, backup);
-      log.warn(`dsh sync state quarantined to ${backup}`);
-    } catch (qe) {
-      log.warn(`dsh sync state quarantine failed: ${qe instanceof Error ? qe.message : String(qe)}`);
-    }
+    // Quarantine the evidence (F-23, shared helper so both state files
+    // prune identically) so the next store cannot silently overwrite the
+    // only copy of the corrupt file. Best effort only.
+    quarantineCorruptFile(p, "dsh sync state");
     return null;
   }
 }

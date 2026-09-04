@@ -270,9 +270,9 @@ async function writeFileAtomic(filename: string, content: string, mode: number =
  *
  * Rationale: filesystem mtime alone (Math.floor(mtimeMs)) collapses to 1ms
  * granularity and can be equal for two distinct writes (coalesced timestamps,
- * VM clock, rapid edit). Content hash cannot collide on same-mtime edits.
- * Hybrid: revision = (hash48 << 0) ^ (mtimeBucket & 0xFFFF) — formally
- * content-hash + mtime hybrid that cannot collide on same-mtime edits.
+ * VM clock, rapid edit). Content hash is the collision-resistant component
+ * (48-bit: same-mtime/different-content edits differ absent a hash
+ * collision); the mtime bucket preserves monotonic ordering across edits.
  */
 /**
  * Content-hash + mtime hybrid revision (M1): 48-bit SHA-256 prefix folded with
@@ -283,14 +283,19 @@ async function writeFileAtomic(filename: string, content: string, mode: number =
  *
  * Note: values differ from pre-fix revisions (which were 32-bit). Revisions
  * are recomputed live from file content on every read, so the only upgrade
- * effect is a single conservative mismatch, never a false match.
+ * effect is a single conservative mismatch, never a false match — but a
+ * preview taken pre-fix and applied post-fix (or vice versa) ALWAYS
+ * mismatches and forces re-preview. Automated preview→ratify→apply flows
+ * must re-preview after upgrading (safe direction: spurious mismatch, not a
+ * false match).
  */
 export function fileContentRevision(text: string, mtimeMs?: number): number {
   const h = createHash("sha256").update(text, "utf8").digest();
   let n = 0;
   for (let i = 0; i < 6; i++) n = n * 256 + h[i]!;
   if (typeof mtimeMs === "number" && Number.isFinite(mtimeMs)) {
-    const bucket = Math.floor(mtimeMs / 1000) % 65536;
+    // Non-negative bucket even for exotic (negative/pre-epoch) mtimes.
+    const bucket = ((Math.floor(mtimeMs / 1000) % 65536) + 65536) % 65536;
     // Clear the low 16 bits arithmetically, then add the bucket.
     n = n - (n % 65536) + bucket;
   }
@@ -438,6 +443,15 @@ export class FileDshClient implements DshClient {
  * reconcile single-flight indefinitely (M6). Generous for localhost. */
 export const DSH_HTTP_TIMEOUT_MS = 10_000;
 
+/** Floor for explicit RPC timeouts: sub-second budgets abort localhost RPCs
+ * spuriously under load, and 0/negative/NaN abort immediately or throw. */
+export const MIN_DSH_TIMEOUT_MS = 1_000;
+
+/** Clamp an explicit timeout to the sane range (test seam: pure). */
+export function clampDshTimeoutMs(t: number | undefined): number {
+  return Number.isFinite(t) && (t as number) >= MIN_DSH_TIMEOUT_MS ? Math.floor(t as number) : DSH_HTTP_TIMEOUT_MS;
+}
+
 export class HttpDshClient implements DshClient {
   private baseUrl: string;
   private hostHeader: string;
@@ -446,21 +460,33 @@ export class HttpDshClient implements DshClient {
     const u = validateLoopbackUrl(webUrl);
     this.baseUrl = u.origin;
     this.hostHeader = u.host;
-    this.timeoutMs = opts.timeoutMs ?? DSH_HTTP_TIMEOUT_MS;
+    // Unclamped timeouts abort immediately (0/negative) or throw RangeError
+    // (NaN): floor to the sane localhost default instead.
+    this.timeoutMs = clampDshTimeoutMs(opts.timeoutMs);
   }
 
   private async rpc(endpoint: string, payload: unknown): Promise<unknown> {
     const body = JSON.stringify({ type: "client-request", rpcId: randomUUID(), method: endpoint, payload });
-    const res = await fetch(`${this.baseUrl}/api`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "host": this.hostHeader,
-      },
-      body,
-      redirect: "manual",
-      signal: AbortSignal.timeout(this.timeoutMs),
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/api`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "host": this.hostHeader,
+        },
+        body,
+        redirect: "manual",
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (e) {
+      // A hung host must surface as DshUnavailableError (the type callers
+      // branch on for fail-closed reconcile), never a raw TimeoutError —
+      // with the configured budget in the message for operability.
+      const name = e instanceof Error ? e.name : "";
+      const what = name === "TimeoutError" || name === "AbortError" ? "timeout" : "unreachable";
+      throw new DshUnavailableError(`dsh host ${what} after ${this.timeoutMs}ms (${endpoint})`);
+    }
     if (res.status === 403) throw new DshUnavailableError(`dsh host forbidden (loopback fence): ${res.status}`);
     if (res.status !== 200) throw new DshUnavailableError(`dsh host unexpected status ${res.status}`);
     const json = await res.json() as Record<string, unknown>;

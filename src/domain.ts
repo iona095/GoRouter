@@ -231,12 +231,28 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         // hold the cross-process lock. An orphan blob on lock loss is benign
         // (no ref points to it); the re-check under the lock stays authoritative.
         secrets.put(ref, cred);
-        mutateLocked((s) => {
-          // re-check under the lock: a concurrent setup may have won
-          if (s.localCredentialRef !== null) return;
-          s.localCredentialRef = ref;
-        });
+        try {
+          mutateLocked((s) => {
+            // re-check under the lock: a concurrent setup may have won
+            if (s.localCredentialRef !== null) return;
+            s.localCredentialRef = ref;
+          });
+        } catch (e) {
+          // Claim failed (lock loss, corrupt-state refusal): the ref is
+          // unclaimed by construction — reap before surfacing the error.
+          try {
+            secrets.delete(ref);
+          } catch { /* best effort */ }
+          throw e;
+        }
         created = state.read().localCredentialRef === ref;
+        // Losing racer (or lock-timeout orphan): our ref is unclaimed — reap
+        // the blob so repeated concurrent setups cannot leak DPAPI entries.
+        if (!created) {
+          try {
+            secrets.delete(ref);
+          } catch { /* winner-referenced or already gone; benign either way */ }
+        }
       }
       return { created, credential: created ? credential : null };
     },
@@ -257,7 +273,16 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         oldRef = s.localCredentialRef;
         s.localCredentialRef = ref;
       });
-      if (oldRef) secrets.delete(oldRef);
+      // The new credential is live and returned regardless: a stale-blob
+      // delete failure must never surface as a rotate failure (the caller
+      // would never learn the new credential and would rotate again).
+      if (oldRef) {
+        try {
+          secrets.delete(oldRef);
+        } catch (e) {
+          log.warn(`stale local credential blob cleanup failed (harmless orphan): ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
       return credential;
     },
 
@@ -290,12 +315,28 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       if (!existing) throw new Error(`account '${alias}' not found`);
       secrets.put(existing.secretRef, secret);
       let updated: AccountRecord | null = null;
-      mutateLocked((s) => {
-        const a = s.accounts.find((x) => x.id === existing.id);
-        if (!a) throw new Error(`account '${alias}' not found`);
-        a.updatedAtUtc = new Date().toISOString();
-        updated = a;
-      });
+      try {
+        mutateLocked((s) => {
+          const a = s.accounts.find((x) => x.id === existing.id);
+          if (!a) throw new Error(`account '${alias}' not found`);
+          a.updatedAtUtc = new Date().toISOString();
+          updated = a;
+        });
+      } catch (e) {
+        // A remove+re-add with the same alias between the pre-read and the
+        // lock (new id) leaves our put aimed at a dead ref: reap the orphan
+        // ONLY when the account id is actually gone — a lock-timeout after a
+        // successful put must keep the blob (the account still owns the ref;
+        // only its updatedAtUtc skews, corrected by the next update).
+        try {
+          if (!state.read().accounts.find((x) => x.id === existing.id)) {
+            try {
+              secrets.delete(existing.secretRef);
+            } catch { /* already reaped by the concurrent remover */ }
+          }
+        } catch { /* read failed: leave the blob; an orphan is benign */ }
+        throw e;
+      }
       return viewAccount(state.read(), secrets, updated!);
     },
 

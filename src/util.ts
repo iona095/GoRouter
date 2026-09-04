@@ -56,8 +56,8 @@ export function redact(text: string): string {
 // a half-written state file.
 // ---------------------------------------------------------------------------
 
-import { writeFileSync, renameSync, openSync, closeSync, fsyncSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { writeFileSync, renameSync, openSync, closeSync, fsyncSync, unlinkSync, readdirSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export function atomicWriteJson(file: string, value: unknown): void {
@@ -88,6 +88,34 @@ export function atomicWriteBytes(file: string, bytes: Uint8Array): void {
 
 export function tryUnlink(file: string): void {
   try { unlinkSync(file); } catch { /* already gone */ }
+}
+
+/**
+ * Quarantine a corrupt/unreadable file as timestamped evidence
+ * (`<p>.corrupt-<ts>`), keeping only the newest `keepNewest` backups so one
+ * side never silently deletes forensics while the other fills the disk.
+ * Best effort: returns the backup path, or null when the rename failed
+ * (caller must still serve safe defaults — never throw from the read path).
+ */
+export function quarantineCorruptFile(p: string, label: string, keepNewest = 5): string | null {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const backup = `${p}.corrupt-${ts}`;
+    renameSync(p, backup);
+    log.warn(`${label} quarantined to ${backup}`);
+    try {
+      const dir = dirname(p);
+      const prefix = `${basename(p)}.corrupt-`;
+      const olds = readdirSync(dir).filter((f) => f.startsWith(prefix)).sort();
+      for (const f of olds.slice(0, Math.max(0, olds.length - keepNewest))) {
+        try { unlinkSync(join(dir, f)); } catch { /* best effort */ }
+      }
+    } catch { /* pruning is optional */ }
+    return backup;
+  } catch (e) {
+    log.warn(`${label} quarantine failed: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

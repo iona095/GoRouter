@@ -26,6 +26,13 @@ export interface EligibilityResult {
   /** Approved ids absent from the registry (inactive; approval retained). */
   approvedAbsentGo: string[];
   approvedAbsentZen: string[];
+  /**
+   * Approved + registry-present ids the sanitizer refused (oversize, id-less,
+   * too deep). Surfaced explicitly so a perpetually-withheld id has an
+   * operator-visible reason instead of vanishing between buckets.
+   */
+  sanitizedOutGo: string[];
+  sanitizedOutZen: string[];
 }
 
 /**
@@ -71,7 +78,7 @@ function deriveLane(
   current: ModelEntry[],
   registry: ModelEntry[],
   approvedIds: Set<string>,
-): { desired: ModelEntry[]; withheld: string[]; removals: string[]; approvedAbsent: string[] } {
+): { desired: ModelEntry[]; withheld: string[]; removals: string[]; approvedAbsent: string[]; sanitizedOut: string[] } {
   const regMap = new Map(registry.map((m) => [m.id, m] as const));
 
   // Survivors: currently configured AND in registry AND approved (order preserved, overrides kept).
@@ -90,10 +97,15 @@ function deriveLane(
   // Upstream -> DSH-file boundary (H2): newly-eligible entries are copied from
   // upstream registry data, so sanitize before they reach another application's
   // config file. Survivors below come from the operator's own DSH file and keep
-  // their overrides verbatim by contract.
-  const newlyEntries: ModelEntry[] = newly
-    .map((id) => sanitizeRegistryEntryForDsh(regMap.get(id)!))
-    .filter((m): m is ModelEntry => m !== null);
+  // their overrides verbatim by contract. Sanitizer refusals are collected
+  // (not silently dropped) so the id appears in sanitizedOut with a reason.
+  const newlyEntries: ModelEntry[] = [];
+  const sanitizedOut: string[] = [];
+  for (const id of newly) {
+    const clean = sanitizeRegistryEntryForDsh(regMap.get(id)!);
+    if (clean) newlyEntries.push(clean);
+    else sanitizedOut.push(id);
+  }
 
   // Withheld: discovered (registry) but unapproved.
   const withheld = registry.filter((m) => !approvedIds.has(m.id)).map((m) => m.id);
@@ -101,7 +113,7 @@ function deriveLane(
   // Approved but absent upstream: inactive, approval retained.
   const approvedAbsent = [...approvedIds].filter((id) => !regMap.has(id)).sort();
 
-  return { desired: [...desired, ...newlyEntries], withheld, removals, approvedAbsent };
+  return { desired: [...desired, ...newlyEntries], withheld, removals, approvedAbsent, sanitizedOut };
 }
 
 /** Keys that must never flow from upstream data into another application's config file. */
@@ -110,13 +122,19 @@ const UNSAFE_DSH_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 /** Maximum serialized size of a single registry entry admitted into DSH files. */
 export const MAX_DSH_ENTRY_BYTES = 8 * 1024;
 
-function sanitizeValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitizeValue);
+/** Maximum nesting depth the sanitizer traverses: the 8KiB size bound only
+ * engages AFTER traversal, so an adversarial deeply-nested entry would exhaust
+ * the call stack first. Past the budget the entry is refused (fail closed). */
+const MAX_SANITIZE_DEPTH = 100;
+
+function sanitizeValue(value: unknown, depth: number): unknown {
+  if (depth > MAX_SANITIZE_DEPTH) throw new Error("registry entry exceeds sanitize depth budget");
+  if (Array.isArray(value)) return value.map((v) => sanitizeValue(v, depth + 1));
   if (typeof value === "object" && value !== null) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
       if (UNSAFE_DSH_KEYS.has(k)) continue;
-      out[k] = sanitizeValue(v);
+      out[k] = sanitizeValue(v, depth + 1);
     }
     return out;
   }
@@ -132,9 +150,14 @@ function sanitizeValue(value: unknown): unknown {
  */
 export function sanitizeRegistryEntryForDsh(entry: ModelEntry): ModelEntry | null {
   if (typeof entry.id !== "string" || entry.id.length === 0 || entry.id.length > 256) return null;
-  const clean = sanitizeValue(entry) as ModelEntry;
+  let clean: unknown;
+  try {
+    clean = sanitizeValue(entry, 0);
+  } catch {
+    return null; // depth budget exceeded: refuse, caller records the id
+  }
   if ((JSON.stringify(clean)?.length ?? 0) > MAX_DSH_ENTRY_BYTES) return null;
-  return clean;
+  return clean as ModelEntry;
 }
 
 /**
@@ -162,5 +185,7 @@ export function deriveApprovalDesiredDshState(opts: {
     removalsZen: zen.removals,
     approvedAbsentGo: go.approvedAbsent,
     approvedAbsentZen: zen.approvedAbsent,
+    sanitizedOutGo: go.sanitizedOut,
+    sanitizedOutZen: zen.sanitizedOut,
   };
 }

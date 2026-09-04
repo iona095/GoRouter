@@ -254,6 +254,12 @@ async function doReconcile(
 
   let derived = deriveFor(snapshot);
   let observedRevision = snapshot.revision;
+  // Sanitizer refusals are operator-visible: without this an approved id
+  // would sit in no bucket (not desired, withheld, or absent) and the sync
+  // would perpetually withhold it for no visible reason.
+  if (derived.sanitizedOutGo.length > 0 || derived.sanitizedOutZen.length > 0) {
+    log.warn(`dsh sync withheld by sanitizer (approved but unrepresentable): go=[${derived.sanitizedOutGo.join(",")}] zen=[${derived.sanitizedOutZen.join(",")}]`);
+  }
 
   // Semantic no-op -> zero mutation
   if (isSemanticNoOp(snapshot.go, snapshot.zen, derived.desiredGo, derived.desiredZen)) {
