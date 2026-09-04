@@ -222,7 +222,7 @@ describe("chunked request body (isolated)", () => {
     upstream.stop();
   }, { timeout: 15000 });
 
-  test("invalid-raw-target 400 keeps the connection alive (pipelined valid GET is served)", async () => {
+  test("invalid-raw-target 400 terminates: pipelined valid GET is refused, never served (F2)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({
       upstreamBase: upstream.baseUrl,
@@ -232,9 +232,11 @@ describe("chunked request body (isolated)", () => {
     const port = router.server.port();
     const { connect } = await import("node:net");
     const sock = connect(port, "127.0.0.1", () => {
-      // an invalid raw target 400 must NOT terminate the connection
-      // (narrowing #4): the pipelined valid GET on the same connection is
-      // served — only TE/GET-body rejections terminate.
+      // Supersedes narrowing #4: a pre-consumption 400 that leaves the
+      // connection alive lets a pipelined declared body desync keep-alive
+      // (same class as the chunked/CL branches). The invalid-target reject
+      // now closes+gates like every sibling branch: the pipelined valid GET
+      // is refused at the terminated-socket gate, never dispatched.
       sock.write(
         `GET /go/v1/%zz HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\n\r\n` +
           `GET /go/v1/models HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\n\r\n`,
@@ -246,15 +248,17 @@ describe("chunked request body (isolated)", () => {
     await new Promise((r) => setTimeout(r, 1200));
     sock.destroy();
     const statuses = [...buf.matchAll(/HTTP\/1\.1 (\d{3})/g)].map((m) => m[1]);
-    expect(statuses).toContain("400"); // the invalid-target rejection
-    expect(statuses).toContain("200"); // the pipelined follow-up WAS served
+    expect(statuses[0]).toBe("400"); // the invalid-target rejection
+    expect(statuses).not.toContain("200"); // the pipelined GET must never dispatch
+    // Either the socket dies with the 400 flush (typical: single response)
+    // or the parser reaches the terminated-socket gate first (second 400)
+    // — both are refusals, never a dispatch.
+    expect(statuses.length).toBeLessThanOrEqual(2);
     const rows = readJournalRows(router.paths.journalDb);
-    expect(rows.length).toBe(2); // rejection row + dispatched GET row
+    expect(rows.length).toBe(1); // exactly the invalid-target row
     expect(rows[0]!.terminal_outcome).toBe("local_error");
     expect(rows[0]!.http_status).toBe(400);
-    expect(rows[1]!.terminal_outcome).toBe("ok");
-    expect(rows[1]!.http_status).toBe(200);
-    expect(upstream.requests.length).toBe(1);
+    expect(upstream.requests.length).toBe(0);
     upstream.stop();
   }, { timeout: 15000 });
 
