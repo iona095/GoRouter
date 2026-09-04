@@ -826,6 +826,43 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
     expect(existsSync(p)).toBe(true);
     expect(readdirSync(dir).filter((f) => f.startsWith("dsh-sync-state.json.corrupt-"))).toEqual(backups);
   });
+
+  test("shape-invalid sync-state is quarantined, not cast (M9 strict validation)", async () => {
+    const { paths, dir } = freshPaths();
+    const p = dshSyncStatePathFor(paths);
+    // Valid JSON, wrong shapes: each must read null (never a half-cast status).
+    const badShapes: unknown[] = [
+      { ...emptyDshSyncStatus(), outcome: "nonsense" },
+      { ...emptyDshSyncStatus(), activeGoCount: "many" },
+      { ...emptyDshSyncStatus(), reachable: "yes" },
+      { ...emptyDshSyncStatus(), mutationPerformed: 1 },
+      { ...emptyDshSyncStatus(), lastSuccessAt: 12345 }, // number where string|null belongs
+      { ...emptyDshSyncStatus(), approvedAbsentGoCount: {} },
+      { enabled: true }, // missing required fields
+    ];
+    for (const bad of badShapes) {
+      writeFileSync(p, JSON.stringify(bad));
+      expect(loadDshSyncStatus(paths)).toBeNull();
+    }
+    expect(existsSync(p)).toBe(false); // last offender quarantined away
+    // A full valid shape (incl. extras, forward-compat) still loads.
+    const good = { ...emptyDshSyncStatus(), outcome: "current", activeGoCount: 3, futureField: [1, 2] };
+    writeFileSync(p, JSON.stringify(good));
+    const loaded = loadDshSyncStatus(paths);
+    expect(loaded?.outcome).toBe("current");
+    expect(loaded?.activeGoCount).toBe(3);
+    // Seven offenders quarantined, but the shared helper prunes to the
+    // newest 5 (bounded forensics, never unbounded disk growth).
+    expect(readdirSync(dir).filter((f) => f.startsWith("dsh-sync-state.json.corrupt-"))).toHaveLength(5);
+  });
+
+  test("store failure throws instead of warn-swallowing (M9 honest persist)", async () => {
+    // Point the state path at a directory: atomic write must fail loudly.
+    const { dir } = freshPaths();
+    const { resolvePaths } = await import("../src/paths.ts");
+    const paths = { ...resolvePaths(dir), dshSyncStateJson: dir };
+    expect(() => storeDshSyncStatus(paths, emptyDshSyncStatus())).toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------
