@@ -405,7 +405,24 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       return localError(503, "GoRouterCredentialError", "local router credential is not configured; run `gorouter setup`");
     }
     if (!validateLocalAuth(req, localCred)) {
-      return localError(401, "GoRouterAuthError", "missing or invalid local client credential");
+      // Auth failures get the same traceable journal row + request id as every
+      // other local failure (models path and route-error path already do this).
+      const entry = deps.journal.begin({
+        lane,
+        selectedAccountId: null,
+        selectedAccountAliasSnapshot: null,
+        method: req.method,
+        endpointFamily: classifyEndpointFamily(suffix),
+        terminalOutcome: "ok",
+        httpStatus: null,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: validateCorrelationId(req.headers.get("x-gorouter-correlation-id")) ?? null,
+      });
+      deps.journal.complete(entry, { completedAtUtc: utcNow(), durationMs: 0, terminalOutcome: "local_error", httpStatus: 401, upstreamRequestIds: [] });
+      const res = localError(401, "GoRouterAuthError", "missing or invalid local client credential");
+      res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      return res;
     }
 
     // --- route snapshot (immutable for this request) ------------------------

@@ -36,6 +36,26 @@ describe("local auth boundary", () => {
     upstream.stop();
   });
 
+  test("dispatch-path 401 leaves a journal row and carries a request id", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: "Bearer wrong", "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [] }),
+    });
+    expect(res.status).toBe(401);
+    expect(upstream.requests.length).toBe(0);
+    const requestId = res.headers.get("x-gorouter-request-id");
+    expect(requestId).toBeTruthy();
+    const rows = readJournalRows(router.paths.journalDb);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.terminal_outcome).toBe("local_error");
+    expect(rows[0]!.http_status).toBe(401);
+    expect(rows[0]!.router_request_id).toBe(requestId);
+    upstream.stop();
+  });
+
   test("local credential never forwarded upstream; account key injected", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
