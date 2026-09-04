@@ -34,8 +34,11 @@ function sleep(ms: number): void {
  * alive (or the file is unparseable AND older than STALE_MS). A live holder
  * is never displaced, so a slow in-lock DPAPI cycle cannot open a
  * lost-update window (contract §8).
+ *
+ * Exported for the refresh-claim protocol (models/refresh.ts), which needs
+ * the same liveness question for its own lock file.
  */
-function holderAlive(lockPath: string): boolean {
+export function isLockHolderAlive(lockPath: string): boolean {
   try {
     const raw = readFileSync(lockPath, "utf8");
     const parsed = JSON.parse(raw) as { pid?: unknown };
@@ -72,7 +75,7 @@ export function withFileLock<T>(lockPath: string, timeoutMs: number, fn: () => T
       // existing lock: reclaim only when the holder is gone
       try {
         const st = statSync(lockPath);
-        if (!holderAlive(lockPath) && Date.now() - st.mtimeMs > STALE_MS) {
+        if (!isLockHolderAlive(lockPath) && Date.now() - st.mtimeMs > STALE_MS) {
           try { unlinkSync(lockPath); } catch { /* raced */ }
           continue;
         }

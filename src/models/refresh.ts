@@ -1,8 +1,10 @@
 /**
  * Slice A — refresh orchestrator: transactional Go+Zen, single-flight, TTL/cooldown.
  */
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { openSync, writeSync, closeSync, unlinkSync, statSync, readFileSync } from "node:fs";
 import { log } from "../util.ts";
+import { isLockHolderAlive } from "../lock.ts";
 import type { Paths } from "../paths.ts";
 import type { Lane } from "../state.ts";
 import { MODELS_SCHEMA_VERSION, MODELS_TTL_MS, MODELS_COOLDOWN_MS, type RegistryFile, type AttemptInfo } from "./types.ts";
@@ -25,6 +27,80 @@ export interface RefreshOptions {
   forced?: boolean;
   upstreamGo: string;
   upstreamZen: string;
+  /** Max wait for another process's in-progress refresh (default 45s). */
+  refreshWaitMs?: number;
+}
+
+/**
+ * Cross-process refresh claim (M2): the in-process single-flight cannot see
+ * other processes (CLI vs control service), so concurrent refreshers would
+ * double-hit upstream and last-writer-wins the registry with nondeterministic
+ * diffs. The claim file serializes full refreshes across processes; a process
+ * arriving mid-refresh waits for the other's publish instead of refetching.
+ * Stale claims (dead holder, or older than the longest possible refresh) are
+ * reclaimed. Failure modes all degrade to a normal refresh — never a hang.
+ */
+export function refreshLockPath(paths: Paths): string {
+  return `${paths.state}/.models-refresh.lock`;
+}
+
+const REFRESH_CLAIM_STALE_MS = 120_000;
+const REFRESH_WAIT_MS = 45_000;
+const REFRESH_WAIT_POLL_MS = 250;
+
+function tryClaimRefreshLock(lockPath: string): string | null {
+  const claim = JSON.stringify({ pid: process.pid, ts: Date.now(), nonce: randomUUID() });
+  try {
+    const fd = openSync(lockPath, "wx");
+    try {
+      writeSync(fd, claim);
+    } finally {
+      closeSync(fd);
+    }
+    return JSON.parse(claim).nonce as string;
+  } catch (e) {
+    if ((e as { code?: string }).code !== "EEXIST") throw e;
+  }
+  // Held: reclaim only when the holder is gone (or the claim is ancient).
+  try {
+    const st = statSync(lockPath);
+    const ageMs = Date.now() - st.mtimeMs;
+    if ((!isLockHolderAlive(lockPath) && ageMs > 10_000) || ageMs > REFRESH_CLAIM_STALE_MS) {
+      try { unlinkSync(lockPath); } catch { /* raced */ }
+      return tryClaimRefreshLock(lockPath);
+    }
+  } catch { /* lock vanished mid-check: treat as held this round */ }
+  return null;
+}
+
+function releaseRefreshLock(lockPath: string, nonce: string): void {
+  // Delete only our own claim (never another process's) unless it is ancient.
+  try {
+    const raw = readFileSync(lockPath, "utf8");
+    const parsed = JSON.parse(raw) as { nonce?: unknown };
+    if (parsed.nonce !== nonce) {
+      try {
+        const st = statSync(lockPath);
+        if (Date.now() - st.mtimeMs <= REFRESH_CLAIM_STALE_MS) return;
+      } catch { return; }
+    }
+  } catch { /* unreadable: fall through to best-effort removal */ }
+  try { unlinkSync(lockPath); } catch { /* raced or already gone */ }
+}
+
+async function waitForRefreshLock(lockPath: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let gone = false;
+    try {
+      statSync(lockPath);
+    } catch {
+      gone = true;
+    }
+    if (gone) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, REFRESH_WAIT_POLL_MS));
+  }
 }
 
 // Single-flight state — module-level.
@@ -44,9 +120,39 @@ function parseHttpStatus(errorMsg: string): number | null {
 }
 
 export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promise<RefreshResult> {
-  // Single-flight: coalesce concurrent callers
+  // Single-flight: coalesce concurrent callers in this process
   if (inFlight) return inFlight;
-  const p = doRefresh(paths, opts).finally(() => {
+  const p = (async (): Promise<RefreshResult> => {
+    const lockPath = refreshLockPath(paths);
+    let nonce: string | null = null;
+    try {
+      nonce = tryClaimRefreshLock(lockPath);
+    } catch (e) {
+      log.warn(`models refresh claim failed, proceeding unclaimed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (nonce === null) {
+      // Another process is refreshing: wait for its publish and serve that
+      // instead of double-hitting upstream.
+      const cleared = await waitForRefreshLock(lockPath, opts.refreshWaitMs ?? REFRESH_WAIT_MS);
+      const cur = loadRegistry(paths);
+      const now = opts.nowMs ?? Date.now();
+      if (cleared && cur && isFresh(cur, now)) {
+        return { success: true, registry: cur, error: null, fromCache: true, diff: cur.lastDiff };
+      }
+      return {
+        success: false,
+        registry: cur,
+        error: "another models refresh is in progress; retry shortly",
+        fromCache: true,
+        diff: [],
+      };
+    }
+    try {
+      return await doRefresh(paths, opts);
+    } finally {
+      releaseRefreshLock(lockPath, nonce);
+    }
+  })().finally(() => {
     inFlight = null;
   });
   inFlight = p;

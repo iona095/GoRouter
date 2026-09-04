@@ -10,7 +10,7 @@
  *  + fallback proxy), auth preserved, inference regression. No live network.
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
@@ -43,7 +43,7 @@ import {
 } from "../src/models/registry.ts";
 import { computeDiff } from "../src/models/diff.ts";
 import { fetchLane, upstreamModelsUrl, normalizeModelsResponse, type FetchFn } from "../src/models/fetcher.ts";
-import { refreshRegistry, clearRefreshSingleFlightForTests, maybeRefreshOnStartup } from "../src/models/refresh.ts";
+import { refreshRegistry, clearRefreshSingleFlightForTests, maybeRefreshOnStartup, refreshLockPath } from "../src/models/refresh.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers: deterministic clock + temp state
@@ -688,6 +688,74 @@ describe("refresh orchestrator", () => {
     expect(onDisk.lastAttempt.go!.success).toBe(false);
     expect(onDisk.lastAttempt.combinedAtUtc).toBe(isoAt(BASE_MS));
   });
+});
+
+describe("cross-process refresh claim (M2)", () => {
+  const UGO = "https://upstream.go";
+  const UZEN = "https://upstream.zen";
+
+  test("claim released after refresh: no lock file left behind", async () => {
+    const { paths } = freshPaths();
+    const fetcher = fakeFetcher({
+      [`${UGO}/models`]: listData(["g1"]),
+      [`${UZEN}/models`]: listData(["z1"]),
+    });
+    const res = await refreshRegistry(paths, { upstreamGo: UGO, upstreamZen: UZEN, fetchFn: fetcher, forced: true });
+    expect(res.success).toBe(true);
+    expect(existsSync(refreshLockPath(paths))).toBe(false);
+  });
+
+  test("waiter serves the other process's publish instead of refetching", async () => {
+    const { paths } = freshPaths();
+    const nowIso = new Date().toISOString();
+    storeRegistry(paths, registryFile({ updatedAtMs: Date.now(), lastAttempt: successAttempt(nowIso), goIds: ["pub-go"], zenIds: ["pub-zen"] }));
+    // Simulate another process's live claim (own pid = alive holder).
+    const lock = refreshLockPath(paths);
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, ts: Date.now(), nonce: "other" }));
+    // The other process publishes (releases) after 300ms.
+    setTimeout(() => { try { rmSync(lock, { force: true }); } catch { /* ignore */ } }, 300);
+    let fetchCalled = 0;
+    const neverFetch: FetchFn = async () => { fetchCalled++; throw new Error("must not fetch"); };
+    const res = await refreshRegistry(paths, { upstreamGo: UGO, upstreamZen: UZEN, fetchFn: neverFetch, forced: true });
+    expect(fetchCalled).toBe(0);
+    expect(res.success).toBe(true);
+    expect(res.fromCache).toBe(true);
+    expect(res.registry!.go!.models[0]!.id).toBe("pub-go");
+  }, { timeout: 15000 });
+
+  test("stale claim (dead holder) is reclaimed and refresh proceeds", async () => {
+    const { paths } = freshPaths();
+    const lock = refreshLockPath(paths);
+    writeFileSync(lock, JSON.stringify({ pid: 99999999, ts: Date.now() - 60_000, nonce: "dead" }));
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    let fetchCalled = 0;
+    const fetcher: FetchFn = async (url) => {
+      fetchCalled++;
+      if (url.includes("upstream.go")) return Response.json(listData(["g1"]), { status: 200 });
+      return Response.json(listData(["z1"]), { status: 200 });
+    };
+    const res = await refreshRegistry(paths, { upstreamGo: UGO, upstreamZen: UZEN, fetchFn: fetcher, forced: true });
+    expect(res.success).toBe(true);
+    expect(fetchCalled).toBe(2);
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  test("holder that never releases yields a bounded give-up, never a hang", async () => {
+    const { paths } = freshPaths();
+    const lock = refreshLockPath(paths);
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, ts: Date.now(), nonce: "squatter" }));
+    let fetchCalled = 0;
+    const neverFetch: FetchFn = async () => { fetchCalled++; throw new Error("must not fetch"); };
+    const started = Date.now();
+    const res = await refreshRegistry(paths, { upstreamGo: UGO, upstreamZen: UZEN, fetchFn: neverFetch, forced: true, refreshWaitMs: 600 });
+    expect(Date.now() - started).toBeLessThan(10000);
+    expect(fetchCalled).toBe(0);
+    expect(res.success).toBe(false);
+    expect(res.fromCache).toBe(true);
+    expect(res.error).toMatch(/in progress/);
+    rmSync(lock, { force: true });
+  }, { timeout: 15000 });
 });
 
 // ---------------------------------------------------------------------------
