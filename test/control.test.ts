@@ -282,6 +282,44 @@ describe('in-process control core', () => {
     }
   })
 
+  test('journalStats TTL heals when a sibling-only commit lands inside the window (C1)', () => {
+    const { core, paths, stateDir } = freshCore({ firstRunDone: true })
+    dirs.push(stateDir)
+    const j = createJournal(paths.journalDb, 30, 100000)
+    const row = (alias: string, at: string) => {
+      const e = j.begin({
+        lane: 'go',
+        selectedAccountId: null,
+        selectedAccountAliasSnapshot: alias,
+        method: 'POST',
+        endpointFamily: 'chat/completions',
+        terminalOutcome: 'ok',
+        httpStatus: null,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: null,
+      })
+      j.complete(e, {
+        completedAtUtc: at,
+        durationMs: 10,
+        terminalOutcome: 'ok',
+        httpStatus: 200,
+        upstreamRequestIds: [],
+      })
+    }
+    core.start()
+    try {
+      row('a', '2026-01-01T00:00:01.000Z')
+      expect(core.journalStats().records).toBe(1) // warms the TTL cache
+      row('b', '2026-01-01T00:00:02.000Z') // second commit inside the 2s window
+      // The sibling move busts the TTL: no stale N served, so a poll push
+      // built on this stats call can never dedup-suppress fresh content.
+      expect(core.journalStats().records).toBe(2)
+    } finally {
+      core.stop()
+    }
+  })
+
   test('snapshot has the exact protocol shape', () => {
     const { core, paths } = freshCore()
     core.start()

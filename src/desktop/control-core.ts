@@ -178,6 +178,23 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     }
   }
 
+  // C1 fix: WAL commits move only the -wal/-shm siblings (the T-D04 premise),
+  // so a main-file key cannot heal the stats TTL after a sibling-only commit.
+  // The TTL key covers all three siblings; any journal write busts it.
+  function journalDirtSig(): string | null {
+    const sigPart = (p: string): string => {
+      try {
+        const st = statSync(p)
+        return `${st.mtimeMs}:${st.size}`
+      } catch {
+        return '-'
+      }
+    }
+    const main = dbSig()
+    if (main === null) return null
+    return `${main}|${sigPart(paths.journalDb + '-wal')}|${sigPart(paths.journalDb + '-shm')}`
+  }
+
   function closeRoHandle(): void {
     if (roHandle) {
       try {
@@ -228,7 +245,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   // stats cache is invisible in the UI and skips the COUNT(*) scan per tick.
   // Only successes cache — degraded results always re-probe next tick.
   const STATS_TTL_MS = 2000
-  let statsCache: { at: number; value: SnapshotJournal } | null = null
+  let statsCache: { at: number; sig: string | null; value: SnapshotJournal } | null = null
 
   function journalStats(): SnapshotJournal {
     const settings = domain.configShow()
@@ -243,7 +260,10 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       maxRecords: settings.journalMaxRecords,
     }
     const now = Date.now()
-    if (statsCache && now - statsCache.at < STATS_TTL_MS) {
+    // TTL hit requires a quiet journal: any sibling move since cache time
+    // busts the cache so a fresh push is never dedup-suppressed (C1).
+    const dirt = journalDirtSig()
+    if (statsCache && dirt !== null && statsCache.sig === dirt && now - statsCache.at < STATS_TTL_MS) {
       return { ...statsCache.value, retentionDays: base.retentionDays, maxRecords: base.maxRecords }
     }
     let h: RoHandle | null
@@ -265,7 +285,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
         oldestRecordAtUtc: oldest.v,
         newestRecordAtUtc: newest.v,
       }
-      statsCache = { at: now, value }
+      statsCache = { at: now, sig: journalDirtSig(), value }
       return value
     } catch (e) {
       closeRoHandle() // poisoned handle (e.g. schema mid-migration): reopen next tick

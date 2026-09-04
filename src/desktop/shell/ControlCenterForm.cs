@@ -2375,9 +2375,12 @@ public sealed class ControlCenterForm : Form
 
     private void RenderRecentActivity(IReadOnlyList<JournalRow> rows, bool degraded, string? error)
     {
+        // C2: every RENDERED row keys the fingerprint (id + outcome + status
+        // + completion) — a late in-flight→done flip on any visible row must
+        // re-render, not hide until an unrelated change.
         var fingerprint = degraded
             ? "degraded:" + (error ?? "")
-            : rows.Count + "|" + (rows.Count > 0 ? rows[0].RouterRequestId + "|" + rows[0].CompletedAtUtc : "");
+            : string.Join(";", rows.Take(5).Select(r => r.RouterRequestId + "|" + r.TerminalOutcome + "|" + (r.HttpStatus?.ToString() ?? "-") + "|" + (r.CompletedAtUtc ?? "")));
         if (fingerprint == _activityFingerprint)
         {
             return;
