@@ -680,4 +680,29 @@ describe("opencode session header", () => {
     expect(v).not.toBe(bad);
     upstream.stop();
   });
+
+  test("credential-bearing inbound session replaced, never forwarded", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const bad = "conv-" + LOCAL_KEY;
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": bad }) });
+    expect(res.status).toBe(200);
+    expect(upstream.requests.length).toBe(1);
+    const v = upstream.requests[0]!.headers.get("x-opencode-session");
+    expect(v).toBeTruthy();
+    expect(v).not.toContain(LOCAL_KEY);
+    upstream.stop();
+  });
+
+  test("credential-bearing correlation id not reused as session", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-gorouter-correlation-id": LOCAL_KEY }) });
+    expect(res.status).toBe(200);
+    expect(upstream.requests.length).toBe(1);
+    const v = upstream.requests[0]!.headers.get("x-opencode-session");
+    expect(v).toBeTruthy();
+    expect(v).not.toContain(LOCAL_KEY);
+    upstream.stop();
+  });
 });

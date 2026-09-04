@@ -176,6 +176,27 @@ export function resolveUpstreamSessionId(
   return randomUUID();
 }
 
+/**
+ * Credential-safe wrapper around resolveUpstreamSessionId.
+ * The resolved value is subject to the same containment rule as every other
+ * forwarded header: it must never carry the local client credential upstream
+ * (the raw inbound value must not be re-introduced after stripping). On a
+ * match the value is REPLACED with a fresh UUID — never deleted — so the
+ * upstream never-missing guarantee still holds. The caller logs the
+ * replacement the same way it logs other credential strips.
+ */
+export function resolveUpstreamSessionIdSafe(
+  inbound: string | null | undefined,
+  correlationId: string | undefined,
+  localCred: string,
+): { sessionId: string; replaced: boolean } {
+  const sessionId = resolveUpstreamSessionId(inbound, correlationId);
+  if (localCred.length > 0 && sessionId.includes(localCred)) {
+    return { sessionId: randomUUID(), replaced: true };
+  }
+  return { sessionId, replaced: false };
+}
+
 /** Narrow allowlist of upstream response headers archived as request ids. */
 export const UPSTREAM_REQUEST_ID_HEADERS = ["x-request-id", "x-amzn-requestid"] as const;
 

@@ -25,7 +25,7 @@ import {
   sanitizeForwardHeaders,
   validateCorrelationId,
   OPENCODE_SESSION_HEADER,
-  resolveUpstreamSessionId,
+  resolveUpstreamSessionIdSafe,
   extractUpstreamRequestIds,
   classifyEndpointFamily,
   monotonicMs,
@@ -541,12 +541,19 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       }
     }
     // OpenCode requires x-opencode-session (one stable id per conversation):
-    // forward the client's value untouched when valid, else reuse the router
-    // correlation id, else generate one — upstream never sees it missing.
-    forwardHeaders.set(
-      OPENCODE_SESSION_HEADER,
-      resolveUpstreamSessionId(req.headers.get(OPENCODE_SESSION_HEADER), correlationId),
+    // resolve first, then apply the same credential-containment rule as every
+    // other forwarded header — the raw inbound value must not be re-introduced
+    // after stripping. Replaced (never deleted) on match, so upstream never
+    // sees a missing header.
+    const { sessionId, replaced } = resolveUpstreamSessionIdSafe(
+      req.headers.get(OPENCODE_SESSION_HEADER),
+      correlationId,
+      localCred,
     );
+    if (replaced) {
+      log.warn(`local credential stripped from forwarded header ${OPENCODE_SESSION_HEADER} (lane=${lane})`);
+    }
+    forwardHeaders.set(OPENCODE_SESSION_HEADER, sessionId);
     forwardHeaders.set(
       authHeaderForFamily(authFamily),
       authFamily === "bearer" ? `Bearer ${snapshot.secret}` : snapshot.secret,
