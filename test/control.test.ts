@@ -18,7 +18,7 @@ import { describe, test, expect, afterEach, beforeEach, setDefaultTimeout } from
 // Integration tests spawn real subprocesses (CLI DPAPI seeding, the control
 // service, fake routers); the 5s bun default is too short.
 setDefaultTimeout(120_000)
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -188,6 +188,100 @@ describe('router command resolution (F-01)', () => {
 });
 
 describe('in-process control core', () => {
+  test('journal WAL commit surfaces a snapshot push even when the main DB file is untouched (T-D04)', async () => {
+    const { core, paths, stateDir } = freshCore({ firstRunDone: true })
+    dirs.push(stateDir)
+    // Seed one row pre-start so journal.db exists before the poll baselines.
+    // Both handles stay pinned (holders) for the whole test: a GC-collected
+    // handle closes its connection, and last-close checkpoints the WAL,
+    // moving the main file under us and voiding the attribution.
+    const holders: unknown[] = []
+    const seed = createJournal(paths.journalDb, 30, 100000)
+    holders.push(seed)
+    const se = seed.begin({
+      lane: 'go',
+      selectedAccountId: null,
+      selectedAccountAliasSnapshot: 'seed',
+      method: 'POST',
+      endpointFamily: 'chat/completions',
+      terminalOutcome: 'ok',
+      httpStatus: null,
+      upstreamRequestIds: [],
+      model: null,
+      clientCorrelationId: null,
+    })
+    seed.complete(se, {
+      completedAtUtc: '2026-01-01T00:00:00.000Z',
+      durationMs: 1,
+      terminalOutcome: 'ok',
+      httpStatus: 200,
+      upstreamRequestIds: [],
+    })
+    core.start()
+    const seen: string[] = []
+    const unsub = core.onSnapshot((s) => {
+      seen.push(JSON.stringify(s))
+    })
+    try {
+      await sleep(1500) // let the poll establish its baselines silently
+      seen.length = 0
+      // ms-floored: utimesSync restores only ms precision, and the poll
+      // itself compares raw floats — flooring here is test-side tolerance.
+      const sig = () => {
+        const st = statSync(paths.journalDb)
+        return `${Math.floor(st.mtimeMs)}:${st.size}`
+      }
+      const mainBefore = sig()
+      const mainBytes = readFileSync(paths.journalDb)
+      const mainMtime = statSync(paths.journalDb).mtime
+      // A real commit, then the main DB file is restored byte-and-stamp
+      // identical: the -wal/-shm siblings alone must surface the push
+      // (the pre-checkpoint WAL shape T-D04 is about).
+      const j = createJournal(paths.journalDb, 30, 100000)
+      holders.push(j)
+      const e = j.begin({
+        lane: 'go',
+        selectedAccountId: null,
+        selectedAccountAliasSnapshot: 'alpha',
+        method: 'POST',
+        endpointFamily: 'chat/completions',
+        terminalOutcome: 'ok',
+        httpStatus: null,
+        upstreamRequestIds: [],
+        model: null,
+        clientCorrelationId: null,
+      })
+      j.complete(e, {
+        completedAtUtc: '2026-01-01T00:00:01.000Z',
+        durationMs: 10,
+        terminalOutcome: 'ok',
+        httpStatus: 200,
+        upstreamRequestIds: ['x-request-id: r1'],
+      })
+      const { utimesSync } = await import('node:fs')
+      writeFileSync(paths.journalDb, mainBytes)
+      utimesSync(paths.journalDb, mainMtime, mainMtime)
+      expect(sig()).toBe(mainBefore) // main file indistinguishable from baseline
+      let sigAtEmission = ""
+      await waitFor(() => {
+        if (seen.length > 0) {
+          sigAtEmission = sig()
+          return true
+        }
+        return false
+      }, 10_000)
+      expect(seen.length).toBeGreaterThanOrEqual(1)
+      // The push fired while the main file was still pristine: only the
+      // -wal/-shm siblings could have surfaced it (later snapshot reads
+      // may move the main file via WAL recovery — irrelevant post-proof).
+      expect(sigAtEmission).toBe(mainBefore)
+      expect(holders.length).toBe(2) // handles survived: no GC-close checkpoint
+    } finally {
+      unsub()
+      core.stop()
+    }
+  })
+
   test('snapshot has the exact protocol shape', () => {
     const { core, paths } = freshCore()
     core.start()

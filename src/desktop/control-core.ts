@@ -123,8 +123,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   let lastStateMtime = 0
   let lastStateSize = -1
   let journalBaseline = false
-  let lastJournalMtime = 0
-  let lastJournalSize = -1
+  const lastJournalSig = new Map<string, string>()
 
   // debounced emission
   let emitScheduled = false
@@ -356,18 +355,27 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
         noteChange()
       }
     }
-    const jd = statSafe(paths.journalDb)
-    if (jd) {
-      if (!journalBaseline) {
-        journalBaseline = true
-        lastJournalMtime = jd.mtimeMs
-        lastJournalSize = jd.size
-      } else if (jd.mtimeMs !== lastJournalMtime || jd.size !== lastJournalSize) {
-        lastJournalMtime = jd.mtimeMs
-        lastJournalSize = jd.size
+    // WAL mode (T-D04): commits land in -wal/-shm while the main DB file
+    // sits unchanged until checkpoint — watch the siblings too, or change
+    // notifications stall until the next checkpoint.
+    for (const p of [paths.journalDb, `${paths.journalDb}-wal`, `${paths.journalDb}-shm`]) {
+      const jd = statSafe(p)
+      if (!jd) continue
+      const key = `${jd.mtimeMs}:${jd.size}`
+      const prev = lastJournalSig.get(p)
+      if (prev === undefined) {
+        if (!journalBaseline) lastJournalSig.set(p, key)
+        // A sibling appearing mid-run (first WAL commit) is itself a change.
+        else {
+          lastJournalSig.set(p, key)
+          noteChange()
+        }
+      } else if (prev !== key) {
+        lastJournalSig.set(p, key)
         noteChange()
       }
     }
+    journalBaseline = true
   }
 
   // ------------------------------------------------------------------
