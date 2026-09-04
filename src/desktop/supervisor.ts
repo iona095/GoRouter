@@ -70,10 +70,15 @@ const PROBE_TIMEOUT_MS = 1_500
  * the old port while the supervisor probes the new one). */
 const CHILD_HEALTH_GRACE_MS = 10_000
 
+/** True when running as the packaged control binary (vs dev bun). The
+ * router-spawn env override is honored in dev only (F-01). */
+export function isPackagedControl(): boolean {
+  return basename(process.execPath).toLowerCase() === 'gorouter-control.exe'
+}
+
 /** Dev default: [bun, src/cli.ts, serve] from the repo root. Packaged: [<exeDir>/gorouter-router.exe, serve]. */
 export function defaultRouterCommand(): RouterCommand {
-  const exe = basename(process.execPath).toLowerCase()
-  if (exe === 'gorouter-control.exe') {
+  if (isPackagedControl()) {
     const dir = dirname(process.execPath)
     return { argv: [join(dir, 'gorouter-router.exe'), 'serve'], cwd: dir }
   }

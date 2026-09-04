@@ -13,7 +13,7 @@
  * cleaned up, and every mutation goes through the same domain layer the CLI
  * uses.
  */
-import { describe, test, expect, afterEach, setDefaultTimeout } from 'bun:test'
+import { describe, test, expect, afterEach, beforeEach, setDefaultTimeout } from 'bun:test'
 
 // Integration tests spawn real subprocesses (CLI DPAPI seeding, the control
 // service, fake routers); the 5s bun default is too short.
@@ -26,7 +26,7 @@ import net from 'node:net'
 import type { Subprocess } from 'bun'
 import { createControlService } from '../src/desktop/control-core.ts'
 import { loadDesktopSettings } from '../src/desktop/desktop-settings.ts'
-import { createOpHandlers } from '../src/desktop/control-service.ts'
+import { createOpHandlers, resolveRouterCommand } from '../src/desktop/control-service.ts'
 import { createPipeClient } from '../src/desktop/protocol.ts'
 import { hardenPipeDacl, inspectPipeDacl } from '../src/desktop/pipe-acl.ts'
 import type { JournalRowView, Snapshot } from '../src/desktop/protocol.ts'
@@ -158,6 +158,34 @@ function freshCore(opts?: {
 // ---------------------------------------------------------------------------
 // (a) in-process core
 // ---------------------------------------------------------------------------
+
+describe('router command resolution (F-01)', () => {
+  const KEY = 'GOROUTER_DESKTOP_ROUTER_CMD_JSON'
+  let saved: string | undefined
+  beforeEach(() => { saved = process.env[KEY]; });
+  afterEach(() => {
+    if (saved === undefined) delete process.env[KEY];
+    else process.env[KEY] = saved;
+  });
+  test('dev honors the env override', () => {
+    process.env[KEY] = JSON.stringify([' C:\\evil\\router.exe ', 'serve']);
+    const cmd = resolveRouterCommand({ packaged: false });
+    expect(cmd.argv).toEqual([' C:\\evil\\router.exe ', 'serve']);
+  });
+  test('packaged ignores the env override (fixed bundled router)', () => {
+    process.env[KEY] = JSON.stringify(['C:\\evil\\router.exe', 'serve']);
+    const cmd = resolveRouterCommand({ packaged: true });
+    expect(cmd.argv).not.toContain('C:\\evil\\router.exe');
+  });
+  test('packaged ignores even malformed JSON (no throw, bundled default)', () => {
+    process.env[KEY] = 'not-json{';
+    expect(() => resolveRouterCommand({ packaged: true })).not.toThrow();
+  });
+  test('dev still rejects malformed JSON loudly', () => {
+    process.env[KEY] = 'not-json{';
+    expect(() => resolveRouterCommand({ packaged: false })).toThrow(/not valid JSON/);
+  });
+});
 
 describe('in-process control core', () => {
   test('snapshot has the exact protocol shape', () => {

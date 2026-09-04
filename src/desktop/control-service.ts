@@ -10,7 +10,8 @@
  *   GOROUTER_DESKTOP_PIPE           full pipe path override (default
  *                                   \\.\pipe\gorouter-ctrl-<userSID, dashes stripped>)
  *   GOROUTER_DESKTOP_ROUTER_CMD_JSON  JSON array of router argv ("<port>"
- *                                   entry replaced with the configured port)
+ *                                   entry replaced with the configured port;
+ *                                   honored in DEV only, ignored packaged)
  *   GOROUTER_STATE_DIR              runtime state dir (src/paths.ts)
  *   GOROUTER_LOG_LEVEL              debug|info|warn|error
  *
@@ -27,7 +28,7 @@ import { loadDesktopSettings } from './desktop-settings.ts'
 import { createControlService, type ControlService } from './control-core.ts'
 import { hardenPipeDacl } from './pipe-acl.ts'
 import { serveControlPipe, type ControlTransport } from './transport.ts'
-import { defaultRouterCommand, type RouterCommand } from './supervisor.ts'
+import { defaultRouterCommand, isPackagedControl, type RouterCommand } from './supervisor.ts'
 import {
   controlError,
   ControlError,
@@ -60,13 +61,18 @@ function currentUserSid(): string {
 }
 
 /**
- * Router command: GOROUTER_DESKTOP_ROUTER_CMD_JSON wins; otherwise the dev
- * default ([bun, src/cli.ts, serve] from the repo root) or the packaged
- * default ([<exeDir>/gorouter-router.exe, serve]) when compiled.
+ * Router command: GOROUTER_DESKTOP_ROUTER_CMD_JSON wins in DEV only. A
+ * packaged control binary (F-01) ignores the override and uses the fixed
+ * bundled router: env-controlled argv in a shipped shell is an arbitrary-
+ * spawn primitive for anything that can set the service environment.
  */
-export function resolveRouterCommand(): RouterCommand {
+export function resolveRouterCommand(opts: { packaged?: boolean } = {}): RouterCommand {
   const raw = process.env.GOROUTER_DESKTOP_ROUTER_CMD_JSON
   if (raw && raw.trim().length > 0) {
+    if (opts.packaged ?? isPackagedControl()) {
+      log.warn('ignoring GOROUTER_DESKTOP_ROUTER_CMD_JSON in packaged mode (fixed bundled router)')
+      return defaultRouterCommand()
+    }
     let argv: unknown
     try {
       argv = JSON.parse(raw)
