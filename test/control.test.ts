@@ -263,13 +263,15 @@ describe('in-process control core', () => {
       utimesSync(paths.journalDb, mainMtime, mainMtime)
       expect(sig()).toBe(mainBefore) // main file indistinguishable from baseline
       let sigAtEmission = ""
+      // Generous window: under full-suite parallel load the 1s poll + GC
+      // pauses stretch far beyond solo timing (observed 10s+ starvation).
       await waitFor(() => {
         if (seen.length > 0) {
           sigAtEmission = sig()
           return true
         }
         return false
-      }, 10_000)
+      }, 60_000)
       expect(seen.length).toBeGreaterThanOrEqual(1)
       // The push fired while the main file was still pristine: only the
       // -wal/-shm siblings could have surfaced it (later snapshot reads
