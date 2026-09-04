@@ -128,12 +128,16 @@ public sealed class ControlClient : IControlChannel
     private readonly Dictionary<int, TaskCompletionSource<ControlResponse>> _pending = new();
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-    // Maximum pipe frame length (F-06): mirrors the service-side 1 MiB line cap
-    // (transport MAX_LINE_BYTES). An unbounded ReadLineAsync lets a corrupt or
-    // hostile peer grow the line string without limit.
-    private const int MaxLineChars = 1 << 20;
+    // Maximum pipe frame length in UTF-16 chars (F-06): a chars-based memory
+    // bound sized like the service-side 1 MiB byte cap (transport
+    // MAX_LINE_BYTES) — identical for ASCII, divergent for multibyte, which is
+    // fine because this side bounds memory, not wire bytes. An unbounded
+    // ReadLineAsync lets a corrupt or hostile peer grow the line without limit.
+    private const int MaxFrameChars = 1 << 20;
 
     private NamedPipeClientStream? _pipe;
+    private StreamReader? _reader;
+    private CancellationTokenSource? _loopCts;
     private CancellationTokenSource? _connectCts;
     private int _nextId;
     private bool _disposed;
@@ -197,11 +201,14 @@ public sealed class ControlClient : IControlChannel
             if (_disposed)
             {
                 pipe.Dispose();
+                reader.Dispose();
                 loopCts.Dispose();
                 return false;
             }
 
             _pipe = pipe;
+            _reader = reader;
+            _loopCts = loopCts;
         }
 
         _ = Task.Run(() => ReadLoopAsync(pipe, reader, loopCts.Token));
@@ -221,9 +228,11 @@ public sealed class ControlClient : IControlChannel
                 {
                     // Non-auth rejection (e.g. version mismatch): the pipe never
                     // completed authentication, so it must not stay usable for
-                    // later CallAsync writes. Close it; the read loop exits and
-                    // ConnectAsync retries with backoff.
-                    SetState(ClientState.Reconnecting, hello.ErrorMessage ?? "Control service rejected the connection.");
+                    // later CallAsync writes. Close it and return false without
+                    // touching the state — the ConnectAsync loop owns the
+                    // Reconnecting transition, and one-shot probes (Starting)
+                    // must keep their terminal bool contract, not strand in
+                    // Reconnecting with no owner retrying.
                     ClosePipe();
                 }
 
@@ -232,6 +241,10 @@ public sealed class ControlClient : IControlChannel
         }
         catch
         {
+            // Hello exchange failed (timeout, reset, framing): tear the
+            // half-open connection down so no orphaned read loop keeps
+            // dispatching events or racing _pending with the next attempt.
+            ClosePipe();
             return false;
         }
         finally
@@ -437,7 +450,9 @@ public sealed class ControlClient : IControlChannel
     /// <summary>Reads one newline-terminated frame with a length cap.
     /// Returns null on end-of-stream (mirroring ReadLineAsync: a partial final
     /// line without a terminator is delivered first). Throws
-    /// InvalidDataException when the frame exceeds <see cref="MaxLineChars"/>.
+    /// InvalidDataException when the frame exceeds <see cref="MaxFrameChars"/>.
+    /// The cap is checked before every append, so it holds on the terminating
+    /// chunk too — zero overshoot on any return path.
     /// </summary>
     private static async Task<string?> ReadBoundedLineAsync(StreamReader reader, CancellationToken ct)
     {
@@ -445,10 +460,7 @@ public sealed class ControlClient : IControlChannel
         var buf = new char[4096];
         for (;;)
         {
-            ct.ThrowIfCancellationRequested();
-            // No char[]/CT overload: pipe disposal surfaces as IOException,
-            // which the caller already treats as a connection error.
-            int n = await reader.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false);
+            int n = await reader.ReadAsync(buf.AsMemory(), ct).ConfigureAwait(false);
             if (n == 0)
             {
                 return sb.Length == 0 ? null : sb.ToString();
@@ -458,16 +470,21 @@ public sealed class ControlClient : IControlChannel
             for (int i = 0; i < n; i++)
             {
                 if (buf[i] != '\n') continue;
-                sb.Append(buf, start, i - start);
+                int segLen = i - start;
+                if (sb.Length + segLen > MaxFrameChars)
+                {
+                    throw new InvalidDataException($"Control frame exceeded {MaxFrameChars} chars.");
+                }
+                sb.Append(buf, start, segLen);
                 if (sb.Length > 0 && sb[sb.Length - 1] == '\r') sb.Length--;
                 return sb.ToString();
             }
 
-            sb.Append(buf, 0, n);
-            if (sb.Length > MaxLineChars)
+            if (sb.Length + n > MaxFrameChars)
             {
-                throw new InvalidDataException($"Control frame exceeded {MaxLineChars} chars.");
+                throw new InvalidDataException($"Control frame exceeded {MaxFrameChars} chars.");
             }
+            sb.Append(buf, 0, n);
         }
     }
 
@@ -484,11 +501,16 @@ public sealed class ControlClient : IControlChannel
                 }
                 catch (InvalidDataException ex)
                 {
-                    // Hostile/corrupt over-cap frame: drop the connection (state
-                    // stays Connected so the finally below reconnects) and record
-                    // why. The unread remainder is discarded with the pipe.
+                    // Hostile/corrupt over-cap frame: drop the connection and
+                    // reconnect explicitly. Reconnecting (not Connected) fires
+                    // StateChanged so the UI learns the reason; the read-loop
+                    // finally skips its own reconnect because ClosePipe
+                    // cancelled this loop's token — the explicit ConnectAsync
+                    // below is the single reconnect owner. The unread remainder
+                    // is discarded with the pipe.
                     ClosePipe();
-                    SetState(ClientState.Connected, ex.Message);
+                    SetState(ClientState.Reconnecting, ex.Message);
+                    _ = ConnectAsync(CancellationToken.None);
                     break;
                 }
 
@@ -522,13 +544,25 @@ public sealed class ControlClient : IControlChannel
         }
         finally
         {
+            // Take ownership of this connection's reader/CTS only if no newer
+            // connection replaced it (ClosePipe owns the replaced case).
+            StreamReader? ownedReader = null;
+            CancellationTokenSource? ownedCts = null;
             lock (_gate)
             {
                 if (ReferenceEquals(_pipe, pipe))
                 {
                     _pipe = null;
+                    ownedReader = _reader;
+                    ownedCts = _loopCts;
+                    _reader = null;
+                    _loopCts = null;
                 }
             }
+
+            ownedReader?.Dispose();
+            try { ownedCts?.Cancel(); } catch { /* already disposed */ }
+            ownedCts?.Dispose();
 
             FailAllPending();
 
@@ -555,16 +589,31 @@ public sealed class ControlClient : IControlChannel
         }
     }
 
+    /// <summary>Full teardown of the current connection: the pipe, its
+    /// StreamReader, and the read loop's CancellationTokenSource (cancelling
+    /// unblocks a pending ReadAsync so no orphaned loop survives). Each piece
+    /// is nulled under the gate first, so concurrent ClosePipe calls and the
+    /// read-loop finally dispose each object at most once per connection.
+    /// </summary>
     private void ClosePipe()
     {
         NamedPipeClientStream? pipe;
+        StreamReader? reader;
+        CancellationTokenSource? loopCts;
         lock (_gate)
         {
             pipe = _pipe;
+            reader = _reader;
+            loopCts = _loopCts;
             _pipe = null;
+            _reader = null;
+            _loopCts = null;
         }
 
+        try { loopCts?.Cancel(); } catch { /* already disposed */ }
         pipe?.Dispose();
+        reader?.Dispose();
+        loopCts?.Dispose();
     }
 
     private void SetState(ClientState state, string? error)

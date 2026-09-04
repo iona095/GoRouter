@@ -26,6 +26,11 @@ public sealed partial class FirstRunFlow : Form
     // from UI memory and taken back from the clipboard on close/expiry.
     private string? _shownCredential;
     private System.Windows.Forms.Timer? _credentialClipboardTimer;
+    /// <summary>Credential value the clipboard timer is currently armed for
+    /// (null when disarmed). Prevents repeated Copy clicks from extending the
+    /// exposure window and lets Tick null the field before disposing, so a
+    /// later Stop() can never touch a disposed instance.</summary>
+    private string? _clipboardArmedFor;
 
     private readonly Panel _content = new() { Dock = DockStyle.Fill, Padding = new Padding(24, 16, 24, 8) };
     private readonly Label _lblStep = new() { AutoSize = true, AccessibleName = "Onboarding step indicator" };
@@ -98,9 +103,36 @@ public sealed partial class FirstRunFlow : Form
         ShowStep(1);
     }
 
+    /// <summary>Recursively clears every TextBox under a container. Required
+    /// because credential boxes live nested in layout panels — a flat
+    /// Controls.OfType&lt;TextBox&gt;() finds none of them.</summary>
+    private static void ClearTextBoxes(Control.ControlCollection controls)
+    {
+        foreach (Control child in controls)
+        {
+            if (child is TextBox txt) txt.Clear();
+            if (child.HasChildren) ClearTextBoxes(child.Controls);
+        }
+    }
+
+    private static void DisposeControls(Control.ControlCollection controls)
+    {
+        foreach (Control child in controls)
+        {
+            child.Dispose();
+        }
+    }
+
     private void ShowStep(int step)
     {
         _step = step;
+        // Scrub on navigation, not just on close: leaving the credential step
+        // must not keep the one-time secret in the undisposed controls or in
+        // _shownCredential. Best effort (managed strings cannot be zeroed),
+        // so the clipboard timer and close-scrub below stay as backstops.
+        ClearTextBoxes(_content.Controls);
+        DisposeControls(_content.Controls);
+        _shownCredential = null;
         _content.Controls.Clear();
         _lblStep.Text = $"Step {step} of {StepCount}";
         _btnBack.Enabled = step > 1;
@@ -229,7 +261,17 @@ public sealed partial class FirstRunFlow : Form
         {
             if (txtCredential.Text.Length > 0)
             {
-                Clipboard.SetText(txtCredential.Text);
+                try
+                {
+                    Clipboard.SetText(txtCredential.Text);
+                }
+                catch
+                {
+                    // Locked clipboard: report honestly instead of arming a
+                    // clear for text that never landed.
+                    status.Text = "Could not copy: the clipboard is busy. Try again.";
+                    return;
+                }
                 btnCopy.Text = "Copied";
                 ArmCredentialClipboardClear(txtCredential.Text);
             }
@@ -574,14 +616,33 @@ public sealed partial class FirstRunFlow : Form
 
     /// <summary>Takes the one-time credential back from the shared clipboard
     /// after a short window — but only if the clipboard still holds our exact
-    /// text, so content the user copied afterwards is never clobbered.</summary>
+    /// text, so content the user copied afterwards is never clobbered. Armed
+    /// once per credential value: repeated Copy clicks do not extend the
+    /// exposure window.</summary>
     private void ArmCredentialClipboardClear(string credential)
     {
-        _credentialClipboardTimer?.Stop();
-        _credentialClipboardTimer?.Dispose();
-        var timer = new System.Windows.Forms.Timer { Interval = 30_000 };
+        if (_clipboardArmedFor == credential && _credentialClipboardTimer is not null)
+        {
+            return; // already armed for this value; do not extend the window
+        }
+        var prev = _credentialClipboardTimer;
+        _credentialClipboardTimer = null;
+        _clipboardArmedFor = null;
+        if (prev is not null)
+        {
+            // prev is either live (Stop is safe) or already fired-and-nulled
+            // (never a disposed instance: Tick nulls the field first).
+            try { prev.Stop(); } catch { /* already disposed */ }
+            prev.Dispose();
+        }
+        var timer = new System.Windows.Forms.Timer { Interval = 10_000 };
         timer.Tick += (_, _) =>
         {
+            if (ReferenceEquals(_credentialClipboardTimer, timer))
+            {
+                _credentialClipboardTimer = null;
+                _clipboardArmedFor = null;
+            }
             timer.Stop();
             timer.Dispose();
             try
@@ -593,26 +654,56 @@ public sealed partial class FirstRunFlow : Form
             }
             catch
             {
-                // Clipboard contention (another process holds it open): the text
-                // stays, same as before this hardening.
+                // Clipboard contention: one short retry instead of leaving the
+                // credential indefinitely. Retry only if the user has not
+                // armed a newer value since.
+                if (_credentialClipboardTimer is null)
+                {
+                    var retry = new System.Windows.Forms.Timer { Interval = 5_000 };
+                    retry.Tick += (_, _) =>
+                    {
+                        if (ReferenceEquals(_credentialClipboardTimer, retry))
+                        {
+                            _credentialClipboardTimer = null;
+                            _clipboardArmedFor = null;
+                        }
+                        retry.Stop();
+                        retry.Dispose();
+                        try
+                        {
+                            if (Clipboard.ContainsText() && Clipboard.GetText() == credential)
+                            {
+                                Clipboard.Clear();
+                            }
+                        }
+                        catch { /* best effort only */ }
+                    };
+                    _credentialClipboardTimer = retry;
+                    retry.Start();
+                }
             }
         };
         _credentialClipboardTimer = timer;
+        _clipboardArmedFor = credential;
         timer.Start();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        _credentialClipboardTimer?.Stop();
-        _credentialClipboardTimer?.Dispose();
+        var timer = _credentialClipboardTimer;
         _credentialClipboardTimer = null;
-
-        // Clear every TextBox unconditionally: the one-time credential box is
-        // read-only (not masked-by-filter), so a password-only filter misses it.
-        foreach (var txt in _content.Controls.OfType<TextBox>())
+        _clipboardArmedFor = null;
+        if (timer is not null)
         {
-            txt.Clear();
+            try { timer.Stop(); } catch { /* already fired */ }
+            timer.Dispose();
         }
+
+        // Clear every TextBox recursively and unconditionally: the one-time
+        // credential box lives nested in a layout panel, so a flat control
+        // enumeration misses it — and a password-only filter misses it because
+        // it is read-only, not masked.
+        ClearTextBoxes(_content.Controls);
 
         // Take the credential back from the clipboard if it is still ours.
         try

@@ -242,6 +242,13 @@ describe('in-process control core', () => {
     core.stop(false)
     await new Promise((r) => setTimeout(r, 650))
     expect(post).toBe(0)
+    // And noteChange() after stop() must not re-arm anything.
+    core.noteChange()
+    await new Promise((r) => setTimeout(r, 650))
+    expect(post).toBe(0)
+    // Unsubscribe is idempotent; double-stop is safe.
+    unsub()
+    core.stop(false)
   }, { timeout: 15000 })
 
   test('journal.recent returns seeded rows newest-first with only safe fields', () => {

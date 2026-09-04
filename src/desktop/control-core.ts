@@ -312,6 +312,11 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   }
 
   function noteChange(): void {
+    // Post-teardown emissions are the exact hole F-28 closes: stop() cancels
+    // the pending timer, and anything scheduled afterwards (external callers,
+    // or a synchronous supervisor.close() callback racing the clear) must not
+    // invoke detached listeners against a closed supervisor.
+    if (!started) return
     if (emitScheduled) return
     emitScheduled = true
     const gap = Date.now() - lastEmitAt
