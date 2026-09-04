@@ -6,7 +6,7 @@
  * carry the admin token: missing/wrong token -> auth error response then the
  * connection is closed. Op dispatch is concurrent — responses are matched by
  * id and may return out of order. `push(event, data)` broadcasts to all
- * authenticated clients.
+ * hello-completed clients (token auth gates frames; hello gates pushes).
  */
 import net, { type Server, type Socket } from 'node:net'
 import { timingSafeEqual } from 'node:crypto'
@@ -110,7 +110,10 @@ export function serveControlPipe(
           socket.destroy()
           return
         }
-        clients.add(socket)
+        // Broadcast membership is granted on completed hello (F-29), not on
+        // connect or first authenticated frame: a socket that never finishes
+        // the handshake must not receive push events. Token auth above still
+        // gates every frame; this only scopes the push set.
         const id = typeof msg.id === 'number' ? msg.id : 0
         if (typeof msg.op !== 'string' || msg.op.length === 0) {
           send({ id, ok: false, error: { code: 'validation', message: 'missing op' } })
@@ -130,9 +133,15 @@ export function serveControlPipe(
           .then(
             (data) => {
               send({ id, ok: true, data })
-              if (msg.op === 'hello' && onHello) onHello()
+              if (msg.op === 'hello') {
+                clients.add(socket)
+                if (onHello) onHello()
+              }
             },
             (err) => {
+              // A FAILED hello must not subscribe (F-29): the socket stays
+              // usable for a retry, but receives no pushes until one succeeds.
+              if (msg.op === 'hello') clients.delete(socket)
               const e = err as { code?: unknown; message?: unknown }
               const code =
                 typeof e.code === 'string' && ERROR_CODES[e.code as ErrorCode] ? (e.code as ErrorCode) : 'internal'

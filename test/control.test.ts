@@ -615,6 +615,47 @@ async function connectPipe(pipeName: string, token: string, timeoutMs = 10_000):
   throw new Error(`pipe connect timed out: ${String(lastErr)}`)
 }
 
+describe('transport hello-gate (F-29)', () => {
+  test('push reaches only hello-completed sockets', async () => {
+    const { serveControlPipe } = await import('../src/desktop/transport.ts')
+    const pipeName = `\\\\.\\pipe\\gorouter-hello-gate-${randomUUID()}`
+    const token = 'test-token'
+    const transport = serveControlPipe(
+      pipeName,
+      token,
+      async (op) => {
+        if (op === 'hello') return { version: '1.5.0' }
+        if (op === 'ping') return { pong: true }
+        throw Object.assign(new Error('unsupported op'), { code: 'unsupported' })
+      },
+    )
+    await transport.listening
+    const frames: string[] = []
+    const raw = net.connect({ path: pipeName })
+    await new Promise<void>((res, rej) => {
+      raw.once('connect', () => res())
+      raw.once('error', rej)
+    })
+    raw.on('data', (d: Buffer) => frames.push(d.toString('utf8')))
+    const blob = () => frames.join('')
+    // Authenticated but pre-hello: ping is rejected AND no pushes arrive.
+    raw.write(JSON.stringify({ id: 1, token, op: 'ping' }) + '\n')
+    await waitFor(() => blob().includes('"id":1'), 5_000)
+    expect(blob()).toContain('hello must be the first message')
+    transport.push('snap', { n: 1 })
+    await sleep(300)
+    expect(blob()).not.toContain('"event":"snap"')
+    // Completed hello subscribes: pushes arrive from here on.
+    raw.write(JSON.stringify({ id: 2, token, op: 'hello', params: {} }) + '\n')
+    await waitFor(() => blob().includes('"id":2,"ok":true'), 5_000)
+    transport.push('snap', { n: 2 })
+    await waitFor(() => blob().includes('"event":"snap"'), 5_000)
+    expect(blob()).toContain('"n":2')
+    raw.destroy()
+    await transport.close()
+  })
+})
+
 describe('real pipe integration', () => {
   test('frame cap: many coalesced small frames process; oversized partial line closes', async () => {
     const stateDir = freshStateDir()
