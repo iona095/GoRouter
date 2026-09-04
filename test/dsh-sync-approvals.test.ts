@@ -539,7 +539,9 @@ describe("FileDshClient metadata under approval gating", () => {
     const reg = authoritativeReg(["go-a", "go-new"], ["zen-x"]);
     const st = await reconcileDshCatalog(reg, client as unknown as DshClient, { approvalStore: initStore(["go-a", "go-new"], ["zen-x"]) });
     expect(st.outcome).toBe("current");
-    const raw = JSON.parse(readFileSync(settingsPath, "utf8")) as { "llm-pi-ai": { providers: Record<string, Record<string, unknown>> } };
+    // The file is YAML (block style) since M5 fidelity — parse as YAML.
+    const { parse: parseYaml } = await import("yaml");
+    const raw = parseYaml(readFileSync(settingsPath, "utf8")) as { "llm-pi-ai": { providers: Record<string, Record<string, unknown>> } };
     const providers = raw["llm-pi-ai"].providers;
     // Binding-relevant metadata (api/baseURL) — the approval-gate's own inputs — preserved verbatim
     expect(providers["gorouter-go"]!["api"]).toBe("openai-completions");
@@ -551,6 +553,59 @@ describe("FileDshClient metadata under approval gating", () => {
     expect(providers["openrouter"]!["models"]).toEqual([{ id: "other" }]);
     // Models updated per approvals
     expect((providers["gorouter-go"]!["models"] as ModelEntry[]).map((m) => m.id).sort()).toEqual(["go-a", "go-new"]);
+  });
+
+  test("mutation preserves comments, anchors, key order and style (M5 fidelity)", async () => {
+    const { paths } = freshPaths();
+    const settingsPath = join(paths.state, "settings.yaml");
+    const before = [
+      "# Operator header comment (must survive sync writes)",
+      "custom-top-level: true # inline comment",
+      "llm-pi-ai:",
+      "  # providers section comment",
+      "  providers:",
+      "    gorouter-go: # go binding comment",
+      '      displayName: Go',
+      '      api: openai-completions',
+      '      baseURL: http://127.0.0.1:8787/go/v1',
+      "      apiKeyEnv: OPENCODE_API_KEY",
+      "      models: # old models, replaced below",
+      "        - id: go-a",
+      "    shared-alias: &alias", // anchor the fidelity path must not disturb
+      '      key: shared-value',
+      "    gorouter-zen:",
+      '      displayName: Zen',
+      '      api: openai-responses',
+      '      baseURL: http://127.0.0.1:8787/zen/v1',
+      "      models:",
+      "        - id: zen-x",
+      "",
+    ].join("\n");
+    writeFileSync(settingsPath, before, "utf8");
+    const client = new FileDshClient(settingsPath, null);
+    const snap = await client.read();
+    expect(snap).not.toBeNull();
+    if (!snap) return;
+    await client.mutate([{ id: "go-a" }, { id: "go-new" }] as ModelEntry[], [{ id: "zen-x" }] as ModelEntry[], snap.revision);
+    const after = readFileSync(settingsPath, "utf8");
+    // Fidelity: operator content survives outside the two replaced sequences
+    // (an end-of-line comment on a nested map key is reflowed to its own
+    // line by the CST — content preserved, placement normalized).
+    for (const line of [
+      "# Operator header comment (must survive sync writes)",
+      "custom-top-level: true # inline comment",
+      "# providers section comment",
+      "# go binding comment",
+      "shared-alias: &alias",
+    ]) {
+      expect(after).toContain(line);
+    }
+    // Models updated, anchors/keys intact, file still parses.
+    expect(after).toContain("go-new");
+    expect(after).toContain("zen-x");
+    const raw = JSON.parse(JSON.stringify(await client.read()));
+    expect(raw.go.map((m: ModelEntry) => m.id).sort()).toEqual(["go-a", "go-new"]);
+    expect(raw.zen.map((m: ModelEntry) => m.id)).toEqual(["zen-x"]);
   });
 });
 

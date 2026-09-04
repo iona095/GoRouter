@@ -173,19 +173,51 @@ async function parseSettingsYaml(text: string): Promise<Record<string, unknown>>
   }
 }
 
-function serializeSettingsYaml(doc: Record<string, unknown>): string {
-  // Bundled yaml stringify — preserves comments/anchors on read side is not needed
-  // because we write leaf-level diff semantics (caller preserves unrelated fields);
-  // using JSON output would still be valid YAML 1.2, but bundled yaml proves artifact independence.
-  // We emit YAML via parseDocument-style stringify for fidelity to DSH FileSettingsProvider.
-  // Keep deterministic: use yaml stringify if available, else JSON fallback (both valid).
+/**
+ * Fidelity-preserving render (M5): the operator's settings.yaml may carry
+ * comments, anchors, key order and style choices that a JSON re-serialize
+ * destroys. Parse to a CST Document, replace ONLY the two owned models
+ * sequences in place, and stringify — everything else (comments, unrelated
+ * providers, top-level keys, style) survives byte-for-byte where the CST
+ * allows. Any surprise (YAML errors, non-map namespace, reparse mismatch)
+ * falls back to the previous JSON output (valid YAML 1.2, DSH re-parses
+ * either) — fidelity is best-effort, validity is guaranteed.
+ */
+async function renderSettingsYaml(
+  sourceText: string,
+  desiredGo: ModelEntry[],
+  desiredZen: ModelEntry[],
+  fallbackDoc: Record<string, unknown>,
+): Promise<string> {
+  const fallback = JSON.stringify(fallbackDoc, null, 2) + "\n";
   try {
-    // Lazy import would be async; serialize is sync, so use JSON which is valid YAML 1.2.
-    // The parse path above proves yaml is bundled; serialize via JSON satisfies the file seam
-    // because the reader (parse) accepts both. No loss: DSH re-parses either.
-    return JSON.stringify(doc, null, 2) + "\n";
+    const yamlMod = (await import("yaml")) as unknown as {
+      parseDocument: (t: string) => {
+        errors: unknown[];
+        setIn: (path: string[], v: unknown) => void;
+        createNode: (v: unknown) => unknown;
+        toString: () => string;
+      };
+    };
+    const doc = yamlMod.parseDocument(sourceText.trim() === "" ? "{}\n" : sourceText);
+    if (!doc || doc.errors.length > 0) return fallback;
+    doc.setIn([DSH_NAMESPACE, "providers", "gorouter-go", "models"], doc.createNode(desiredGo));
+    doc.setIn([DSH_NAMESPACE, "providers", "gorouter-zen", "models"], doc.createNode(desiredZen));
+    const out = doc.toString();
+    // Fail-safe: the CST round-trip must yield exactly the intended models;
+    // otherwise the file gets the valid-JSON fallback, never a surprise.
+    const check = await parseSettingsYaml(out);
+    const ns = (check[DSH_NAMESPACE] as Record<string, unknown> | undefined) ?? {};
+    const provs = (ns["providers"] as Record<string, unknown> | undefined) ?? {};
+    const ids = (lane: string): string[] =>
+      (((provs[lane] as Record<string, unknown> | undefined)?.["models"] as ModelEntry[] | undefined) ?? []).map((m) => m.id);
+    const wantGo = desiredGo.map((m) => m.id);
+    const wantZen = desiredZen.map((m) => m.id);
+    if (JSON.stringify(ids("gorouter-go")) !== JSON.stringify(wantGo)) return fallback;
+    if (JSON.stringify(ids("gorouter-zen")) !== JSON.stringify(wantZen)) return fallback;
+    return out;
   } catch {
-    return JSON.stringify(doc, null, 2) + "\n";
+    return fallback;
   }
 }
 
@@ -420,7 +452,7 @@ export class FileDshClient implements DshClient {
       const nextProviders = { ...curProviders, ["gorouter-go"]: nextGoProv, ["gorouter-zen"]: nextZenProv };
       const nextNsRaw = { ...(curNsRaw as Record<string, unknown>), providers: nextProviders };
       const nextDoc = { ...doc, [DSH_NAMESPACE]: nextNsRaw };
-      const text = serializeSettingsYaml(nextDoc);
+      const text = await renderSettingsYaml(currentText, desiredGo, desiredZen, nextDoc);
       // Commit via the same atomic sibling+rename as dsh-atomic-write/writeFileAtomic
       await writeFileAtomic(this.filePath, text, 0o600);
       let newRev: number;

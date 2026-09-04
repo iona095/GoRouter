@@ -24,7 +24,7 @@ import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore, makeAccount } from "../src/state.ts";
 import { createJournal } from "../src/journal.ts";
 import { createServer } from "../src/server.ts";
-import { memSecrets, LOCAL_KEY, authHeaders, startMockUpstream, startTestRouter as _unused } from "./harness.ts";
+import { memSecrets, LOCAL_KEY, authHeaders, startMockUpstream, startTestRouter as _unused, readYamlFile } from "./harness.ts";
 import { createDomain } from "../src/domain.ts";
 import {
   MODELS_SCHEMA_VERSION,
@@ -507,7 +507,7 @@ describe("unrelated settings preserved (FileDshClient real file seam)", () => {
     const reg = authoritativeReg(["go-a","go-new"], ["zen-b"]);
     const st = await reconcileDshCatalog(reg, client as unknown as DshClient, { approvalStore: initStore(["go-a","go-new"], ["zen-b"]) });
     expect(st.outcome).toBe("current");
-    const raw = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+    const raw = await readYamlFile<Record<string, unknown>>(settingsPath);
     const ns = (raw["llm-pi-ai"] as Record<string, unknown>);
     const providers = ns["providers"] as Record<string, Record<string, unknown>>;
     // unrelated namespace preserved
@@ -1397,8 +1397,9 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
 
   async function dshLikeMutateUnrelated(filename: string, key: string, value: unknown): Promise<void> {
     await dshLikeWithFileLock(filename, async () => {
-      const text = readFileSync(filename, "utf8");
-      const doc = JSON.parse(text) as Record<string, unknown>;
+      // The real external DSH host parses genuine YAML (yaml package), not
+      // JSON — the double reads the same way so the race keeps its teeth.
+      const doc = await readYamlFile<Record<string, unknown>>(filename);
       const ns = (doc["llm-pi-ai"] as Record<string, unknown>) ?? {};
       const providers = (ns["providers"] as Record<string, unknown>) ?? {};
       // mutate an unrelated provider key (not gorouter-go/zen models)
@@ -1461,10 +1462,14 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
       // OR if revision conflict style: exactly one of the two could conflict if they shared expectedRevision semantics.
       // Here B is not revision-checked but lock-serialized: so both should fulfill (B holds lock, then A holds lock, both commit sequentially).
       // Verify file integrity:
-      const text = readFileSync(settingsPath, "utf8");
-      let parsed: unknown;
-      expect(() => { parsed = JSON.parse(text); }).not.toThrow();
-      const doc = parsed as Record<string, unknown>;
+      // File is YAML since M5 fidelity: parseable means yaml-parseable.
+      let doc: Record<string, unknown>;
+      try {
+        doc = await readYamlFile<Record<string, unknown>>(settingsPath);
+      } catch (e) {
+        expect(`file unparseable: ${e instanceof Error ? e.message : String(e)}`).toBe("parseable");
+        return;
+      }
       const ns = (doc["llm-pi-ai"] as Record<string, unknown>);
       expect(ns).toBeDefined();
       if (aOk) successes++;
@@ -1477,10 +1482,9 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
         expect(other?.[`race-${i}`]).toBe(`val-${i}`);
       }
     }
-    // No corruption across iterations; lock prevented torn writes.
+    // No corruption across iterations; lock prevented torn writes (YAML since M5).
     expect(successes + conflicts).toBe(iterations);
-    const finalText = readFileSync(settingsPath, "utf8");
-    expect(() => JSON.parse(finalText)).not.toThrow();
+    await readYamlFile(settingsPath);
   });
 
   test("CROSS_PROCESS_LOST_UPDATE_PROOF: repeated barrier races — 20 concurrent FileDshClient readers vs DSH-like writers, unrelated provider always survives", async () => {
@@ -1507,10 +1511,13 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
       // Both use shared .lock so both should commit sequentially; file must be parseable and contain B''s key.
       // If A conflicted due to stale revision (because B committed first and A''s rev was stale), that''s expected when B wins the lock first
       // and A''s final check sees changed content hash — still not a lost update: B''s key survives either way.
-      const finalText = readFileSync(settingsPath, "utf8");
-      let parsed: unknown;
-      expect(() => { parsed = JSON.parse(finalText); }).not.toThrow();
-      const doc = parsed as Record<string, unknown>;
+      let doc: Record<string, unknown>;
+      try {
+        doc = await readYamlFile<Record<string, unknown>>(settingsPath);
+      } catch (e) {
+        expect(`file unparseable: ${e instanceof Error ? e.message : String(e)}`).toBe("parseable");
+        return;
+      }
       const ns = doc["llm-pi-ai"] as Record<string, unknown>;
       const providers = ns["providers"] as Record<string, unknown>;
       const other = providers["other-provider"] as Record<string, unknown> | undefined;
@@ -1526,7 +1533,7 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
         // Should be DshConflictError, not a file corruption.
         expect(err.message).toMatch(/changed since it was read|conflict/i);
         // B''s unrelated key must still exist (FileDshClient would have conflicted, not overwritten).
-        const still = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+        const still = await readYamlFile<Record<string, unknown>>(settingsPath);
         const stillNs = (still["llm-pi-ai"] as Record<string, unknown>);
         const stillProv = (stillNs["providers"] as Record<string, unknown>);
         const stillOther = stillProv["other-provider"] as Record<string, unknown> | undefined;
@@ -1537,7 +1544,7 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
         // If B succeeded earlier, A''s FileDshClient re-reads latest doc inside withFileLock before render, so B''s key is merged.
         // Thus both serial commits under shared lock preserve each other.
         if (bRes.status === "fulfilled") {
-          const fd = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, unknown>;
+          const fd = await readYamlFile<Record<string, unknown>>(settingsPath);
           const fns = (fd["llm-pi-ai"] as Record<string, unknown>);
           const fprov = (fns["providers"] as Record<string, unknown>);
           const fother = fprov["other-provider"] as Record<string, unknown> | undefined;
@@ -1550,8 +1557,7 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
     expect(lostUpdates).toBe(0);
     const finalSnap = await client.read();
     expect(finalSnap).not.toBeNull();
-    const finalRaw = readFileSync(settingsPath, "utf8");
-    expect(() => JSON.parse(finalRaw)).not.toThrow();
+    await readYamlFile(settingsPath); // still parseable after the races
   });
 
   test("REVISION_SAFE is PASS only when FINAL_CHECK_TO_RENAME_RACE and CROSS_PROCESS_LOST_UPDATE_PROOF both PASS (meta)", () => {

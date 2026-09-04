@@ -162,6 +162,16 @@ export async function startTestRouter(opts: {
   };
 }
 
+/**
+ * Read a settings.yaml written by FileDshClient (block-style YAML since M5
+ * fidelity — JSON.parse no longer reads it back).
+ */
+export async function readYamlFile<T = unknown>(p: string): Promise<T> {
+  const { readFileSync } = await import("node:fs");
+  const { parse } = await import("yaml");
+  return parse(readFileSync(p, "utf8")) as T;
+}
+
 export function authHeaders(extra?: Record<string, string>): Headers {
   const h = new Headers({ authorization: `Bearer ${LOCAL_KEY}` });
   for (const [k, v] of Object.entries(extra ?? {})) h.set(k, v);

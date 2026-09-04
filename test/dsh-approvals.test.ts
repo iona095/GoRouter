@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import { resolvePaths, ensureStateDirs, type Paths } from "../src/paths.ts";
 import { createStateStore } from "../src/state.ts";
 import type { Lane } from "../src/state.ts";
-import { memSecrets } from "./harness.ts";
+import { memSecrets, readYamlFile } from "./harness.ts";
 import { createDomain } from "../src/domain.ts";
 import { MODELS_SCHEMA_VERSION, type RegistryFile, type LaneSnapshot, type ModelEntry } from "../src/models/types.ts";
 import { registryPathFor, loadRegistry, storeRegistry } from "../src/models/registry.ts";
@@ -660,7 +660,7 @@ describe("migration", () => {
     const reg = registryFile({ goIds: ["legacy-go-1"], zenIds: ["legacy-zen-1"] });
     const client = new FileDshClient(settingsPath);
     const status = await reconcile(reg, client, loadApprovalStore(st.paths));
-    const after = JSON.parse(readFileSync(settingsPath, "utf8")) as typeof settingsDoc;
+    const after = await readYamlFile<typeof settingsDoc>(settingsPath);
     // Owned arrays already hold exactly the approved registry models: semantic no-op.
     expect(status.outcome).toBe("no-op");
     expect(status.mutationPerformed).toBe(false);
