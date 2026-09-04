@@ -1229,7 +1229,9 @@ public sealed class ControlCenterForm : Form
             TabIndex = 1,
             AccessibleName = "Refresh journal",
         };
-        _btnJournalRefresh.Click += (_, _) => _ = RefreshJournalAsync();
+        // Visual slice 8: the explicit Refresh click carries a busy
+        // affordance (tab-selection refreshes reuse the quiet path below).
+        _btnJournalRefresh.Click += (_, _) => _ = RefreshJournalWithBusyAsync();
         header.Controls.Add(_btnJournalBack, 0, 0);
         header.Controls.Add(_lblJournalStats, 1, 0);
         header.Controls.Add(_btnJournalRefresh, 2, 0);
@@ -2421,11 +2423,67 @@ public sealed class ControlCenterForm : Form
     // Journal
     // ------------------------------------------------------------------
 
-    private async Task RefreshJournalAsync()
+    // Visual slice 8: user-clicked refresh shows a busy button while the
+    // call runs and pulses the stats line on success. Tab-selection and
+    // tick-driven refreshes keep the quiet path (no button flash, no pulse).
+    private async Task RefreshJournalWithBusyAsync()
     {
         if (_journalRefreshing || _clientState != ClientState.Connected)
         {
             return;
+        }
+
+        var originalText = _btnJournalRefresh.Text;
+        _btnJournalRefresh.Enabled = false;
+        _btnJournalRefresh.Text = "Refreshing…";
+        try
+        {
+            if (await RefreshJournalAsync())
+            {
+                PulseLabelOnce(_lblJournalStats);
+            }
+        }
+        finally
+        {
+            if (!IsDisposed && !Disposing)
+            {
+                _btnJournalRefresh.Enabled = true;
+                _btnJournalRefresh.Text = originalText;
+            }
+        }
+    }
+
+    /// <summary>Brief success pulse: stats line flashes healthy, then rests.
+    /// One-shot UI timer, guarded against close/dispose mid-pulse.</summary>
+    private void PulseLabelOnce(Label label)
+    {
+        if (IsDisposed || Disposing || label.IsDisposed)
+        {
+            return;
+        }
+
+        var rest = label.ForeColor;
+        label.ForeColor = VisualTheme.Healthy;
+        var timer = new System.Windows.Forms.Timer { Interval = 650 };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            timer.Dispose();
+            if (!IsDisposed && !Disposing && !label.IsDisposed)
+            {
+                // Re-resolve: a theme toggle inside the pulse window must
+                // not restore a stale color.
+                label.ForeColor = VisualTheme.Map(rest);
+            }
+        };
+        timer.Start();
+    }
+
+    private async Task<bool> RefreshJournalAsync()
+    {
+        if (_journalRefreshing || _clientState != ClientState.Connected)
+        {
+            return false;
         }
 
         _journalRefreshing = true;
@@ -2452,6 +2510,8 @@ public sealed class ControlCenterForm : Form
 
                 // The home preview renders from the same response payload.
                 RenderRecentActivity(data.Rows, degraded, degraded ? UiText.Truncate(data.Error ?? _snapshot.Journal.LastError) : null);
+                // Pulse only on clean success: degraded shows its own banner.
+                return !degraded;
             }
             else
             {
@@ -2459,6 +2519,7 @@ public sealed class ControlCenterForm : Form
                 _lblJournalDegraded.Text = UiText.Truncate("Journal unavailable: " + (response.ErrorMessage ?? "unknown error"));
                 _lblJournalEmpty.Visible = false;
                 RenderRecentActivity(Array.Empty<JournalRow>(), true, UiText.Truncate(response.ErrorMessage ?? "read failure"));
+                return false;
             }
         }
         catch (Exception ex)
@@ -2467,6 +2528,7 @@ public sealed class ControlCenterForm : Form
             _lblJournalDegraded.Text = UiText.Truncate("Journal unavailable: " + ex.Message);
             _lblJournalEmpty.Visible = false;
             RenderRecentActivity(Array.Empty<JournalRow>(), true, UiText.Truncate(ex.Message));
+            return false;
         }
         finally
         {
@@ -2585,6 +2647,9 @@ public sealed class ControlCenterForm : Form
         }
 
         _lblPortError.Text = "";
+        _btnApplyPort.Enabled = false;
+        var portText = _btnApplyPort.Text;
+        _btnApplyPort.Text = "Applying…";
         try
         {
             var response = await _channel.CallAsync("config.set", new { key = "port", value = raw }, 15_000);
@@ -2600,6 +2665,11 @@ public sealed class ControlCenterForm : Form
         catch (Exception ex)
         {
             _lblPortError.Text = UiText.Truncate("Port change failed: " + ex.Message);
+        }
+        finally
+        {
+            _btnApplyPort.Enabled = true;
+            _btnApplyPort.Text = portText;
         }
     }
 
@@ -2618,6 +2688,9 @@ public sealed class ControlCenterForm : Form
         }
 
         _lblRetentionError.Text = "";
+        _btnApplyRetention.Enabled = false;
+        var retentionText = _btnApplyRetention.Text;
+        _btnApplyRetention.Text = "Applying…";
         try
         {
             var response = await _channel.CallAsync("config.set", new { key = "journalRetentionDays", value = days.ToString() }, 15_000);
@@ -2639,6 +2712,11 @@ public sealed class ControlCenterForm : Form
         catch (Exception ex)
         {
             _lblRetentionError.Text = UiText.Truncate("Journal settings failed: " + ex.Message);
+        }
+        finally
+        {
+            _btnApplyRetention.Enabled = true;
+            _btnApplyRetention.Text = retentionText;
         }
     }
 

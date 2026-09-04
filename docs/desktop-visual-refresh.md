@@ -102,7 +102,7 @@ endpoint text (state display lives in exactly one place).
   no placeholder groups ship.
 - Micro-feedback last and never on the snapshot tick path (fade on
   refresh, press states, probe progress); dirty-check and fingerprint
-  guards from the perf pass stay authoritative.
+  guards from the perf pass stay authoritative. Slice 8: busy buttons on explicit Refresh/Apply clicks (quiet path otherwise); 650ms stats-line pulse on clean user refresh; outline-tinted hovers; probe marquee already existed.
 - Slice order: header + lane cards → type/spacing → empty states + chips →
   tray pip → dark toggle → System cleanup → micro-feedback.
 

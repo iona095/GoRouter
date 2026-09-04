@@ -178,8 +178,9 @@ internal class StyledSelector : ComboBox, IThemeAware
 
 /// <summary>
 /// Flat outline action button: white surface, 1px colored border, colored
-/// text, hover fill. Disabled state renders gray. Danger() = red outline for
-/// destructive actions; Neutral() = blue outline for regular actions.
+/// text, tinted hover fill, neutral press. Disabled state renders gray.
+/// Danger() = red outline for destructive actions; Neutral() = blue
+/// outline for regular actions.
 /// </summary>
 internal class ActionButton : Button, IThemeAware
 {
@@ -202,14 +203,14 @@ internal class ActionButton : Button, IThemeAware
     internal static ActionButton Danger(string text)
     {
         var button = new ActionButton { Text = text };
-        button.SetOutline(VisualTheme.Danger);
+        button.SetOutline(VisualTheme.Danger, VisualTheme.ErrorBoxBack);
         return button;
     }
 
     internal static ActionButton Neutral(string text)
     {
         var button = new ActionButton { Text = text };
-        button.SetOutline(VisualTheme.AccentZen);
+        button.SetOutline(VisualTheme.AccentZen, VisualTheme.SelectedRowBack);
         return button;
     }
 
@@ -219,12 +220,16 @@ internal class ActionButton : Button, IThemeAware
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     internal Color TextColor { get; private set; } = VisualTheme.PrimaryText;
 
-    private void SetOutline(Color color)
+    // Visual slice 8: outlined buttons hover in their own tint; the press
+    // fill stays neutral (MouseDownBackColor from the constructor). The
+    // hover tint is a token, so RefreshTheme re-resolves it like the rest.
+    private void SetOutline(Color color, Color? hover = null)
     {
         BorderColor = color;
         TextColor = color;
         FlatAppearance.BorderColor = color;
         ForeColor = color;
+        FlatAppearance.MouseOverBackColor = hover ?? VisualTheme.HoverBack;
     }
 
     protected override void OnPaint(PaintEventArgs pevent)
@@ -245,7 +250,7 @@ internal class ActionButton : Button, IThemeAware
         // plain buttons resolve text and border independently.
         if (ForeColor.ToArgb() == BorderColor.ToArgb())
         {
-            SetOutline(VisualTheme.Map(BorderColor));
+            SetOutline(VisualTheme.Map(BorderColor), VisualTheme.Map(FlatAppearance.MouseOverBackColor));
         }
         else
         {
