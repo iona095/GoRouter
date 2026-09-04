@@ -481,7 +481,7 @@ public sealed partial class FirstRunFlow : Form
                 else
                 {
                     status.ForeColor = Color.FromArgb(0xB7, 0x1C, 0x1C);
-                    status.Text = response.ErrorMessage ?? "Add account failed.";
+                    status.Text = UiText.Truncate(response.ErrorMessage ?? "Add account failed.");
                 }
             }
             catch (Exception ex)
@@ -592,7 +592,8 @@ public sealed partial class FirstRunFlow : Form
             var response = accountId is null
                 ? await _channel.CallAsync("route.clear", new { lane })
                 : await _channel.CallAsync("route.set", new { lane, accountId });
-            return response.Ok ? null : (response.ErrorMessage ?? "Route change failed.");
+            // Returned to a status label upstream: cap before crossing.
+            return response.Ok ? null : UiText.Truncate(response.ErrorMessage ?? "Route change failed.");
         }
         catch (Exception ex)
         {
@@ -663,7 +664,7 @@ public sealed partial class FirstRunFlow : Form
             {
                 // the snapshot keeps firstRun true; keep the dialog open so the
                 // completion is not silently lost (PS-04)
-                _lblError.Text = "Could not finish setup: " + (response.ErrorMessage ?? "control service did not save the change");
+                _lblError.Text = UiText.Truncate("Could not finish setup: " + (response.ErrorMessage ?? "control service did not save the change"));
                 _lblError.Visible = true;
                 _btnNext.Enabled = true;
                 return;

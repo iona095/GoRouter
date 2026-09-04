@@ -2023,7 +2023,7 @@ public sealed class ControlCenterForm : Form
                 // never keep displaying a selection that did not commit (PS-07).
                 var route = lane == "go" ? _snapshot.Routes.Go : _snapshot.Routes.Zen;
                 FillLaneCombo(cmb, route, feedback, error);
-                error.Text = response.ErrorMessage ?? "Route change failed.";
+                error.Text = UiText.Truncate(response.ErrorMessage ?? "Route change failed.");
             }
 
             UpdateLaneStatusBoxes(_snapshot.Routes.Go, _snapshot.Routes.Zen);
@@ -2321,9 +2321,9 @@ public sealed class ControlCenterForm : Form
             else
             {
                 _lblJournalDegraded.Visible = true;
-                _lblJournalDegraded.Text = "Journal unavailable: " + (response.ErrorMessage ?? "unknown error");
+                _lblJournalDegraded.Text = UiText.Truncate("Journal unavailable: " + (response.ErrorMessage ?? "unknown error"));
                 _lblJournalEmpty.Visible = false;
-                RenderRecentActivity(Array.Empty<JournalRow>(), true, response.ErrorMessage ?? "read failure");
+                RenderRecentActivity(Array.Empty<JournalRow>(), true, UiText.Truncate(response.ErrorMessage ?? "read failure"));
             }
         }
         catch (Exception ex)
@@ -2437,7 +2437,7 @@ public sealed class ControlCenterForm : Form
             }
             else
             {
-                _lblPortError.Text = response.ErrorMessage ?? "Port change refused.";
+                _lblPortError.Text = UiText.Truncate(response.ErrorMessage ?? "Port change refused.");
             }
         }
         catch (Exception ex)
@@ -2466,14 +2466,14 @@ public sealed class ControlCenterForm : Form
             var response = await _channel.CallAsync("config.set", new { key = "journalRetentionDays", value = days.ToString() }, 15_000);
             if (!response.Ok)
             {
-                _lblRetentionError.Text = response.ErrorMessage ?? "Retention change refused.";
+                _lblRetentionError.Text = UiText.Truncate(response.ErrorMessage ?? "Retention change refused.");
                 return;
             }
 
             response = await _channel.CallAsync("config.set", new { key = "journalMaxRecords", value = maxRecords.ToString() }, 15_000);
             if (!response.Ok)
             {
-                _lblRetentionError.Text = response.ErrorMessage ?? "Max records change refused.";
+                _lblRetentionError.Text = UiText.Truncate(response.ErrorMessage ?? "Max records change refused.");
                 return;
             }
 

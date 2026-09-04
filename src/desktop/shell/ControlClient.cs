@@ -461,6 +461,9 @@ public sealed class ControlClient : IControlChannel
 
         if (root.TryGetProperty("id", out var idProp) && idProp.ValueKind == JsonValueKind.Number && idProp.TryGetInt64(out var idValue))
         {
+            // Request ids are client-assigned sequential ints: ignore echoes
+            // outside int range instead of wrapping them onto a live call.
+            if (idValue < 1 || idValue > int.MaxValue) return;
             var response = ControlResponse.FromJson(root);
             TaskCompletionSource<ControlResponse>? tcs;
             lock (_gate)
@@ -654,6 +657,10 @@ public sealed class ControlClient : IControlChannel
         {
             changed = _state != state;
             _state = state;
+            // A fresh Connected session retires the previous failure text:
+            // the banner reads LastError on the NEXT failure, which always
+            // carries its own message — a retained one would be stale.
+            if (state == ClientState.Connected) LastError = null;
             if (error is not null)
             {
                 // LastError surfaces in the UI banner: cap it here so every
