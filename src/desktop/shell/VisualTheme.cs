@@ -78,6 +78,9 @@ internal static class VisualTheme
     internal static Font FieldLabelFont { get; } = new Font("Segoe UI", 9.75f, FontStyle.Bold);
     internal static Font BodyFont { get; } = new Font("Segoe UI", 9.75f, FontStyle.Regular);
     internal static Font SmallFont { get; } = new Font("Segoe UI", 8.75f, FontStyle.Regular);
+    // Dense tabular data stays one step below the general small scale, so
+    // five activity rows remain readable without crowding at narrow widths.
+    internal static Font TableFont { get; } = new Font("Segoe UI", 8.25f, FontStyle.Regular);
     internal static Font StatusFont { get; } = new Font("Segoe UI", 9.75f, FontStyle.Bold);
     // Visual slice 3 (5-role scale): Caption for footnotes/hints, Mono for
     // machine identifiers (ports, versions, paths, endpoints). Consolas ships

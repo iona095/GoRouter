@@ -1007,7 +1007,7 @@ public sealed class ControlCenterForm : Form
         lv.BackColor = VisualTheme.SurfaceWhite;
         lv.ForeColor = VisualTheme.PrimaryText;
         lv.GridLines = false;
-        lv.Font = VisualTheme.SmallFont;
+        lv.Font = VisualTheme.TableFont;
         if (!alternateRows)
         {
             return;
@@ -1023,7 +1023,7 @@ public sealed class ControlCenterForm : Form
             TextRenderer.DrawText(
                 e.Graphics,
                 lv.Columns[e.ColumnIndex].Text,
-                VisualTheme.SmallFont,
+                VisualTheme.TableFont,
                 e.Bounds,
                 VisualTheme.SecondaryText,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
@@ -1051,7 +1051,7 @@ public sealed class ControlCenterForm : Form
             TextRenderer.DrawText(
                 e.Graphics,
                 e.SubItem?.Text ?? string.Empty,
-                VisualTheme.SmallFont,
+                VisualTheme.TableFont,
                 e.Bounds,
                 fore,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
