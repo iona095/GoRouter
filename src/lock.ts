@@ -16,6 +16,13 @@
 import { openSync, closeSync, writeSync, unlinkSync, statSync, existsSync, readFileSync } from "node:fs";
 
 const STALE_MS = 10_000;
+/**
+ * Absolute reclaim ceiling (F-10): a recycled PID can make a dead holder
+ * look alive to kill(pid, 0) forever, wedging the lock. No live holder
+ * keeps the lock anywhere near this long (in-lock cycles are ms-scale),
+ * so past this age the claim is reclaimed regardless of pid liveness.
+ */
+const ABSOLUTE_STALE_MS = 120_000;
 const RETRY_INTERVAL_MS = 10;
 
 export function lockPathFor(stateDir: string): string {
@@ -75,10 +82,13 @@ export function withFileLock<T>(lockPath: string, timeoutMs: number, fn: () => T
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code !== "EEXIST") throw e;
-      // existing lock: reclaim only when the holder is gone
+      // existing lock: reclaim when the holder is gone (fast path), or
+      // past the absolute ceiling regardless of pid liveness (F-10: a
+      // recycled PID can report a dead holder alive forever).
       try {
         const st = statSync(lockPath);
-        if (!isLockHolderAlive(lockPath) && Date.now() - st.mtimeMs > STALE_MS) {
+        const ageMs = Date.now() - st.mtimeMs;
+        if (ageMs > ABSOLUTE_STALE_MS || (!isLockHolderAlive(lockPath) && ageMs > STALE_MS)) {
           try { unlinkSync(lockPath); } catch { /* raced */ }
           continue;
         }
@@ -118,7 +128,8 @@ export async function withFileLockAsync<T>(lockPath: string, timeoutMs: number, 
       if (code !== "EEXIST") throw e;
       try {
         const st = statSync(lockPath);
-        if (!isLockHolderAlive(lockPath) && Date.now() - st.mtimeMs > STALE_MS) {
+        const ageMs = Date.now() - st.mtimeMs;
+        if (ageMs > ABSOLUTE_STALE_MS || (!isLockHolderAlive(lockPath) && ageMs > STALE_MS)) {
           try { unlinkSync(lockPath); } catch { /* raced */ }
           continue;
         }

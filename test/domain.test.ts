@@ -229,6 +229,30 @@ describe("domain mutations apply exactly once", () => {
     }
   });
 
+  test("ancient lock is reclaimed even when the pid looks alive (F-10 PID reuse)", async () => {
+    const { withFileLockAsync } = await import("../src/lock.ts");
+    for (const run of [
+      (lock: string) => withFileLock(lock, 2_000, () => 42),
+      (lock: string) => withFileLockAsync(lock, 2_000, () => 42),
+    ]) {
+      const dir = mkdtempSync(join(tmpdir(), "gorouter-lock-"));
+      try {
+        const lock = join(dir, ".state.lock");
+        const fd = openSync(lock, "wx");
+        // Our OWN live pid (kill(pid,0) succeeds) but an ancient claim:
+        // a recycled PID must not wedge the lock forever.
+        writeSync(fd, JSON.stringify({ pid: process.pid, ts: Date.now() - 130_000 }));
+        closeSync(fd);
+        const old = new Date(Date.now() - 130_000);
+        utimesSync(lock, old, old);
+        expect(await run(lock)).toBe(42);
+        expect(existsSync(lock)).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   test("stale lock with a dead holder is reclaimed and the cycle proceeds", () => {
     const dir = mkdtempSync(join(tmpdir(), "gorouter-lock-"));
     try {
