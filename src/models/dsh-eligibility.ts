@@ -65,7 +65,13 @@ function deriveLane(
     .map((m) => m.id)
     .sort();
 
-  const newlyEntries: ModelEntry[] = newly.map((id) => ({ ...regMap.get(id)! }));
+  // Upstream -> DSH-file boundary (H2): newly-eligible entries are copied from
+  // upstream registry data, so sanitize before they reach another application's
+  // config file. Survivors below come from the operator's own DSH file and keep
+  // their overrides verbatim by contract.
+  const newlyEntries: ModelEntry[] = newly
+    .map((id) => sanitizeRegistryEntryForDsh(regMap.get(id)!))
+    .filter((m): m is ModelEntry => m !== null);
 
   // Withheld: discovered (registry) but unapproved.
   const withheld = registry.filter((m) => !approvedIds.has(m.id)).map((m) => m.id);
@@ -74,6 +80,39 @@ function deriveLane(
   const approvedAbsent = [...approvedIds].filter((id) => !regMap.has(id)).sort();
 
   return { desired: [...desired, ...newlyEntries], withheld, removals, approvedAbsent };
+}
+
+/** Keys that must never flow from upstream data into another application's config file. */
+const UNSAFE_DSH_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Maximum serialized size of a single registry entry admitted into DSH files. */
+export const MAX_DSH_ENTRY_BYTES = 8 * 1024;
+
+function sanitizeValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sanitizeValue);
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (UNSAFE_DSH_KEYS.has(k)) continue;
+      out[k] = sanitizeValue(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+/**
+ * Boundary guard for the upstream -> DSH-file flow: strip
+ * prototype-pollution-shaped keys (recursively) and refuse unbounded or
+ * id-less entries. Returns null when the entry must not enter the DSH file;
+ * such ids simply never become desired (fail closed — the sync never writes
+ * what it cannot bound).
+ */
+export function sanitizeRegistryEntryForDsh(entry: ModelEntry): ModelEntry | null {
+  if (typeof entry.id !== "string" || entry.id.length === 0 || entry.id.length > 256) return null;
+  const clean = sanitizeValue(entry) as ModelEntry;
+  if ((JSON.stringify(clean)?.length ?? 0) > MAX_DSH_ENTRY_BYTES) return null;
+  return clean;
 }
 
 /**

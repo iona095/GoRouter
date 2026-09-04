@@ -60,7 +60,7 @@ import {
   type DshClient,
   type DshSnapshot,
 } from "../src/models/dsh-client.ts";
-import { deriveApprovalDesiredDshState, isSemanticNoOp } from "../src/models/dsh-eligibility.ts";
+import { deriveApprovalDesiredDshState, isSemanticNoOp, sanitizeRegistryEntryForDsh } from "../src/models/dsh-eligibility.ts";
 import { OWNED_DSH_PROVIDERS, type ApprovalStoreLoad } from "../src/models/dsh-approvals.ts";
 import { reconcileDshCatalog, clearDshSyncSingleFlightForTests } from "../src/models/dsh-sync.ts";
 import { loadDshSyncStatus, storeDshSyncStatus } from "../src/models/dsh-sync-state.ts";
@@ -557,6 +557,68 @@ describe("unrelated settings preserved (FileDshClient real file seam)", () => {
     // Newly eligible entry copied from the registry template, not the DSH array
     const added = snap.go.find(m=>m.id==="go-new") as any;
     expect(added.input).toEqual(["from-registry"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8b. Upstream -> DSH-file boundary guard (H2)
+// ---------------------------------------------------------------------------
+
+describe("dsh entry boundary guard", () => {
+  test("newly-eligible entries keep legitimate registry fields", () => {
+    const res = deriveApprovalDesiredDshState({
+      currentGo: [],
+      currentZen: [],
+      registryGo: [makeModel("go-new", { input: ["from-registry"] })],
+      registryZen: [],
+      approvedGoIds: new Set(["go-new"]),
+      approvedZenIds: new Set(),
+    });
+    expect(res.desiredGo.length).toBe(1);
+    const added = res.desiredGo[0] as unknown as Record<string, unknown>;
+    expect(added["id"]).toBe("go-new");
+    expect(added["input"]).toEqual(["from-registry"]);
+  });
+
+  test("prototype-shaped keys are stripped from newly-eligible entries", () => {
+    const evil = JSON.parse('{"id":"evil","__proto__":{"polluted":true},"constructor":{"x":1},"nested":{"prototype":2,"keep":3},"input":["x"]}');
+    const res = deriveApprovalDesiredDshState({
+      currentGo: [],
+      currentZen: [],
+      registryGo: [evil],
+      registryZen: [],
+      approvedGoIds: new Set(["evil"]),
+      approvedZenIds: new Set(),
+    });
+    expect(res.desiredGo.length).toBe(1);
+    const added = res.desiredGo[0] as unknown as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(added, "__proto__")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(added, "constructor")).toBe(false);
+    expect((added["nested"] as Record<string, unknown>)["keep"]).toBe(3);
+    expect(Object.prototype.hasOwnProperty.call(added["nested"], "prototype")).toBe(false);
+    // legitimate fields survive sanitization
+    expect(added["input"]).toEqual(["x"]);
+    expect(added["id"]).toBe("evil");
+  });
+
+  test("oversized registry entries never enter desired arrays", () => {
+    const big = makeModel("big", { blob: "x".repeat(9000) });
+    const res = deriveApprovalDesiredDshState({
+      currentGo: [],
+      currentZen: [],
+      registryGo: [big, makeModel("small")],
+      registryZen: [],
+      approvedGoIds: new Set(["big", "small"]),
+      approvedZenIds: new Set(),
+    });
+    // fail closed: the unbounded entry is dropped, the small one passes
+    expect(res.desiredGo.map((m) => m.id)).toEqual(["small"]);
+  });
+
+  test("sanitizeRegistryEntryForDsh rejects empty and over-long ids", () => {
+    expect(sanitizeRegistryEntryForDsh({ id: "" })).toBeNull();
+    expect(sanitizeRegistryEntryForDsh({ id: "x".repeat(257) })).toBeNull();
+    expect(sanitizeRegistryEntryForDsh({ id: "ok" })).toEqual({ id: "ok" });
   });
 });
 
