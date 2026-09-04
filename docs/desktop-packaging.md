@@ -78,8 +78,9 @@ Binary resolution at runtime:
   `gorouter-control.exe`, it spawns `[<exeDir>/gorouter-router.exe,
   "serve"]`; otherwise `["bun", "src/cli.ts", "serve"]` with cwd = repo
   root. `GOROUTER_DESKTOP_ROUTER_CMD_JSON` (JSON array of argv) overrides
-  either; `GOROUTER_DESKTOP_PIPE` overrides the pipe path; the router child
-  inherits `GOROUTER_STATE_DIR` and `GOROUTER_LOG_LEVEL`.
+  the dev resolution only — a packaged service ignores it (F-01) and always
+  uses the bundled router; `GOROUTER_DESKTOP_PIPE` overrides the pipe path;
+  the router child inherits `GOROUTER_STATE_DIR` and `GOROUTER_LOG_LEVEL`.
 - No other files are required; the three executables are the whole product.
 
 ## Install
