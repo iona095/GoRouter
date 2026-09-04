@@ -656,6 +656,44 @@ describe("deterministic ordering", () => {
     const b = [makeModel("b"), makeModel("a")];
     expect(isSemanticNoOp(a, [], b, [])).toBe(false);
   });
+
+  test("isSemanticNoOp ignores object key order but honors entry order and content (M4)", () => {
+    const cur = [makeModel("a", { meta: { x: 1, y: [1, 2] } })];
+    // Same model, keys serialized in a different order (as real DSH hosts do).
+    const reordered = [{ meta: { y: [1, 2], x: 1 }, object: "model", id: "a" } as unknown as ModelEntry];
+    expect(isSemanticNoOp(cur, [], reordered, [])).toBe(true);
+    const changed = [makeModel("a", { meta: { x: 2, y: [1, 2] } })];
+    expect(isSemanticNoOp(cur, [], changed, [])).toBe(false);
+  });
+
+  test("key-reordered commit verifies clean: current, not a phantom pending (M4)", async () => {
+    const reg = authoritativeReg(["go-a"], ["zen-x"], {
+      goMap: new Map([["go-a", makeModel("go-a", { meta: { x: 1, y: [1, 2] } })]]),
+    });
+    const mem = createMemoryDshClient({ go: [], zen: [makeModel("zen-x")], ...RAW_BINDINGS }) as unknown as DshClient & { mutations: number };
+    // Host simulation: every read returns semantically identical entries with
+    // reversed key order. Pre-fix this verified as a mismatch (pending) forever.
+    const reorder = (v: unknown): unknown => {
+      if (Array.isArray(v)) return v.map(reorder);
+      if (typeof v === "object" && v !== null) {
+        const out: Record<string, unknown> = {};
+        for (const k of Object.keys(v as Record<string, unknown>).sort().reverse()) {
+          out[k] = reorder((v as Record<string, unknown>)[k]);
+        }
+        return out;
+      }
+      return v;
+    };
+    const origRead = (mem as unknown as DshClient).read.bind(mem);
+    (mem as { read(): Promise<DshSnapshot> }).read = async () => {
+      const snap = await origRead();
+      return { ...snap, go: reorder(snap.go) as ModelEntry[], zen: reorder(snap.zen) as ModelEntry[] };
+    };
+    const st = await reconcileDshCatalog(reg, mem as unknown as DshClient, { approvalStore: initStore(["go-a"], ["zen-x"]) });
+    expect(st.mutationPerformed).toBe(true);
+    expect(st.outcome).toBe("current");
+    expect(st.lastError).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------

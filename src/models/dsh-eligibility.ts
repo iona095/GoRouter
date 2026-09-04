@@ -28,6 +28,28 @@ export interface EligibilityResult {
   approvedAbsentZen: string[];
 }
 
+/**
+ * Key-order-insensitive deep equality for JSON-shaped values (M4): entry
+ * order in the array is significant (it is the operator's configured order),
+ * but object key order is not — upstream registries and DSH files serialize
+ * the same model with different key orders, and plain JSON.stringify would
+ * report a phantom difference and rewrite the file on every sync.
+ */
+function jsonDeepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => jsonDeepEqual(v, (b as unknown[])[i]));
+  }
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  const ka = Object.keys(ra).sort();
+  const kb = Object.keys(rb).sort();
+  if (ka.length !== kb.length) return false;
+  return ka.every((k, i) => kb[i] === k && jsonDeepEqual(ra[k], rb[k]));
+}
+
 /** Deep equality for ModelEntry arrays (ordered). */
 function entriesEqual(a: ModelEntry[], b: ModelEntry[]): boolean {
   if (a.length !== b.length) return false;
@@ -35,8 +57,8 @@ function entriesEqual(a: ModelEntry[], b: ModelEntry[]): boolean {
     const av = a[i]!;
     const bv = b[i]!;
     if (av.id !== bv.id) return false;
-    // Compare extra fields via stable stringify for override preservation check
-    if (JSON.stringify(av) !== JSON.stringify(bv)) return false;
+    // Compare extra fields key-order-insensitively for override preservation
+    if (!jsonDeepEqual(av, bv)) return false;
   }
   return true;
 }
