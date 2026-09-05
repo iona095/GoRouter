@@ -1247,7 +1247,10 @@ describe('real pipe integration', () => {
     const port = await freePort()
     await seedState(stateDir, port, [['alpha', 'sk-alpha']])
     const pipeName = uniquePipe('cohere')
-    const proc = spawnService(stateDir, pipeName, [process.execPath, 'test/fake-router.ts', '<port>'])
+    // GR-005: the managed fake proves identity so supervision settles to
+    // running instead of churning port_conflict probes during measurement.
+    const credential = readLocalCredential(stateDir)
+    const proc = spawnService(stateDir, pipeName, [process.execPath, 'test/fake-router.ts', '<port>', '--secret', credential])
     try {
       const token = await waitForAdminToken(stateDir)
       const client = await connectPipe(pipeName, token)
@@ -1255,12 +1258,20 @@ describe('real pipe integration', () => {
       expect(snap0.routes.go.alias).toBeNull()
 
       let seenGo: string | null = null
+      let seenZen = false
       client.onEvent((event, data) => {
         if (event === 'snapshot') {
           const s = data as Snapshot
           if (s.routes.go.alias !== null) seenGo = s.routes.go.alias
+          if (s.routes.zen.alias !== null) seenZen = true
         }
       })
+      // Warm up the detect-push path once: after a long suite run, cold
+      // scheduling (Defender scans, DPAPI, FS cache) can stall the first
+      // poll cycle by seconds. The 3s bound below measures steady-state
+      // promptness, not cold-start churn.
+      await cli(cliEnv(stateDir), ['route', 'zen', 'alpha'])
+      await waitFor(() => seenZen, 15_000)
       await cli(cliEnv(stateDir), ['route', 'go', 'alpha'])
       const t0 = Date.now()
       await waitFor(() => seenGo !== null, 3_000)
