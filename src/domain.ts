@@ -274,10 +274,19 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const ref = newRef();
       secrets.put(ref, credential);
       let oldRef: string | null = null;
-      mutateLocked((s) => {
-        oldRef = s.localCredentialRef;
-        s.localCredentialRef = ref;
-      });
+      try {
+        mutateLocked((s) => {
+          oldRef = s.localCredentialRef;
+          s.localCredentialRef = ref;
+        });
+      } catch (e) {
+        // GR-001 (same class): the swap never committed — reap the staged
+        // blob so a failed rotation cannot leak DPAPI entries.
+        try {
+          secrets.delete(ref);
+        } catch { /* best effort */ }
+        throw e;
+      }
       // The new credential is live and returned regardless: a stale-blob
       // delete failure must never surface as a rotate failure (the caller
       // would never learn the new credential and would rotate again).
@@ -331,29 +340,41 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       // (a concurrent removal surfaces as not-found, never a dangling write).
       const existing = findAccount(state.read(), alias);
       if (!existing) throw new Error(`account '${alias}' not found`);
-      secrets.put(existing.secretRef, secret);
+      // GR-001: atomic secret-reference swap. The new secret is stored under
+      // a FRESH ref OUTSIDE the lock (F-08: the DPAPI spawn must not hold
+      // it); the lock only swaps the reference after revalidating the
+      // account by stable id. A commit failure (lock timeout, write refusal)
+      // therefore leaves the OLD credential live, and the staged blob is an
+      // unclaimed orphan — reaped below. A concurrent removal surfaces as
+      // not-found, never a dangling write.
+      const ref = newRef();
+      secrets.put(ref, secret);
       let updated: AccountRecord | null = null;
+      let replacedRef: string | null = null;
       try {
         mutateLocked((s) => {
           const a = s.accounts.find((x) => x.id === existing.id);
           if (!a) throw new Error(`account '${alias}' not found`);
+          replacedRef = a.secretRef;
+          a.secretRef = ref;
           a.updatedAtUtc = new Date().toISOString();
           updated = a;
         });
       } catch (e) {
-        // A remove+re-add with the same alias between the pre-read and the
-        // lock (new id) leaves our put aimed at a dead ref: reap the orphan
-        // ONLY when the account id is actually gone — a lock-timeout after a
-        // successful put must keep the blob (the account still owns the ref;
-        // only its updatedAtUtc skews, corrected by the next update).
+        // The swap never committed: nobody references the staged blob.
         try {
-          if (!state.read().accounts.find((x) => x.id === existing.id)) {
-            try {
-              secrets.delete(existing.secretRef);
-            } catch { /* already reaped by the concurrent remover */ }
-          }
-        } catch { /* read failed: leave the blob; an orphan is benign */ }
+          secrets.delete(ref);
+        } catch { /* best effort */ }
         throw e;
+      }
+      // Committed: the previous blob is now unreferenced — remove it so a
+      // stale credential cannot linger (best effort; an orphan is benign).
+      if (replacedRef !== null && replacedRef !== ref) {
+        try {
+          secrets.delete(replacedRef);
+        } catch (e) {
+          log.warn(`stale account credential blob cleanup failed (harmless orphan): ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
       return viewAccount(state.read(), secrets, updated!);
     },
