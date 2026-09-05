@@ -51,6 +51,7 @@ public sealed class ControlCenterForm : Form
     private Label _lblBannerText = null!;
     private bool _onboardingPending;
     private bool _localCredentialWarning;
+    private string? _compatibilityWarning;
     private Button _btnRetry = null!;
     private Button _btnResetCredential = null!;
     private Button _btnResumeOnboarding = null!;
@@ -1817,7 +1818,20 @@ public sealed class ControlCenterForm : Form
 
     private void RefreshBanner()
     {
-        if (_localCredentialWarning)
+        // R3-004: an unsupported schema outranks every other snapshot banner —
+        // setup/config are refused at the gate, so the operator must see the
+        // compatibility state instead of misleading defaults.
+        if (_compatibilityWarning is not null)
+        {
+            _banner.Visible = true;
+            _banner.BackColor = VisualTheme.ErrorBoxBack;
+            _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
+            _lblBannerText.Text = UiText.Truncate(_compatibilityWarning, 240);
+            _btnRetry.Visible = false;
+            _btnResetCredential.Visible = false;
+            _btnResumeOnboarding.Visible = false;
+        }
+        else if (_localCredentialWarning)
         {
             _banner.Visible = true;
             _banner.BackColor = VisualTheme.AmberBannerBack;
@@ -1899,6 +1913,16 @@ public sealed class ControlCenterForm : Form
             UpdateLifecycleButtons();
 
             _localCredentialWarning = snapshot.Initialized && !snapshot.LocalCredentialConfigured;
+            // R3-004: promote storage compatibility state to the operator.
+            _compatibilityWarning = null;
+            if (snapshot.StateUnsupportedVersion is not null)
+            {
+                _compatibilityWarning = $"Incompatible state schema v{snapshot.StateUnsupportedVersion} (this app supports v1) — showing defaults; restore a supported state.json.";
+            }
+            else if (snapshot.DesktopUnsupportedVersion is not null)
+            {
+                _compatibilityWarning = $"Incompatible desktop settings schema v{snapshot.DesktopUnsupportedVersion} (this app supports v1) — restore or delete desktop.json.";
+            }
             RefreshBanner();
 
             FillLaneCombo(_cmbGo, snapshot.Routes.Go, _lblGoFeedback, _lblGoError);
@@ -2772,6 +2796,8 @@ public sealed class ControlCenterForm : Form
         sb.AppendLine($"stateDir: {snapshot.StateDir}");
         sb.AppendLine($"initialized: {snapshot.Initialized}");
         sb.AppendLine($"stateCorrupt: {snapshot.StateCorrupt}");
+        sb.AppendLine($"stateUnsupportedVersion: {snapshot.StateUnsupportedVersion?.ToString() ?? "(none)"}");
+        sb.AppendLine($"desktopUnsupportedVersion: {snapshot.DesktopUnsupportedVersion?.ToString() ?? "(none)"}");
         sb.AppendLine($"secretStore: {snapshot.SecretStore}");
         sb.AppendLine($"settings: port={snapshot.Settings.Port} journalRetentionDays={snapshot.Settings.JournalRetentionDays} journalMaxRecords={snapshot.Settings.JournalMaxRecords}");
         sb.AppendLine($"router: state={snapshot.Router.State} mode={snapshot.Router.Mode} pid={snapshot.Router.Pid} restartCount={snapshot.Router.RestartCount}");

@@ -132,6 +132,10 @@ export interface Snapshot {
   initialized: boolean
   firstRun: boolean
   stateCorrupt: boolean
+  /** On-disk state.json schema version when it is not ours (R3-004 gate active). */
+  stateUnsupportedVersion: number | null
+  /** On-disk desktop.json schema version when it is not ours (R3-004 gate active). */
+  desktopUnsupportedVersion: number | null
   secretStore: 'ok' | 'unavailable'
   settings: SnapshotSettings
   routes: Record<'go' | 'zen', SnapshotRoute>

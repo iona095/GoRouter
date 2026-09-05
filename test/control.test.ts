@@ -1312,3 +1312,103 @@ describe('real pipe integration', () => {
     })
   })
 })
+
+// ---------------------------------------------------------------------------
+// R3-004: unsupported schemas propagate to the snapshot and suppress router
+// auto-start. A rolled-back future state/desktop must read as an explicit
+// compatibility state — never as misleading defaults driving a supervisor
+// restart loop. Deleting the future file heals the gate and permits startup.
+// ---------------------------------------------------------------------------
+
+describe('R3-004: unsupported schema propagation + auto-start suppression', () => {
+  test('future state.json: version in snapshot, zero spawn, writes refuse, file untouched; replace heals', async () => {
+    // NOTE: an explicit free port is required — the default 8787 may belong
+    // to a live session, whose proof-less /healthz would read as port_conflict.
+    const port = await freePort()
+    const markerDir = freshStateDir()
+    const marker = join(markerDir, 'spawns.log')
+    const { core, stateDir, domain } = freshCore({
+      firstRunDone: true,
+      port,
+      routerCmd: { argv: [process.execPath, 'test/fake-router.ts', '<port>', '--marker', marker], cwd: ROOT },
+    })
+    domain.setup()
+    const stateJson = join(stateDir, 'state.json')
+    const before = readFileSync(stateJson, 'utf8')
+    const seeded = JSON.parse(before) as Record<string, unknown>
+    seeded.schemaVersion = 99
+    seeded.futureSentinel = 'keep-me'
+    writeFileSync(stateJson, JSON.stringify(seeded))
+    core.start()
+    try {
+      await sleep(3000)
+      expect(existsSync(marker)).toBe(false)
+      expect(core.snapshot().router.state).toBe('stopped')
+      const snap = core.snapshot()
+      expect(snap.stateUnsupportedVersion).toBe(99)
+      expect(snap.desktopUnsupportedVersion).toBeNull()
+      expect(() => domain.configSet('port', '9999')).toThrow(/unsupported schema version/)
+      expect(readFileSync(stateJson, 'utf8')).toBe(JSON.stringify(seeded))
+    } finally {
+      await core.stop()
+    }
+    // replacing with the supported doc heals the gate and permits startup
+    // (delete would also heal, but would lose the configured free port).
+    writeFileSync(stateJson, before)
+    core.start()
+    try {
+      await waitFor(() => existsSync(marker), 10_000)
+      expect(core.snapshot().stateUnsupportedVersion).toBeNull()
+    } finally {
+      await core.stop()
+    }
+  })
+
+  test('future desktop.json: version in snapshot, zero spawn, writes refuse, file untouched; replace heals', async () => {
+    const port = await freePort()
+    const markerDir = freshStateDir()
+    const marker = join(markerDir, 'spawns.log')
+    const { core, stateDir, domain } = freshCore({
+      firstRunDone: true,
+      port,
+      routerCmd: { argv: [process.execPath, 'test/fake-router.ts', '<port>', '--marker', marker], cwd: ROOT },
+    })
+    domain.setup()
+    const deskJson = join(stateDir, 'desktop.json')
+    const before = readFileSync(deskJson, 'utf8')
+    const seeded = { ...(JSON.parse(before) as Record<string, unknown>), schemaVersion: 99, futureSentinel: 'keep-me' }
+    writeFileSync(deskJson, JSON.stringify(seeded))
+    const deskBefore = readFileSync(deskJson, 'utf8')
+    core.start()
+    try {
+      await sleep(3000)
+      expect(existsSync(marker)).toBe(false)
+      expect(core.snapshot().router.state).toBe('stopped')
+      const snap = core.snapshot()
+      expect(snap.desktopUnsupportedVersion).toBe(99)
+      expect(snap.stateUnsupportedVersion).toBeNull()
+      const desk = loadDesktopSettings(stateDir)
+      expect(() => desk.write(desk.read())).toThrow(/unsupported schema version/)
+      expect(readFileSync(deskJson, 'utf8')).toBe(deskBefore)
+    } finally {
+      await core.stop()
+    }
+    writeFileSync(deskJson, before)
+    core.start()
+    try {
+      await waitFor(() => existsSync(marker), 10_000)
+      expect(core.snapshot().desktopUnsupportedVersion).toBeNull()
+    } finally {
+      await core.stop()
+    }
+  })
+
+  test('CLI status names the incompatible state schema instead of showing silent defaults', async () => {
+    const stateDir = freshStateDir()
+    const paths = resolvePaths(stateDir)
+    ensureStateDirs(paths)
+    writeFileSync(join(stateDir, 'state.json'), JSON.stringify({ schemaVersion: 99, futureSentinel: 'keep-me' }))
+    const out = await cli(cliEnv(stateDir), ['status'])
+    expect(out).toMatch(/INCOMPATIBLE state schema v99/)
+  })
+})

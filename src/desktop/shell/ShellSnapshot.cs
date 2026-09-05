@@ -23,6 +23,12 @@ public sealed class ShellSnapshot
     [JsonPropertyName("stateCorrupt")]
     public bool StateCorrupt { get; init; }
 
+    [JsonPropertyName("stateUnsupportedVersion")]
+    public int? StateUnsupportedVersion { get; init; }
+
+    [JsonPropertyName("desktopUnsupportedVersion")]
+    public int? DesktopUnsupportedVersion { get; init; }
+
     [JsonPropertyName("secretStore")]
     public string SecretStore { get; init; } = "ok";
 

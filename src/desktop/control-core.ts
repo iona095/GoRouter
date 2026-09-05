@@ -373,6 +373,10 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       initialized: st.initialized,
       firstRun: firstRunNow(),
       stateCorrupt: st.stateCorrupt,
+      // R3-004: compatibility state is product state — the shell renders a
+      // banner from these instead of showing misleading defaults.
+      stateUnsupportedVersion: st.stateUnsupportedVersion,
+      desktopUnsupportedVersion: desktop.unsupportedVersion(),
       secretStore: probeSecretStore(),
       settings: {
         port: st.settings.port,
@@ -552,8 +556,13 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     // Auto-start policy: stay stopped while onboarding (firstRun) is pending
     // or while desktop.json is unreadable (corrupt settings must not drive a
     // router crash-loop — STATE-03); setDesktop({firstRunDone:true}) starts
-    // the router.
-    if (!firstRunNow() && !desktop.corrupt()) supervisor.start()
+    // the router. R3-004: unsupported state/desktop schemas also suppress
+    // auto-start — a supervised child serves defaults with no credential ref
+    // and would just climb the backoff ladder; surface the compatibility
+    // state in the snapshot instead.
+    // domain.status() re-reads the store; the gate intentionally observes the
+    // on-disk version at start rather than a cached view.
+    if (!firstRunNow() && !desktop.corrupt() && domain.status().stateUnsupportedVersion === null && desktop.unsupportedVersion() === null) supervisor.start()
     if (pollTimer === null) {
       pollTimer = setInterval(poll, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS)
     }

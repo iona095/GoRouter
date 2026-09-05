@@ -227,6 +227,11 @@ async function main(argv: string[]): Promise<number> {
     case "status": {
       const st = domain.status();
       printStatus({ routes: Object.fromEntries(st.routes.map((r) => [r.lane, { accountId: r.accountId }])) as Record<Lane, { accountId: string | null }>, accounts: st.accounts });
+      // R3-004: never show defaults silently — an unsupported schema reads
+      // as defaults with writes refused, so say so explicitly.
+      if (st.stateUnsupportedVersion !== null) {
+        console.log(`  INCOMPATIBLE state schema v${st.stateUnsupportedVersion} (this binary supports v1): showing defaults; setup/config refused until a supported state.json is restored`);
+      }
       // status is read-only: don't create journal DB if absent
       if (!st.journalExists) {
         console.log("  Journal: schema v1, records=0 (no journal yet)");
