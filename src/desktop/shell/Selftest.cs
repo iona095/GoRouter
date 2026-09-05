@@ -59,8 +59,7 @@ internal static class Selftest
             return DispatchSelftest.Run(args).GetAwaiter().GetResult();
         }
 
-        NativeDpi.SetPerMonitorV2();
-        ApplicationConfiguration.Initialize();
+        ApplicationConfiguration.Initialize(); // sole DPI source (csproj), see Program.cs
 
         var state = "empty";
         string? snapshotFile = null;

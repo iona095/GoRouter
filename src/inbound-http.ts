@@ -487,6 +487,19 @@ function budgetRelease(n: number): void {
  *   waitForListening; bind errors surface there, not here)
  */
 /**
+ * Reject response headers: every pre-dispatch reject carries its journal
+ * row's request id (the same traceability contract as dispatch-path local
+ * errors) plus Connection: close so unread framing cannot desync reuse.
+ */
+function rejectHeaders(requestId: string): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    connection: "close",
+    "x-gorouter-request-id": requestId,
+  };
+}
+
+/**
  * Correlation id off a node IncomingMessage's header bag (D-12): rejected
  * requests carry the client's header when present so reject rows join the
  * same trace as admitted ones. Array forms take the first value; anything
@@ -541,7 +554,8 @@ export function createInboundHttpServer(
     method?: string,
     httpStatus?: number,
     correlationId?: string | null,
-  ) => void,
+    // Returns the reject row's request id, echoed as x-gorouter-request-id.
+  ) => string,
 ): Server {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const rawTarget = req.url ?? "/";
@@ -566,14 +580,11 @@ export function createInboundHttpServer(
     // terminated (Connection: close + gate), never left alive for a pipelined
     // follow-up to dispatch.
     if (req.headers["transfer-encoding"] !== undefined) {
-      journalReject(rawTarget, "chunked request bodies are not supported", req.method ?? "GET", undefined, incomingCorrelationId(req));
+      const requestId = journalReject(rawTarget, "chunked request bodies are not supported", req.method ?? "GET", undefined, incomingCorrelationId(req));
       // Connection: close — the chunked body may still be arriving; the
       // response is flushed, then the socket closes, discarding the unread
       // framing so a keep-alive connection cannot desynchronize.
-      res.writeHead(400, {
-        "content-type": "application/json",
-        connection: "close",
-      });
+      res.writeHead(400, rejectHeaders(requestId));
       res.end(JSON.stringify({
         error: { type: "GoRouterRouteError", message: "chunked request bodies are not supported" },
       }));
@@ -591,8 +602,8 @@ export function createInboundHttpServer(
     // next request (the keep-alive desync class every sibling branch closes).
     const validation = validateRawTarget(rawTarget);
     if (!validation.valid) {
-      journalReject(rawTarget, validation.reason ?? "invalid", req.method ?? "GET", undefined, incomingCorrelationId(req));
-      res.writeHead(400, { "content-type": "application/json", connection: "close" });
+      const requestId = journalReject(rawTarget, validation.reason ?? "invalid", req.method ?? "GET", undefined, incomingCorrelationId(req));
+      res.writeHead(400, rejectHeaders(requestId));
       res.end(JSON.stringify({
         error: { type: "GoRouterRouteError", message: `invalid request target: ${validation.reason}` },
       }));
@@ -648,8 +659,8 @@ export function createInboundHttpServer(
     if (opts.admit) {
       const verdict = opts.admit({ rawTarget, method, headers });
       if (!verdict.ok) {
-        journalReject(rawTarget, verdict.message, method, verdict.status, incomingCorrelationId(req));
-        res.writeHead(verdict.status, { "content-type": "application/json", connection: "close" });
+        const requestId = journalReject(rawTarget, verdict.message, method, verdict.status, incomingCorrelationId(req));
+        res.writeHead(verdict.status, rejectHeaders(requestId));
         res.end(JSON.stringify({
           error: { type: verdict.type, message: verdict.message },
         }));
@@ -691,8 +702,8 @@ export function createInboundHttpServer(
     const rawContentLength: unknown = req.headers["content-length"];
     if (rawContentLength !== undefined) {
       if (!isWellFormedContentLength(rawContentLength)) {
-        journalReject(rawTarget, "invalid content-length header", method, undefined, incomingCorrelationId(req));
-        res.writeHead(400, { "content-type": "application/json", connection: "close" });
+        const requestId = journalReject(rawTarget, "invalid content-length header", method, undefined, incomingCorrelationId(req));
+        res.writeHead(400, rejectHeaders(requestId));
         res.end(JSON.stringify({
           error: { type: "GoRouterRouteError", message: "invalid content-length header" },
         }));
@@ -705,8 +716,8 @@ export function createInboundHttpServer(
     const contentLength = Number(req.headers["content-length"] ?? NaN);
     if (Number.isFinite(contentLength) && contentLength > 0) {
       if (method === "GET" || method === "HEAD") {
-        journalReject(rawTarget, "GET/HEAD request bodies are not supported", method, undefined, incomingCorrelationId(req));
-        res.writeHead(400, { "content-type": "application/json", connection: "close" });
+        const requestId = journalReject(rawTarget, "GET/HEAD request bodies are not supported", method, undefined, incomingCorrelationId(req));
+        res.writeHead(400, rejectHeaders(requestId));
         res.end(JSON.stringify({
           error: { type: "GoRouterRouteError", message: "GET/HEAD request bodies are not supported" },
         }));
@@ -716,8 +727,8 @@ export function createInboundHttpServer(
         return;
       }
       if (contentLength > MAX_REQUEST_BODY_BYTES) {
-        journalReject(rawTarget, `request body too large (${contentLength} > ${MAX_REQUEST_BODY_BYTES})`, method, 413, incomingCorrelationId(req));
-        res.writeHead(413, { "content-type": "application/json", connection: "close" });
+        const requestId = journalReject(rawTarget, `request body too large (${contentLength} > ${MAX_REQUEST_BODY_BYTES})`, method, 413, incomingCorrelationId(req));
+        res.writeHead(413, rejectHeaders(requestId));
         res.end(JSON.stringify({
           error: { type: "GoRouterRouteError", message: `request body too large (limit ${MAX_REQUEST_BODY_BYTES} bytes)` },
         }));
@@ -737,8 +748,8 @@ export function createInboundHttpServer(
         }
       };
       if (!budgetAcquire(contentLength)) {
-        journalReject(rawTarget, "aggregate body budget exhausted", method, 503, incomingCorrelationId(req));
-        res.writeHead(503, { "content-type": "application/json", connection: "close" });
+        const requestId = journalReject(rawTarget, "aggregate body budget exhausted", method, 503, incomingCorrelationId(req));
+        res.writeHead(503, rejectHeaders(requestId));
         res.end(JSON.stringify({
           error: { type: "GoRouterOverloadedError", message: "server is busy buffering request bodies; retry shortly" },
         }));
@@ -759,8 +770,8 @@ export function createInboundHttpServer(
           releaseReservation();
           activeControllers.delete(abortController);
           if (e instanceof RequestBodyTooLargeError) {
-            journalReject(rawTarget, e.message, method, 413, incomingCorrelationId(req));
-            res.writeHead(413, { "content-type": "application/json", connection: "close" });
+            const requestId = journalReject(rawTarget, e.message, method, 413, incomingCorrelationId(req));
+            res.writeHead(413, rejectHeaders(requestId));
             res.end(JSON.stringify({
               error: { type: "GoRouterRouteError", message: `request body too large (limit ${MAX_REQUEST_BODY_BYTES} bytes)` },
             }));

@@ -1,6 +1,10 @@
 # F-06: minimal CI so the quality gates stop drifting.
 # The suite is Windows-native (DPAPI secret store, named-pipe control
 # channel, PowerShell-gated paths), so it runs on windows-latest.
+# GR-010: the shipped desktop distribution (shell + both Bun executables)
+# builds in CI too — the release script, the zero-warning shell gate, the
+# launch smoke test, and the final manifest assertion all run per push/PR,
+# and the resulting dist/ ships as an artifact.
 name: ci
 
 on:
@@ -22,3 +26,27 @@ jobs:
         run: bun run typecheck
       - name: Tests
         run: bun test
+
+  desktop-dist:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Shell build (zero-warning gate)
+        run: dotnet build src/desktop/shell/GoRouterDesktop.csproj -c Release --nologo
+      - name: Build desktop distribution
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: gorouter-dist
+          path: dist/
+          if-no-files-found: error

@@ -6,6 +6,7 @@ docs/evidence/
 
 # build outputs (V1.5 desktop)
 dist/
+.build-work/
 src/desktop/shell/bin/
 src/desktop/shell/obj/
 

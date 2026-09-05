@@ -8,8 +8,9 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        NativeDpi.SetPerMonitorV2();
-
+        // GR-009: DPI comes solely from ApplicationHighDpiMode (csproj) via
+        // ApplicationConfiguration.Initialize() below — no manifest or
+        // P/Invoke duplicates (WFO0003).
         if (args.Length > 0 && args[0] == "--selftest")
         {
             return Selftest.Run(args);
@@ -42,26 +43,6 @@ internal static class Program
         catch (WaitHandleCannotBeOpenedException)
         {
             // The first instance may have just exited; nothing to signal.
-        }
-    }
-}
-
-internal static class NativeDpi
-{
-    private static readonly IntPtr DpiAwarenessPerMonitorV2 = new(-4);
-
-    [DllImport("user32.dll")]
-    private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-
-    public static void SetPerMonitorV2()
-    {
-        try
-        {
-            SetProcessDpiAwarenessContext(DpiAwarenessPerMonitorV2);
-        }
-        catch (EntryPointNotFoundException)
-        {
-            // Pre-Windows-10: the app.manifest dpiAware setting still applies.
         }
     }
 }

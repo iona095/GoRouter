@@ -897,7 +897,9 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       const host = st.settings.host;
       const port = st.settings.port;
 
-      const journalReject = (rawTarget: string, reason: string, method?: string, httpStatus?: number, correlationId?: string | null) => {
+      // Returns the reject row's request id so the inbound layer echoes it
+      // (every local reject is traceable, like every dispatch-path error).
+      const journalReject = (rawTarget: string, reason: string, method?: string, httpStatus?: number, correlationId?: string | null): string => {
         // Create a synthetic journal entry for the rejected request.
         // The correlation id rides in from inbound (D-12, validated there);
         // absent when the client sent none.
@@ -968,6 +970,7 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
         }
         loggedTarget = redact(loggedTarget);
         log.warn(`raw-target validation rejected: ${reason} (target: ${loggedTarget})`);
+        return entry.routerRequestId;
       };
 
       // GR-003: lane + local-auth admission runs on raw headers before any
