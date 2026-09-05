@@ -149,7 +149,7 @@ export async function startTestRouter(opts: {
   }
   const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
   const server = createServer({ state, journal, paths, startupRefresh: false });
-  server.serve();
+  await server.serve();
   const baseUrl = `http://127.0.0.1:${server.port()}`;
   return {
     stateDir,

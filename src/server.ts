@@ -20,7 +20,7 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import type { Server } from "node:http";
-import { createInboundHttpServer } from "./inbound-http.ts";
+import { createInboundHttpServer, waitForListening } from "./inbound-http.ts";
 import {
   sanitizeForwardHeaders,
   validateCorrelationId,
@@ -262,7 +262,7 @@ export function wrapBodyWithFinalize(
   });
 }
 
-export function createServer(deps: ServerDeps): { serve: () => void; stop: () => void; port: () => number } {
+export function createServer(deps: ServerDeps): { serve: () => Promise<number>; stop: () => void; port: () => number } {
   let server: Server | null = null;
 
   function serveModelsCache(lane: Lane, reg: import("./models/types.ts").RegistryFile, fromCache: "hit" | "stale"): Response {
@@ -800,7 +800,10 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
   };
 
   return {
-    serve() {
+    // GR-002: startup is awaitable. The promise resolves with the bound port
+    // only after the listener owns it; a bind failure rejects (startup
+    // failure — the caller exits nonzero) and no "listening" line is logged.
+    async serve(): Promise<number> {
       const st = deps.state.read();
       const host = st.settings.host;
       const port = st.settings.port;
@@ -879,8 +882,21 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       };
 
       server = createInboundHttpServer(handler, { hostname: host, port }, journalReject);
-      const addr = server.address();
-      const actualPort = addr && typeof addr === 'object' ? addr.port : 0;
+      let actualPort: number;
+      try {
+        actualPort = await waitForListening(server);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log.error(`failed to bind ${host}:${port} (${msg}); refusing to run without a listener`);
+        try { server.close(); } catch { /* already closed */ }
+        server = null;
+        throw e;
+      }
+      // A runtime accept failure after successful bind degrades observably
+      // (routing continues); only the STARTUP bind decides the process fate.
+      server.on("error", (err) => {
+        log.error(`listener runtime error (routing continues): ${err instanceof Error ? err.message : String(err)}`);
+      });
       log.info(`GoRouter V1 listening on http://${host}:${actualPort} (go/v1, zen/v1)`);
       // Slice A startup trigger: if registry absent/stale and not in cooldown, background refresh
       // Disabled in tests (startupRefresh===false) so per-test upstream request counts stay deterministic.
@@ -908,6 +924,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
           log.warn(`models startup trigger skipped: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
+      return actualPort;
     },
     port() {
       const addr = server?.address();

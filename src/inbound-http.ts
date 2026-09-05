@@ -406,6 +406,40 @@ function incomingCorrelationId(req: IncomingMessage): string | null {
   return validateCorrelationId(first) ?? null;
 }
 
+/**
+ * GR-002 — awaitable listener readiness.
+ *
+ * node:http binds asynchronously: `server.listen()` returns before the port
+ * is owned, and a collision surfaces as an 'error' event (EADDRINUSE). Await
+ * this promise before logging success or serving traffic; a rejection is a
+ * startup failure (exit nonzero), never a log-and-continue event.
+ * Resolves with the bound port (OS-assigned when 0 was requested).
+ */
+export function waitForListening(server: Server): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const addrNow = server.address();
+    if (server.listening && addrNow && typeof addrNow === "object") {
+      resolve(addrNow.port);
+      return;
+    }
+    const cleanup = (): void => {
+      server.off("listening", onListening);
+      server.off("error", onError);
+    };
+    const onListening = (): void => {
+      cleanup();
+      const addr = server.address();
+      resolve(addr && typeof addr === "object" ? addr.port : 0);
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    server.once("listening", onListening);
+    server.once("error", onError);
+  });
+}
+
 export function createInboundHttpServer(
   handler: (req: Request) => Promise<Response>,
   opts: { hostname: string; port: number },

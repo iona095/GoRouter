@@ -318,7 +318,15 @@ async function main(argv: string[]): Promise<number> {
       }
       const journal = createJournal(paths.journalDb, s.settings.journalRetentionDays, s.settings.journalMaxRecords);
       const server = createServer({ state, journal, paths });
-      server.serve();
+      // GR-002: startup failure (bind collision) exits nonzero promptly —
+      // a router without a listener must never linger as a live process.
+      try {
+        await server.serve();
+      } catch (e) {
+        console.error(`failed to start listener: ${e instanceof Error ? e.message : String(e)}`);
+        journal.close();
+        return 1;
+      }
       // A long-running proxy must survive runtime-level async faults: log
       // them and keep serving; each request is already isolated by its own
       // error handling. (Bun's default is to exit on unhandled rejections.)

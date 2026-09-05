@@ -1259,7 +1259,7 @@ describe("Slice A regression (deterministic, no live network)", () => {
     storeRegistry(paths, fresh);
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
     const server = createServer({ state, journal, paths, startupRefresh:false });
-    server.serve(); servers.push({ stop: ()=>server.stop(), journal });
+    await server.serve(); servers.push({ stop: ()=>server.stop(), journal });
     const baseUrl = "http://127.0.0.1:" + server.port();
     const noAuth = await fetch(baseUrl+"/go/v1/models");
     expect(noAuth.status).toBe(401);
@@ -1288,7 +1288,7 @@ describe("Slice A regression (deterministic, no live network)", () => {
     storeRegistry(paths, fresh);
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
     const server = createServer({ state, journal, paths, startupRefresh:false });
-    server.serve(); servers.push({ stop: ()=>server.stop(), journal });
+    await server.serve(); servers.push({ stop: ()=>server.stop(), journal });
     const baseUrl = "http://127.0.0.1:" + server.port();
     const res = await fetch(baseUrl+"/go/v1/chat/completions", { method:"POST", headers: new Headers({ authorization: `Bearer ${LOCAL_KEY}`, "content-type":"application/json" }), body: JSON.stringify({ model:"cached", messages:[] }) });
     expect(res.status).toBe(200);

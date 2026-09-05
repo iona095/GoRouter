@@ -165,9 +165,9 @@ import type { Paths } from "../src/paths.ts";
 import type { StateStore } from "../src/state.ts";
 import type { Journal } from "../src/journal.ts";
 
-function startTestServerWithState(paths: Paths, state: StateStore, journal: Journal) {
+async function startTestServerWithState(paths: Paths, state: StateStore, journal: Journal) {
   const server = createServer({ state, journal, paths });
-  server.serve();
+  await server.serve();
   // Track for afterEach cleanup after stop (journal close)
   servers.push({ stop: () => server.stop(), journal });
   return server;
@@ -1176,7 +1176,7 @@ describe("server /models cache and auth", () => {
       state.mutate((st) => { st.routes[lane].accountId = acct.id; });
     }
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     // Ensure no registry file
@@ -1233,7 +1233,7 @@ describe("server /models cache and auth", () => {
     storeRegistry(paths, fresh);
 
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     const resNoAuth = await fetch(baseUrl + "/go/v1/models");
@@ -1284,7 +1284,7 @@ describe("server /models cache and auth", () => {
     const fresh = registryFile({ updatedAtMs: now, goIds: ["cached-go-1", "cached-go-2"], zenIds: ["cached-zen-1"] });
     storeRegistry(paths, fresh);
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
@@ -1339,7 +1339,7 @@ describe("server /models cache and auth", () => {
     storeRegistry(paths, stale);
 
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
@@ -1397,7 +1397,7 @@ describe("server /models cache and auth", () => {
     const fresh2 = registryFile({ updatedAtMs: Date.now(), goIds: ["cached-go"], zenIds: ["cached-zen"] });
     storeRegistry(paths, fresh2);
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     for (const suffix of ["/chat/completions", "/responses", "/messages"] as const) {
@@ -1459,7 +1459,7 @@ describe("server /models cache and auth", () => {
     });
     storeRegistry(paths, staleCooldown);
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
@@ -1907,7 +1907,7 @@ describe("CHALLENGE 2 — non-blocking startup", () => {
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
     const server = createServer({ state, journal, paths, startupRefresh: true });
     const t0 = Date.now();
-    server.serve();
+    await server.serve();
     servers.push({ stop: () => server.stop(), journal });
     const elapsed = Date.now() - t0;
     expect(elapsed).toBeLessThan(100);
@@ -2119,7 +2119,7 @@ describe("CHALLENGE 5 — bootstrap, Windows atomic, journal", () => {
     const fresh = registryFile({ updatedAtMs: Date.now(), goIds: ["cached-a"], zenIds: ["cached-b"] });
     storeRegistry(paths, fresh);
     const journal = createJournal(paths.journalDb, state.read().settings.journalRetentionDays, state.read().settings.journalMaxRecords);
-    const server = startTestServerWithState(paths, state, journal);
+    const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     const before = journal.stats().records;
