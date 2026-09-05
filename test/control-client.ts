@@ -48,6 +48,8 @@ export interface SnapshotData {
   initialized: boolean
   firstRun: boolean
   stateCorrupt: boolean
+  stateUnsupportedVersion?: number | null
+  desktopUnsupportedVersion?: number | null
   secretStore: string
   settings: { port: number; journalRetentionDays: number; journalMaxRecords: number }
   routes: { go: LaneSelection; zen: LaneSelection }

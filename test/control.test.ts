@@ -338,6 +338,7 @@ describe('in-process control core', () => {
     expect(Object.keys(snap).sort()).toEqual([
       'accounts',
       'desktop',
+      'desktopUnsupportedVersion',
       'firstRun',
       'initialized',
       'journal',
@@ -349,11 +350,14 @@ describe('in-process control core', () => {
       'settings',
       'stateCorrupt',
       'stateDir',
+      'stateUnsupportedVersion',
     ])
     expect(snap.serviceVersion).toBe('1.5.0')
     expect(snap.initialized).toBe(true)
     expect(snap.firstRun).toBe(true) // state freshly created by this service start
     expect(snap.stateCorrupt).toBe(false)
+    expect(snap.stateUnsupportedVersion).toBe(null)
+    expect(snap.desktopUnsupportedVersion).toBe(null)
     expect(snap.secretStore).toBe('ok')
     expect(snap.settings).toEqual({ port: 8787, journalRetentionDays: 30, journalMaxRecords: 100000 })
     expect(snap.routes).toEqual({ go: { accountId: null, alias: null }, zen: { accountId: null, alias: null } })

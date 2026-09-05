@@ -190,7 +190,7 @@ function admitPreBody(rawTarget: string, headers: Headers, localCredential: () =
   const rawPath = rawTarget.split("?")[0] ?? "/";
   if (rawPath === "/healthz") {
     if (method !== "GET" && method !== "HEAD") {
-      return { ok: false, status: 404, type: "GoRouterRouteError", message: "/healthz only supports bodyless GET" };
+      return { ok: false, status: 404, type: "GoRouterRouteError", message: "/healthz only supports bodyless GET/HEAD" };
     }
     if (hasDeclaredBody(headers)) {
       return { ok: false, status: 400, type: "GoRouterRouteError", message: "/healthz does not accept a request body" };
