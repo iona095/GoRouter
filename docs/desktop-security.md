@@ -116,8 +116,8 @@ The GUI exposes no upstream controls: no host field, no upstream textbox,
 no "advanced" override. `config.set` on the control channel refuses
 `host` / `upstreamGo` / `upstreamZen` with `error.code:"unsupported"`; the
 only GUI-settable settings are `port` (1..65535, default 8787, refused
-while a router is running), `journalRetentionDays` and
-`journalMaxRecords`. Upstream authority stays pinned to the accepted
+while a router is running), `journalRetentionDays` (fractional allowed,
+max 3650 days) and `journalMaxRecords` (integer-only, GR-007). Upstream authority stays pinned to the accepted
 OpenCode surface exactly as in V1.
 
 ## §17.8 — GUI or desktop crash interrupting the request path
@@ -142,10 +142,14 @@ Failure isolation:
   second launch yields to the running instance.
 - Service: the shell attaches to an already-running service; there is only
   one service process per user state.
-- Router: the service probes `/healthz` before spawning; a healthy foreign
-  listener on the port yields `port_conflict` (never a second instance on
-  the same port), a healthy GoRouter yields attach mode. The desktop never
-  starts competing router instances on the same state/port.
+- Router: the service probes `/healthz` before spawning, and the probe
+  requires identity, not just liveness (GR-005): every probe mints a fresh
+  challenge, and only a listener that echoes it with a valid HMAC proof
+  (keyed by the state's local credential) yields attach mode. A healthy
+  foreign listener — including one parroting the public health JSON — is
+  busy-but-foreign and yields `port_conflict` (never a second instance on
+  the same port). The desktop never starts competing router instances on
+  the same state/port.
 - Mutations: the cross-process lock (`src/lock.ts`, `.state.lock` in the
   state dir) serializes every read-modify-write cycle across CLI and
   service writers — no lost updates, deterministic committed results

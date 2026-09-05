@@ -19,7 +19,7 @@ accounts are supported; the immediate scenario uses two.
 | --- | --- |
 | `src/cli.ts` | operator surface: accounts, routes, probe, serve, journal stats, config, reset |
 | `src/server.ts` | loopback HTTP proxy: local auth, path routing, snapshot dispatch, streaming, response metadata |
-| `src/inbound-http.ts` | node:http transport adapter: raw request-target validation before WHATWG normalization, Transfer-Encoding (chunked) request-body rejection, held-body client-abort detection |
+| `src/inbound-http.ts` | node:http transport adapter: raw request-target validation before WHATWG normalization, Transfer-Encoding (chunked) request-body rejection, held-body client-abort detection, GR-003 pre-body lane/auth admission with aggregate body budgets |
 | `src/state.ts` | non-secret persisted state (accounts metadata, route selections, settings); atomic tmp+fsync+rename writes; per-request snapshot reads |
 | `src/secret-store.ts` | Windows DPAPI (CryptProtectData) blob store with mtime-keyed decrypt cache and spawn retry |
 | `src/journal.ts` | SQLite request journal, schema v1, bounded retention, degradable |
@@ -41,21 +41,36 @@ accounts are supported; the immediate scenario uses two.
    and the connection is terminated. GET/HEAD with a declared request body is
    rejected 400. Client-abort detection uses the request's `aborted` signal
    only and is disabled for `Connection: close` requests.
+ 0b. **Pre-body admission** (GR-003): lane prefix + local-auth verdict run on
+    raw headers BEFORE a single body byte is buffered, so unauthenticated
+    senders never reach the 25 MiB per-request buffer, the 100 MiB
+    process-wide aggregate budget (declared bytes reserved up front), or the
+    120 s absolute upload deadline — and never reach upstream dispatch.
+    Every pre-dispatch reject (admission, framing, over-budget) mints a
+    journal row and echoes its id as `X-Gorouter-Request-Id`, then answers
+    with `Connection: close` and destroys the socket after flush: the
+    session's connection is severed by design, so unread framing can never
+    be dispatched as a pipelined follow-up on a reused connection.
 1. Path must match `/go/v1/*` or `/zen/v1/*`; anything else → local 404/400.
 2. Local client auth: `Authorization: Bearer <local credential>` validated
    against the DPAPI-protected local credential (constant-time compare).
-   Missing/invalid → local 401; **no upstream call**.
-3. Route snapshot: lane → account id + alias + decrypted secret, read once
-   per request from `state.json` (atomic rename makes concurrent updates
-   unobservable half-written). Missing route/dangling account/missing secret
+   Missing/invalid → local 401; **no upstream call**. (Enforced pre-body
+   by admission above; dispatch re-checks after the body is held.)
+3. Route snapshot: lane → account id + alias + decrypted secret, resolved
+   EXACTLY ONCE per request into an immutable object that gates admission
+   AND populates the journal (GR-006). Reads come from `state.json`
+   (atomic rename makes concurrent updates unobservable half-written). Missing route/dangling account/missing secret
    → local 503/500; **no upstream call**.
 4. `router_request_id` assigned and journal row inserted **before** upstream
    dispatch.
 5. Upstream: fixed per-lane authority from settings — origin-validated at
    `config set` and on every load (foreign origins fail closed to the
    OpenCode default; loopback HTTP is the only non-OpenCode escape, for
-   deterministic tests). Path suffix + query + method + body passed
-   verbatim; local/hop-by-hop headers stripped; the selected account key is
+   deterministic tests). Path suffix + method + body passed verbatim;
+   the raw query is byte-preserved (GR-008: no parse-and-reserialize, so
+   `%20` vs `+`, bare keys, duplicate order and malformed escapes survive)
+   — only a pair carrying the local credential is dropped, and only that
+   pair; local/hop-by-hop headers stripped; the selected account key is
    injected into the **endpoint-family-appropriate header** (validated
    against the current OpenCode gateway surface: `authorization: Bearer`
    for chat/completions and responses, `x-api-key` for /messages,
@@ -75,7 +90,9 @@ accounts are supported; the immediate scenario uses two.
 
 - Route change → next request, no restart; in-flight requests keep their
   snapshot (journal proves the dispatched snapshot).
-- Route state updates are atomic (tmp + fsync + rename).
+- Route state updates are atomic (tmp + fsync + rename); a failure at any
+  stage unlinks the staging file before propagating (GR-011), so a leaked
+  tmp can never wedge the next attempt.
 - Failures: no implicit rotation; upstream 401/429/5xx proxied faithfully,
   exactly once.
 - Loopback default (`127.0.0.1`); `--host` at serve time is required for any
@@ -94,8 +111,10 @@ http_status, upstream_request_ids (allowlist: `x-request-id`,
 `x-amzn-requestid`), model (always NULL in V1), client_correlation_id
 (`X-Gorouter-Correlation-Id` when it passes bounded validation).
 
-Retention: `journalRetentionDays` (default 30) and `journalMaxRecords`
-(default 100k), pruned on startup and every 64 inserts. Journal storage
+Retention: `journalRetentionDays` (default 30, fractional allowed, max
+3650 days) and `journalMaxRecords` (default 100k, must be an integer —
+refused at `config set` and at load, GR-007), pruned on startup and every
+64 inserts; the prune backstop clamps out-of-range values. Journal storage
 faults set `degraded` (visible in `journal stats` and the control-pipe
 `journal.stats`; unauthenticated `/healthz` carries status/version only) and
 never block routing.

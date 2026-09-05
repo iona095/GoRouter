@@ -34,7 +34,7 @@ router  (unchanged V1 data plane, 127.0.0.1:<port>)
 | --- | --- |
 | `GoRouterDesktop.exe` | WinForms shell: system tray (NotifyIcon), control-center window, single-instance mutex (`Local\GoRouterDesktop-<userSID>`), close-to-tray semantics, HKCU Run start-at-login management, DPI awareness (PerMonitorV2), accessibility names, and the control client (named pipe). |
 | `control-service` (`src/desktop/control-service.ts`) | Named-pipe control API server, shared domain operations (`src/domain.ts`), router supervision, state-mtime watching for CLI coherence, event push to clients, desktop settings (`<state>/desktop.json`), admin token lifecycle. |
-| `router` (`src/cli.ts` / `gorouter-router.exe`) | The unchanged V1 data plane. Never imports desktop code; spawned by the service only when no healthy router answers `/healthz` on the configured port (attach mode otherwise). |
+| `router` (`src/cli.ts` / `gorouter-router.exe`) | The unchanged V1 data plane. Never imports desktop code; spawned by the service only when no router proves identity on the configured port (per-probe challenge + HMAC proof, GR-005; attach mode otherwise). |
 
 ### Spawn and environment contract
 
@@ -203,7 +203,11 @@ not ours.
   `failed` (manual restart action). No uncontrolled crash loop (contract
   §13).
 - Shutdown (explicit shell Exit, `app.exit` with `stopRouter:true`): stop
-  the MANAGED child only. Attached external routers are never stopped. If
+  the MANAGED child only. Teardown is asynchronous (GR-012):
+  `stop`/`close`/`restart` transition state synchronously and await only
+  the SIGTERM grace, which is event-driven — the control loop keeps
+  serving pipe ops while the child exits, and only the same child
+  (pid match) is force-killed past the grace. Attached external routers are never stopped. If
   the service is killed, the managed child is terminated with it (Windows
   job object, `KILL_ON_JOB_CLOSE` — see the managed-router lifecycle note)
   and the next shell start respawns it; attached external routers are
@@ -214,7 +218,12 @@ not ours.
   only; per-request completion notifications are prohibited as default UX.
 - A corrupt `state.json` fails closed to V1 defaults (port 8787, loopback,
   OpenCode upstreams); `snapshot.stateCorrupt` surfaces the condition and
-  the supervisor re-binds the default port after a state reset/repair. An
+  the supervisor re-binds the default port after a state reset/repair.
+  Schema compatibility is gated the same way (GR-004): a `state.json` or
+  `desktop.json` with an unrecognized `schemaVersion`, or a `journal.db`
+  stamped with a non-v1 user version, refuses writes and serves safe
+  defaults — never migrates, never force-claims — until a v1 file is
+  restored (or the file is deleted, which heals the gate). An
   adopted state whose local credential blob is missing is never silently
   rotated — `snapshot.localCredentialConfigured=false` is shown with a
   banner and the CLI `setup` is the documented repair path.

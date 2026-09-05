@@ -10,7 +10,7 @@ distribution outcome). Companion documents: `docs/desktop-architecture.md`
 | Tool | Version | Used for |
 | --- | --- | --- |
 | Bun | 1.3.14 | `bun build --compile` executables (control service, router) |
-| .NET SDK | 9.0.312 | WinForms shell publish (`net9.0-windows`) |
+| .NET SDK | 9.0.312 (pinned by `global.json`, `rollForward: disable`) | WinForms shell publish (`net9.0-windows`), zero-warning gate (`TreatWarningsAsErrors`; DPI comes solely from csproj `ApplicationHighDpiMode`, GR-009) |
 | PowerShell | 5.1 (Windows PowerShell, ships with Windows) | `scripts/build-desktop.ps1`, `scripts/desktop-dev.ps1` |
 | Windows | 10/11 x64 | supported host |
 
@@ -61,6 +61,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1
 The dev flow (`scripts/desktop-dev.ps1`) does not compile: it builds the
 shell in Debug, starts the service as `bun src/desktop/control-service.ts`
 and launches the tray app against the repo sources.
+
+## Staging and release manifest (GR-009)
+
+The release is staged in `dist.new/`, verified there, then atomically
+swapped over `dist/` — a failed build never leaves a half-written `dist`
+behind, and stale files from older builds cannot linger. Publish and
+smoke-test intermediates live in `.build-work/` (NOT in the stage tree,
+removed on success and on failure), so duplicate executables and evidence
+can never be swept into the release; only the `dev/` scratch dir is
+preserved across the swap. Before the swap, the script asserts the final
+manifest: exactly `GoRouterDesktop.exe`, `gorouter-control.exe`,
+`gorouter-router.exe` (each non-empty), plus optionally `dev/` — anything
+else fails the build.
+
+## Continuous integration (GR-010)
+
+`.github/workflows/ci.yml` runs `gates` (typecheck + `bun test` on
+Windows) and `desktop-dist`: pinned .NET SDK via `global.json`, the
+zero-warning shell build, the full `scripts/build-desktop.ps1` (including
+its launch smoke test and manifest assertion), and uploads the resulting
+`dist/` as the `gorouter-dist` artifact.
 
 ## dist/ layout
 
