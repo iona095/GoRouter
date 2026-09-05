@@ -263,16 +263,28 @@ async function withFileLock<T>(filename: string, operation: () => Promise<T>, wa
   }, operation);
 }
 
-async function writeFileAtomic(filename: string, content: string, mode: number = 0o600): Promise<void> {
-  const { mkdir, writeFile, rename, rm } = await import("node:fs/promises");
+// R3-010: exported for the durability regression test (fsync-before-rename
+// order through the real fs stack). Production callers use FileDshClient.
+export async function writeFileAtomic(filename: string, content: string, mode: number = 0o600): Promise<void> {
+  const { mkdir, rename, rm, open } = await import("node:fs/promises");
   const { dirname } = await import("node:path");
   await mkdir(dirname(filename), { recursive: true, mode: 0o700 });
   const { randomBytes } = await import("node:crypto");
   const temp = `${filename}.${randomBytes(6).toString("hex")}.tmp`;
+  // R3-010: same durability contract as the project's sync atomic writers
+  // (write -> fsync -> close -> rename). Without the fsync a crash between
+  // the rename commit and the cache flush can lose or corrupt the
+  // third-party settings file. The catch below is shared by the write,
+  // fsync, and rename stages: the target is intact either way (rename is
+  // the only commit point) and the staging temp is always removed.
+  const fh = await open(temp, "wx", mode);
   try {
-    await writeFile(temp, content, { mode, flag: "wx" });
+    await fh.writeFile(content, "utf8");
+    await fh.sync();
+    await fh.close();
     await rename(temp, filename);
   } catch (error) {
+    try { await fh.close(); } catch {}
     try { await rm(temp, { force: true }); } catch {}
     throw error;
   }
