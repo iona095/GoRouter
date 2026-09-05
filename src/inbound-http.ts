@@ -252,6 +252,19 @@ function readCloseBody(req: IncomingMessage, cap: number, stopAt: number): Promi
     let total = 0;
     let settled = false;
     const idle = { current: null as unknown as ReturnType<typeof setTimeout> | null };
+    // GR-003: absolute upload deadline (wall-clock, never reset by chunk
+    // arrivals). Declared before cleanup so every settle path clears it.
+    let absoluteTimer: ReturnType<typeof setTimeout> | null = null;
+    const armAbsolute = (): void => {
+      const t = setTimeout(() => {
+        if (settled) return;
+        cleanup();
+        try { req.destroy(); } catch { /* already gone */ }
+        reject(new Error("client body exceeded the absolute upload deadline"));
+      }, bodyAbsoluteTimeoutMs);
+      (t as unknown as { unref?: () => void }).unref?.();
+      absoluteTimer = t;
+    };
     const armIdle = () => {
       const t = setTimeout(() => {
         if (settled) return;
@@ -266,6 +279,7 @@ function readCloseBody(req: IncomingMessage, cap: number, stopAt: number): Promi
       if (settled) return;
       settled = true;
       if (idle.current) clearTimeout(idle.current);
+      if (absoluteTimer !== null) clearTimeout(absoluteTimer);
       req.off("data", onData);
       req.off("end", onEnd);
       req.off("aborted", onAbort);
@@ -311,6 +325,7 @@ function readCloseBody(req: IncomingMessage, cap: number, stopAt: number): Promi
       reject(err);
     };
     idle.current = armIdle();
+    armAbsolute();
     req.on("data", onData);
     req.once("end", onEnd);
     req.once("aborted", onAbort);
@@ -347,15 +362,26 @@ function readHeldBody(
       return t;
     };
     let idleTimer = armIdle();
+    // GR-003: absolute upload deadline (wall-clock, never reset by chunk
+    // arrivals). Declared before cleanup so every settle path clears it.
+    let absoluteTimer: ReturnType<typeof setTimeout> | null = null;
     const cleanup = () => {
       if (settled) return;
       settled = true;
       clearTimeout(idleTimer);
+      if (absoluteTimer !== null) clearTimeout(absoluteTimer);
       req.off("data", onData);
       req.off("aborted", onAbort);
       req.off("error", onError);
       signal.removeEventListener("abort", onAbort);
     };
+    absoluteTimer = setTimeout(() => {
+      if (settled) return;
+      cleanup();
+      try { req.destroy(); } catch { /* already gone */ }
+      reject(new Error("client body exceeded the absolute upload deadline"));
+    }, bodyAbsoluteTimeoutMs);
+    (absoluteTimer as unknown as { unref?: () => void }).unref?.();
     const onData = (chunk: Buffer) => {
       chunks.push(chunk);
       total += chunk.length;
@@ -386,13 +412,79 @@ function readHeldBody(
 }
 
 /**
+ * GR-003 — pre-body admission verdict. The server layer answers from raw
+ * headers only; a rejection is delivered before a single body byte is
+ * buffered (with Connection: close, like every other pre-consumption
+ * reject, so unread framing cannot desynchronize a reused connection).
+ */
+export type AdmitVerdict =
+  | { ok: true }
+  | { ok: false; status: number; type: string; message: string };
+
+export interface InboundAdmitInfo {
+  rawTarget: string;
+  method: string;
+  headers: Headers;
+}
+
+/**
+ * GR-003 — aggregate body budgets. The per-request cap bounds one sender;
+ * these bound ALL senders at once: at most MAX_TOTAL_BUFFERED_BYTES are
+ * held across concurrent body reads, and no single body may take longer
+ * than BODY_ABSOLUTE_TIMEOUT_MS wall-clock (the idle timer alone resets on
+ * every chunk, so a dribbling sender could otherwise hold a slot forever).
+ */
+export const MAX_TOTAL_BUFFERED_BYTES = 100 * 1024 * 1024;
+export const BODY_ABSOLUTE_TIMEOUT_MS = 120_000;
+let totalBufferedLimit = MAX_TOTAL_BUFFERED_BYTES;
+let totalBufferedBytes = 0;
+let bodyAbsoluteTimeoutMs = BODY_ABSOLUTE_TIMEOUT_MS;
+
+/** Test seam: shrink the aggregate budget (never raise it past production). */
+export function setInboundTotalBufferedLimitForTests(n: number): void {
+  if (!Number.isFinite(n) || n < 1 || n > MAX_TOTAL_BUFFERED_BYTES) {
+    throw new Error(`invalid test buffered-bytes limit: ${String(n)}`);
+  }
+  totalBufferedLimit = n;
+}
+
+export function resetInboundTotalBufferedLimitForTests(): void {
+  totalBufferedLimit = MAX_TOTAL_BUFFERED_BYTES;
+}
+
+/** Test seam: shrink the absolute upload deadline (never extend it). */
+export function setInboundBodyAbsoluteTimeoutForTests(ms: number): void {
+  if (!Number.isFinite(ms) || ms < 50 || ms > BODY_ABSOLUTE_TIMEOUT_MS) {
+    throw new Error(`invalid test absolute body timeout: ${String(ms)}`);
+  }
+  bodyAbsoluteTimeoutMs = ms;
+}
+
+export function resetInboundBodyAbsoluteTimeoutForTests(): void {
+  bodyAbsoluteTimeoutMs = BODY_ABSOLUTE_TIMEOUT_MS;
+}
+
+/** Try to reserve `n` bytes of the aggregate budget; false = over budget. */
+function budgetAcquire(n: number): boolean {
+  if (totalBufferedBytes + n > totalBufferedLimit) return false;
+  totalBufferedBytes += n;
+  return true;
+}
+
+function budgetRelease(n: number): void {
+  totalBufferedBytes = Math.max(0, totalBufferedBytes - n);
+}
+
+/**
  * Create an inbound HTTP server that validates raw request-targets before
  * passing to the handler.
  *
  * @param handler - The existing request handler (web Request → web Response)
- * @param opts - Server bind options (hostname, port)
+ * @param opts - Server bind options (hostname, port) plus the optional
+ *   GR-003 pre-body admission hook (lane/auth verdict on raw headers)
  * @param journalReject - Callback to journal rejected requests
- * @returns The node:http server (already listening)
+ * @returns The node:http server (listening asynchronously — see
+ *   waitForListening; bind errors surface there, not here)
  */
 /**
  * Correlation id off a node IncomingMessage's header bag (D-12): rejected
@@ -442,7 +534,7 @@ export function waitForListening(server: Server): Promise<number> {
 
 export function createInboundHttpServer(
   handler: (req: Request) => Promise<Response>,
-  opts: { hostname: string; port: number },
+  opts: { hostname: string; port: number; admit?: (info: InboundAdmitInfo) => AdmitVerdict },
   journalReject: (
     rawTarget: string,
     reason: string,
@@ -549,6 +641,25 @@ export function createInboundHttpServer(
       req.on("aborted", onClientAbort);
     }
 
+    // GR-003: pre-body admission on raw headers (lane + local auth) BEFORE
+    // any body byte is buffered. Rejections close the connection like every
+    // other pre-consumption reject: the declared body (if any) stays unread
+    // and must not be dispatched as a pipelined follow-up.
+    if (opts.admit) {
+      const verdict = opts.admit({ rawTarget, method, headers });
+      if (!verdict.ok) {
+        journalReject(rawTarget, verdict.message, method, verdict.status, incomingCorrelationId(req));
+        res.writeHead(verdict.status, { "content-type": "application/json", connection: "close" });
+        res.end(JSON.stringify({
+          error: { type: verdict.type, message: verdict.message },
+        }));
+        activeControllers.delete(abortController);
+        terminatedSockets.add(req.socket);
+        res.once("finish", () => req.socket.destroy());
+        return;
+      }
+    }
+
     // Convert body.
     //
     // Bun 1.3.14's node:http stops surfacing client disconnects once a request
@@ -615,13 +726,37 @@ export function createInboundHttpServer(
         res.once("finish", () => req.socket.destroy());
         return;
       }
+      // GR-003: aggregate budget — the declared bytes are reserved up front
+      // (released below on every settle path) so concurrent senders cannot
+      // jointly exceed the process-wide held-bytes ceiling.
+      let reserved = 0;
+      const releaseReservation = (): void => {
+        if (reserved > 0) {
+          budgetRelease(reserved);
+          reserved = 0;
+        }
+      };
+      if (!budgetAcquire(contentLength)) {
+        journalReject(rawTarget, "aggregate body budget exhausted", method, 503, incomingCorrelationId(req));
+        res.writeHead(503, { "content-type": "application/json", connection: "close" });
+        res.end(JSON.stringify({
+          error: { type: "GoRouterOverloadedError", message: "server is busy buffering request bodies; retry shortly" },
+        }));
+        activeControllers.delete(abortController);
+        terminatedSockets.add(req.socket);
+        res.once("finish", () => req.socket.destroy());
+        return;
+      }
+      reserved = contentLength;
       if (/close/i.test(req.headers["connection"] ?? "")) {
         // Capped consume: streaming the close-path raw bypassed the size
         // bound. Over-cap raises RequestBodyTooLargeError and answers 413
         // like the declared path.
         try {
           body = await readCloseBody(req, MAX_REQUEST_BODY_BYTES, contentLength);
+          releaseReservation();
         } catch (e) {
+          releaseReservation();
           activeControllers.delete(abortController);
           if (e instanceof RequestBodyTooLargeError) {
             journalReject(rawTarget, e.message, method, 413, incomingCorrelationId(req));
@@ -640,7 +775,9 @@ export function createInboundHttpServer(
       } else {
         try {
           body = await readHeldBody(req, contentLength, abortController.signal);
+          releaseReservation();
         } catch {
+          releaseReservation();
           // client aborted mid-body (or body read error); connection is gone
           activeControllers.delete(abortController);
           res.destroy();

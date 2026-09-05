@@ -20,7 +20,7 @@
  */
 import { timingSafeEqual } from "node:crypto";
 import type { Server } from "node:http";
-import { createInboundHttpServer, waitForListening } from "./inbound-http.ts";
+import { createInboundHttpServer, waitForListening, type AdmitVerdict } from "./inbound-http.ts";
 import {
   sanitizeForwardHeaders,
   validateCorrelationId,
@@ -137,15 +137,55 @@ function extractBearerToken(value: string | null): string | null {
 }
 
 function validateLocalAuth(req: Request, localCred: string): boolean {
+  return validateLocalAuthHeaders(req.headers, localCred);
+}
+
+/**
+ * GR-003: header-only credential check for pre-body admission. The inbound
+ * adapter validates these same headers before consuming a single body byte,
+ * so unauthenticated senders are rejected at framing cost, not buffer cost.
+ */
+function validateLocalAuthHeaders(headers: Headers, localCred: string): boolean {
   const candidates = [
-    extractBearerToken(req.headers.get("authorization")),
-    req.headers.get("x-api-key"),
-    req.headers.get("x-goog-api-key"),
+    extractBearerToken(headers.get("authorization")),
+    headers.get("x-api-key"),
+    headers.get("x-goog-api-key"),
   ];
   for (const c of candidates) {
     if (c !== null && timingSafeStringEq(c, localCred)) return true;
   }
   return false;
+}
+
+/**
+ * GR-003: pre-body admission verdict for one inbound request. Runs on raw
+ * headers only (no body consumed): unknown lanes reject 404, /healthz stays
+ * public, lane traffic requires the local credential (401) and a configured
+ * credential (503). Mirrors the handler's routing so admission and dispatch
+ * can never disagree on what is routable.
+ */
+function admitPreBody(rawTarget: string, headers: Headers, localCredential: () => string): AdmitVerdict {
+  const rawPath = rawTarget.split("?")[0] ?? "/";
+  if (rawPath === "/healthz") return { ok: true };
+  const lane =
+    rawPath === "/go/v1" || rawPath.startsWith("/go/v1/")
+      ? "go"
+      : rawPath === "/zen/v1" || rawPath.startsWith("/zen/v1/")
+        ? "zen"
+        : null;
+  if (!lane) {
+    return { ok: false, status: 404, type: "GoRouterRouteError", message: "unsupported local path; use /go/v1/* or /zen/v1/*" };
+  }
+  let localCred: string;
+  try {
+    localCred = localCredential();
+  } catch {
+    return { ok: false, status: 503, type: "GoRouterCredentialError", message: "local router credential is not configured; run `gorouter setup`" };
+  }
+  if (!validateLocalAuthHeaders(headers, localCred)) {
+    return { ok: false, status: 401, type: "GoRouterAuthError", message: "missing or invalid local client credential" };
+  }
+  return { ok: true };
 }
 
 /**
@@ -900,7 +940,14 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
         log.warn(`raw-target validation rejected: ${reason} (target: ${loggedTarget})`);
       };
 
-      server = createInboundHttpServer(handler, { hostname: host, port }, journalReject);
+      // GR-003: lane + local-auth admission runs on raw headers before any
+      // body byte is buffered (unauthenticated senders never reach the 25MiB
+      // per-request buffer, the aggregate budget, or upstream dispatch).
+      server = createInboundHttpServer(handler, {
+        hostname: host,
+        port,
+        admit: ({ rawTarget, headers }) => admitPreBody(rawTarget, headers, () => deps.state.localCredential()),
+      }, journalReject);
       let actualPort: number;
       try {
         actualPort = await waitForListening(server);
