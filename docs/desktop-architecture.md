@@ -250,7 +250,10 @@ Error codes: `validation | not_found | conflict | auth | unsupported |
 external | unavailable | internal`. Messages never contain secrets.
 
 The single `snapshot` shape carries: `serviceVersion`, `initialized`,
-`firstRun`, `stateCorrupt`, `secretStore` (`"ok"|"unavailable"` — probed by
+`firstRun`, `stateCorrupt`, `stateUnsupportedVersion` /
+`desktopUnsupportedVersion` (on-disk schema version when it is not v1 —
+the shell renders the compatibility banner and auto-start stays
+suppressed), `secretStore` (`"ok"|"unavailable"` — probed by
 DPAPI-unprotecting the admin token blob, never logging the value),
 `settings`, `routes` (per lane: `accountId` + `alias`), `accounts`
 (`secretPresent` boolean only — never a secret), `router` (state, mode,
