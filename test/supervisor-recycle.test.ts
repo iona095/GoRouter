@@ -60,7 +60,7 @@ test("F-03 integration: one failed probe never kills a mature managed child; sus
     log: silent,
   });
   const cleanup = (): void => {
-    try { sup.stop(); } catch { /* gone */ }
+    try { void sup.stop(); } catch { /* gone */ }
     for (const s of sockets) s.destroy();
     server.close();
   };

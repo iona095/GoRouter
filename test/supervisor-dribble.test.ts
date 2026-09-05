@@ -99,9 +99,9 @@ test("F-02: supervisor recovers after stop/start against a dribbling port", asyn
     expect(await waitFor(() => states.includes("port_conflict"), 8000)).toBe(true);
     // stop/start must trigger a NEW probe cycle, not strand on the latch.
     states.length = 0;
-    sup.stop();
+    await sup.stop();
     sup.start();
     expect(await waitFor(() => states.includes("port_conflict"), 8000)).toBe(true);
-    sup.stop();
+    await sup.stop();
   });
 }, 30000);

@@ -55,16 +55,20 @@ export interface RouterSupervisorOptions {
 export interface RouterSupervisor {
   /** Request the router to run: attach if healthy, else spawn. Idempotent. */
   start(): void
-  /** Stop supervision and kill the managed child (router.stop op). */
-  stop(): void
+  /**
+   * GR-012: stop supervision and kill the managed child (router.stop op).
+   * Asynchronous: state transitions synchronously, but the SIGTERM grace
+   * never blocks the event loop — await it for a deterministicResult.
+   */
+  stop(): Promise<void>
   /** Stop then start (manual restart; also recovers from `failed`). */
-  restart(): void
+  restart(): Promise<void>
   snapshot(): RouterSnapshot
   /** Teardown. stopChild=false intends to leave a managed child running
    * (app.exit stopRouter:false); on Windows the Bun job object
    * (KILL_ON_JOB_CLOSE) terminates it with the service regardless — the
    * next service start respawns it. */
-  close(stopChild: boolean): void
+  close(stopChild: boolean): Promise<void>
 }
 
 const DEFAULT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000]
@@ -74,6 +78,38 @@ const PROBE_TIMEOUT_MS = 1_500
  * (e.g. the CLI changed settings.port underneath it — the child still serves
  * the old port while the supervisor probes the new one). */
 export const CHILD_HEALTH_GRACE_MS = 10_000
+/**
+ * GR-012: SIGTERM grace for managed-router teardown — bounded and
+ * asynchronous. The event loop stays alive during the wait so the child's
+ * exit event is observed promptly (the old Bun.sleepSync poll blocked pipe
+ * operations for the full grace on every stop).
+ */
+export const CHILD_STOP_GRACE_MS = 2_000
+
+/**
+ * GR-012 test seam (also the primitive behind the async SIGTERM grace).
+ * Resolve when the child exits, or when the grace expires — never rejects,
+ * never blocks the loop.
+ */
+export function waitForChildExit(c: ChildProcess, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    // Loose null checks: node ChildProcess reports null while running;
+    // Bun.Subprocess leaves signalCode undefined (never null).
+    if (c.exitCode != null || c.signalCode != null) {
+      resolve()
+      return
+    }
+    const t = setTimeout(() => {
+      c.off('exit', onExit)
+      resolve()
+    }, ms)
+    const onExit = (): void => {
+      clearTimeout(t)
+      resolve()
+    }
+    c.once('exit', onExit)
+  })
+}
 
 /**
  * F-03: pure recycle decision (test seam). A startup grace measured as
@@ -513,7 +549,7 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
     void tick()
   }
 
-  function teardown(stopChild: boolean): void {
+  async function teardown(stopChild: boolean): Promise<void> {
     started = false
     healthyStreak = 0
     // F-02: a stranded probe must never brick supervision across a
@@ -538,18 +574,24 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
       } catch {
         /* already gone */
       }
-      // kill() is best-effort; if the child does not exit within a short
-      // grace, terminate the whole tree so a managed router can never be
-      // orphaned by a failed kill (STATE-01 fallback)
-      const deadline = Date.now() + 2_000
-      while (Date.now() < deadline && c.exitCode === null && c.signalCode === null) {
-        Bun.sleepSync(50)
-      }
-      if (c.exitCode === null && c.signalCode === null && c.pid !== undefined) {
+      // GR-012: the grace wait is event-driven, never a sleepSync poll —
+      // the loop keeps serving pipe operations while the child exits.
+      // kill() is best-effort; if the SAME child (pid match) is still alive
+      // past the grace, terminate the whole tree so a managed router can
+      // never be orphaned by a failed kill (STATE-01 fallback).
+      await waitForChildExit(c, CHILD_STOP_GRACE_MS)
+      if (c.exitCode == null && c.signalCode == null && c.pid !== undefined) {
         try {
           spawnSync('taskkill', ['/PID', String(c.pid), '/T', '/F'], { windowsHide: true })
         } catch {
           /* already gone */
+        }
+        if (c.exitCode == null && c.signalCode == null) {
+          try {
+            c.kill('SIGKILL')
+          } catch {
+            /* already gone */
+          }
         }
       }
     }
@@ -560,17 +602,17 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
     setState('stopped')
   }
 
-  function stop(): void {
-    teardown(true)
+  function stop(): Promise<void> {
+    return teardown(true)
   }
 
-  function restart(): void {
-    teardown(true)
+  async function restart(): Promise<void> {
+    await teardown(true)
     start()
   }
 
-  function close(stopChild: boolean): void {
-    teardown(stopChild)
+  function close(stopChild: boolean): Promise<void> {
+    return teardown(stopChild)
   }
 
   return { start, stop, restart, snapshot, close }

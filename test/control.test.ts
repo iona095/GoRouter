@@ -45,7 +45,7 @@ afterEach(async () => {
     // bun:sqlite WAL -shm/-wal handles release asynchronously on Windows;
     // under parallel worker load the release can take many seconds — retry
     // generously (non-blocking sleeps so the release can actually run).
-    // Verified: core.stop() clears the poll timer synchronously and the
+    // Verified: await core.stop() clears the poll timer synchronously and the
     // tests close their journal handles; the residual lock is the async
     // WAL release, so a bounded wait is the correct mitigation.
     for (let attempt = 0; attempt < 30; attempt++) {
@@ -284,7 +284,7 @@ describe('in-process control core', () => {
       expect(holders.length).toBe(2) // handles survived: no GC-close checkpoint
     } finally {
       unsub()
-      core.stop()
+      await core.stop()
       // BL-001: explicit dispose ordering — writers first (last-close may
       // checkpoint the WAL, post-proof and harmless), then the shared
       // afterEach rm only races bun:sqlite's short deferred release.
@@ -292,7 +292,7 @@ describe('in-process control core', () => {
     }
   })
 
-  test('journalStats TTL heals when a sibling-only commit lands inside the window (C1)', () => {
+  test('journalStats TTL heals when a sibling-only commit lands inside the window (C1)', async () => {
     const { core, paths, stateDir } = freshCore({ firstRunDone: true })
     dirs.push(stateDir)
     const j = createJournal(paths.journalDb, 30, 100000)
@@ -326,11 +326,11 @@ describe('in-process control core', () => {
       // built on this stats call can never dedup-suppress fresh content.
       expect(core.journalStats().records).toBe(2)
     } finally {
-      core.stop()
+      await core.stop()
     }
   })
 
-  test('snapshot has the exact protocol shape', () => {
+  test('snapshot has the exact protocol shape', async () => {
     const { core, paths } = freshCore()
     core.start()
     const snap = core.snapshot()
@@ -371,7 +371,7 @@ describe('in-process control core', () => {
     expect(snap.desktop).toEqual({ startAtLogin: false, minimizeToTray: false, theme: 'light', firstRunDoneAtUtc: null })
     expect(snap.stateDir).toBe(paths.state)
     expect(snap.localCredentialConfigured).toBe(true)
-    core.stop()
+    await core.stop()
   })
 
   test('route.set/route.clear via op handlers reflect in the snapshot', async () => {
@@ -390,7 +390,7 @@ describe('in-process control core', () => {
     await expect(handlers('route.set', { lane: 'gopher', accountId: 'alpha' })).rejects.toMatchObject({
       code: 'validation',
     })
-    core.stop()
+    await core.stop()
   })
 
   test('onSnapshot unsubscribe detaches; stop() cancels a pending debounced emission (F-28)', async () => {
@@ -409,7 +409,7 @@ describe('in-process control core', () => {
     let post = 0
     core.onSnapshot(() => post++)
     core.noteChange()
-    core.stop(false)
+    await core.stop(false)
     await new Promise((r) => setTimeout(r, 650))
     expect(post).toBe(0)
     // And noteChange() after stop() must not re-arm anything.
@@ -418,10 +418,10 @@ describe('in-process control core', () => {
     expect(post).toBe(0)
     // Unsubscribe is idempotent; double-stop is safe.
     unsub()
-    core.stop(false)
+    await core.stop(false)
   }, { timeout: 15000 })
 
-  test('journal.recent returns seeded rows newest-first with only safe fields', () => {
+  test('journal.recent returns seeded rows newest-first with only safe fields', async () => {
     const { core, paths } = freshCore()
     core.start()
     const j = createJournal(paths.journalDb, 30, 100000)
@@ -491,10 +491,10 @@ describe('in-process control core', () => {
       'terminalOutcome',
       'upstreamRequestIds',
     ])
-    core.stop()
+    await core.stop()
   })
 
-  test('journal.recent degrades gracefully and clamps the limit', () => {
+  test('journal.recent degrades gracefully and clamps the limit', async () => {
     const { core, paths } = freshCore()
     core.start()
     // no journal -> empty, not degraded
@@ -506,7 +506,7 @@ describe('in-process control core', () => {
     expect(res.degraded).toBe(true)
     expect(res.error).toBeTruthy()
     expect(core.journalStats().degraded).toBe(true)
-    core.stop()
+    await core.stop()
   })
 
   test('config.set allowlist + domain validation', async () => {
@@ -525,7 +525,7 @@ describe('in-process control core', () => {
     await handlers('config.set', { key: 'journalRetentionDays', value: '60' })
     await handlers('config.set', { key: 'journalMaxRecords', value: '5000' })
     expect(core.snapshot().settings).toEqual({ port: 8899, journalRetentionDays: 60, journalMaxRecords: 5000 })
-    core.stop()
+    await core.stop()
   })
 
   test('desktop.set is partial and firstRunDone completes onboarding', async () => {
@@ -545,7 +545,7 @@ describe('in-process control core', () => {
     expect(snap.desktop.minimizeToTray).toBe(true)
     expect(snap.desktop.firstRunDoneAtUtc).toBeTruthy()
     await expect(handlers('desktop.set', {})).rejects.toMatchObject({ code: 'validation' })
-    core.stop()
+    await core.stop()
   })
 
   test('desktop.set theme round-trips and rejects unknown values (6b)', async () => {
@@ -561,7 +561,7 @@ describe('in-process control core', () => {
     expect(core.snapshot().desktop.theme).toBe('light')
     await expect(handlers('desktop.set', { theme: 'midnight' })).rejects.toMatchObject({ code: 'validation' })
     await expect(handlers('desktop.set', { theme: 42 })).rejects.toMatchObject({ code: 'validation' })
-    core.stop()
+    await core.stop()
   })
 
   test('localCred.once: armed on fresh init, consumed once, then unavailable', async () => {
@@ -573,7 +573,7 @@ describe('in-process control core', () => {
     const domain = createDomain(paths, secrets)
     expect(once.credential).toBe(domain.localCredential())
     await expect(handlers('localCred.once', {})).rejects.toMatchObject({ code: 'unavailable' })
-    core.stop()
+    await core.stop()
   })
 
   test('localCred.once unavailable for adopted state and after onboarding', async () => {
@@ -615,7 +615,7 @@ describe('in-process control core', () => {
     expect(core.snapshot().router.state).toBe('stopped')
     expect(core.snapshot().router.pid).toBeNull()
     await waitFor(() => portIsFree(port), 5_000)
-    core.stop()
+    await core.stop()
     expect(existsSync(join(stateDir, 'state.json'))).toBe(true)
   })
 
@@ -642,7 +642,7 @@ describe('in-process control core', () => {
     // no uncontrolled loop: stays failed without further spawns
     await sleep(1500)
     expect(markerLines(marker).length).toBe(lines.length)
-    core.stop()
+    await core.stop()
   })
 
   test('router.stop on an attached router -> external error', async () => {
@@ -669,7 +669,7 @@ describe('in-process control core', () => {
       await waitFor(() => core.snapshot().router.state === 'running' && core.snapshot().router.mode === 'attached', 10_000)
       await expect(handlers('router.stop', {})).rejects.toMatchObject({ code: 'external' })
       await expect(handlers('router.restart', {})).rejects.toMatchObject({ code: 'external' })
-      core.stop()
+      await core.stop()
     } finally {
       try {
         fake.kill()

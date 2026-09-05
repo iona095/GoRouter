@@ -276,7 +276,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
         // `failed` (backoff exhausted) needs a full restart to recover; a
         // plain start() would be a no-op there (PS-01)
         const current = core.routerView()
-        if (current.state === 'failed') core.router.restart()
+        if (current.state === 'failed') await core.router.restart()
         else core.router.start()
         return core.routerView()
       }
@@ -289,7 +289,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
             'the router on this port was not started by the desktop; stop the router process yourself',
           )
         }
-        core.router.stop()
+        await core.router.stop()
         return core.routerView()
       }
 
@@ -301,7 +301,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
             'the router on this port was not started by the desktop; stop the router process yourself',
           )
         }
-        core.router.stop()
+        await core.router.stop()
         core.router.start()
         return core.routerView()
       }
@@ -316,7 +316,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
 
       case 'app.exit': {
         const stopRouter = params.stopRouter !== false
-        core.stop(stopRouter)
+        await core.stop(stopRouter)
         deps.onAppExit?.(stopRouter)
         return { exiting: true }
       }
@@ -416,8 +416,13 @@ async function main(): Promise<void> {
   const shutdown = (): void => {
     if (stopping) return
     stopping = true
-    core.stop(true)
-    void transport.close().then(() => process.exit(0))
+    // GR-012: await the async SIGTERM grace so the managed child is reaped
+    // before the service exits (the job object remains the final backstop).
+    void (async () => {
+      await core.stop(true)
+      await transport.close()
+      process.exit(0)
+    })()
   }
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)

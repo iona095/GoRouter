@@ -48,7 +48,7 @@ export interface ControlServiceOptions {
 export interface ControlService {
   start(): void
   /** Teardown; stopRouter=false leaves a managed router child running (app.exit stopRouter:false). */
-  stop(stopRouter?: boolean): void
+  stop(stopRouter?: boolean): Promise<void>
   snapshot(): Snapshot
   onSnapshot(cb: (snap: Snapshot) => void): () => void
   router: RouterSupervisor
@@ -559,7 +559,9 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     }
   }
 
-  function stop(stopRouter = true): void {
+  // GR-012: teardown awaits the supervisor's async grace (event loop stays
+  // alive; a forced process exit still reaps the child via the job object).
+  async function stop(stopRouter = true): Promise<void> {
     if (!started) return
     started = false
     if (pollTimer) {
@@ -581,7 +583,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     // snapshot serializes identically to pre-stop must still emit to
     // (possibly re-attached) listeners, or the UI goes stale silently.
     lastEmittedJson = null
-    supervisor?.close(stopRouter)
+    await supervisor?.close(stopRouter)
   }
 
   function onSnapshot(cb: (snap: Snapshot) => void): () => void {
@@ -631,10 +633,11 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     onSnapshot,
     router: {
       start: () => supervisor?.start(),
-      stop: () => supervisor?.stop(),
-      restart: () => supervisor?.restart(),
+      // GR-012: async teardown — callers await these for determinism.
+      stop: () => supervisor?.stop() ?? Promise.resolve(),
+      restart: () => supervisor?.restart() ?? Promise.resolve(),
       snapshot: () => supervisor?.snapshot() ?? { state: 'stopped' as const, mode: 'none' as const, pid: null, port: domain.configShow().port, restartCount: 0 },
-      close: (stopChild: boolean) => supervisor?.close(stopChild),
+      close: (stopChild: boolean) => supervisor?.close(stopChild) ?? Promise.resolve(),
     },
     routerView,
     journalRecent,
