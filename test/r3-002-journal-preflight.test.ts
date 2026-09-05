@@ -34,7 +34,7 @@ function inspect(dbPath: string): { master: MasterRow[]; version: string; mode: 
   }
 }
 
-const BEGIN = { lane: "go", selectedAccountId: null, selectedAccountAliasSnapshot: null, method: "GET", endpointFamily: "models", terminalOutcome: "ok", httpStatus: null, upstreamRequestIds: [], model: null, clientCorrelationId: null } as const;
+const BEGIN: { lane: string; selectedAccountId: null; selectedAccountAliasSnapshot: null; method: string; endpointFamily: string; terminalOutcome: "ok"; httpStatus: null; upstreamRequestIds: string[]; model: null; clientCorrelationId: null } = { lane: "go", selectedAccountId: null, selectedAccountAliasSnapshot: null, method: "GET", endpointFamily: "models", terminalOutcome: "ok", httpStatus: null, upstreamRequestIds: [], model: null, clientCorrelationId: null };
 
 describe("R3-002 journal preflight", () => {
   test("future-version DB is refused without any schema or mode mutation", () => {

@@ -517,9 +517,19 @@ async function doReconcile(
           // F-07: reload the approval authority before re-deriving — a
           // revocation that landed mid-flight must be honored, never restored.
           // A throwing loader fails the retry closed (no mutate on stale view).
+          // R3-003: a non-initialized reload (absent/corrupt/unsupported) is
+          // the SAME fail-closed gate as reconciliation entry — re-apply it
+          // and return without mutating instead of continuing on the stale
+          // entry view. No reloader wired (test-only shape; production always
+          // wires one) retains the entry-gated view.
           try {
             const reloaded = opts.reloadApprovalStore?.();
-            if (reloaded && reloaded.state === "initialized") {
+            if (reloaded) {
+              const retryGate = approvalGateStatus(reloaded, registry, attemptAt);
+              if (retryGate) {
+                if (persist) try { persist(retryGate); } catch {}
+                return retryGate;
+              }
               approvedGo = approvedIdsFor("go", reloaded);
               approvedZen = approvedIdsFor("zen", reloaded);
             }

@@ -953,6 +953,72 @@ describe("F-07: approval reload on conflict retry", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 10d. R3-003: conflict retry fails closed when the approval reload is not
+// initialized. A deleted/corrupt/future-version approval file between the
+// conflict and the retry must NOT fall back to the stale entry view.
+// ---------------------------------------------------------------------------
+
+describe("R3-003: approval reload gate on conflict retry", () => {
+  function retryWithReload(reloaded: ApprovalStoreLoad) {
+    const reg = authoritativeReg(["a", "new"], ["b"]);
+    const opts = {
+      approvalStore: initStore(["a", "new"], ["b"]),
+      reloadApprovalStore: () => reloaded,
+    };
+    let rev = 0;
+    let go: ModelEntry[] = [makeModel("a")];
+    let zen: ModelEntry[] = [makeModel("b")];
+    let mutateCalls = 0;
+    const client: DshClient = {
+      async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
+      async mutate(dg, dz, exp) {
+        mutateCalls++;
+        if (mutateCalls === 1) {
+          // External writer commits; approval file deleted/corrupted/replaced
+          // before our retry reloads it.
+          go = [makeModel("a"), makeModel("x")]; zen = [makeModel("b")]; rev += 1;
+          throw new DshConflictError(exp, rev);
+        }
+        if (exp !== rev) throw new DshConflictError(exp, rev);
+        go = [...dg]; zen = [...dz]; rev += 1;
+        return { revision: rev };
+      },
+    };
+    return { reg, opts, client, mutateCalls: () => mutateCalls, goIds: () => go.map((m) => m.id).sort() };
+  }
+
+  test("reload absent blocks with no second mutate and no restore", async () => {
+    const t = retryWithReload({ state: "absent" });
+    const st = await reconcileDshCatalog(t.reg, t.client, t.opts);
+    expect(t.mutateCalls()).toBe(1);
+    expect(st.outcome).toBe("blocked");
+    expect(st.mutationPerformed).toBe(false);
+    expect(st.migrationRequired).toBe(true);
+    expect(t.goIds()).not.toContain("new");
+  });
+
+  test("reload corrupt errors with no second mutate and no restore", async () => {
+    const t = retryWithReload({ state: "corrupt", reason: "injected" });
+    const st = await reconcileDshCatalog(t.reg, t.client, t.opts);
+    expect(t.mutateCalls()).toBe(1);
+    expect(st.outcome).toBe("error");
+    expect(st.mutationPerformed).toBe(false);
+    expect(st.lastError).toMatch(/corrupt/);
+    expect(t.goIds()).not.toContain("new");
+  });
+
+  test("reload unsupported-version errors with no second mutate and no restore", async () => {
+    const t = retryWithReload({ state: "unsupported-version", version: 99 });
+    const st = await reconcileDshCatalog(t.reg, t.client, t.opts);
+    expect(t.mutateCalls()).toBe(1);
+    expect(st.outcome).toBe("error");
+    expect(st.mutationPerformed).toBe(false);
+    expect(st.lastError).toMatch(/unsupported/);
+    expect(t.goIds()).not.toContain("new");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 11. Restart mid-sync (persistence)
 // ---------------------------------------------------------------------------
 
