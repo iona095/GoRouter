@@ -174,7 +174,7 @@ selected account's key at the upstream boundary.
 | `account list` | aliases + DPAPI refs, no secrets |
 | `account rename <old> <new>` | rename (stable account id preserved) |
 | `account remove <alias> [--force]` | remove (refused while routed) |
-| `account test <alias> [--lane go\|zen]` | live non-billing probe of the account |
+| `account test <alias> [--lane go\|zen]` | live authentication probe (Go performs a tiny completion and may consume Go usage/quota; Zen uses the designated free probe model) |
 | `route [go\|zen <alias>]` | show/set lane selection |
 | `route clear <go\|zen>` | clear a lane selection |
 | `status` | routes + journal health |
