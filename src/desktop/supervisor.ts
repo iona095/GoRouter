@@ -16,6 +16,7 @@ import net from 'node:net'
 import { existsSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { log as defaultLog, type Logger } from '../util.ts'
+import { ROUTER_CHALLENGE_HEADER, newRouterChallenge, verifyRouterProof } from '../router-proof.ts'
 
 export type RouterState = 'attached' | 'managed' | 'stopped' | 'starting' | 'degraded' | 'port_conflict' | 'failed'
 export type RouterMode = 'attached' | 'managed' | 'none'
@@ -36,6 +37,10 @@ export interface RouterCommand {
 export interface RouterSupervisorOptions {
   /** Current configured router port (re-read per probe; config.set while stopped takes effect next probe). */
   port: () => number
+  /** Local client credential for the GR-005 challenge proof (read per probe
+   * so rotation takes effect immediately; null while unconfigured fails
+   * closed to port_conflict, never attach). */
+  localCredential?: () => string | null
   /** Router command; an exact "<port>" argv entry is replaced with the configured port. */
   routerCmd: () => RouterCommand
   /** Runtime state dir, passed to the child as GOROUTER_STATE_DIR. */
@@ -180,8 +185,20 @@ function decodeChunkedBody(body: Buffer): string {
   }
 }
 
-/** Probe the router port: ok = our healthz signature; busy = something is listening. */
-export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: boolean }> {
+/**
+ * GR-005 — proof options. When `localCredential` is PRESENT, ok requires a
+ * valid HMAC proof over a fresh per-probe challenge (a parroted public JSON
+ * classifies as busy-but-foreign, never ours). A null return (unconfigured
+ * state) fails closed the same way. When ABSENT, the legacy public-signature
+ * check applies (framing/classification unit tests only — production always
+ * passes the provider via RouterSupervisorOptions).
+ */
+export interface RouterHealthProbeOptions {
+  localCredential?: () => string | null;
+}
+
+/** Probe the router port: ok = proven ours; busy = something is listening. */
+export function probeRouterHealth(port: number, opts?: RouterHealthProbeOptions): Promise<{ ok: boolean; busy: boolean }> {
   return new Promise((resolve) => {
     let settled = false
     // F-02: ABSOLUTE deadline + byte cap. net.connect({timeout}) is an
@@ -205,8 +222,11 @@ export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: bo
       socket.destroy()
       done(false, true)
     }, ABSOLUTE_DEADLINE_MS)
+    // GR-005: the challenge is minted per probe (replay across probes can
+    // never verify). No provider (legacy unit-test path) sends no challenge.
+    const challenge = opts?.localCredential ? newRouterChallenge() : null
     socket.once('connect', () => {
-      socket.write(`GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+      socket.write(`GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n${challenge ? `${ROUTER_CHALLENGE_HEADER}: ${challenge}\r\n` : ''}Connection: close\r\n\r\n`)
       const parts: Buffer[] = []
       let bytes = 0
       socket.on('data', (c) => {
@@ -245,13 +265,38 @@ export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: bo
         // (chunked;foo), and X-Transfer-Encoding must NOT classify as chunked
         const isChunked = teValues.length === 1 && teValues[0] === 'chunked'
         const body = isChunked ? decodeChunkedBody(rawBody) : rawBody.toString('utf8').trim()
-        let ok = false
+        let publicOk = false
+        let proof: unknown = null
+        let echoed: unknown = null
         try {
-          const j = JSON.parse(body) as { status?: unknown; version?: unknown }
-          ok = j.status === 'ok' && typeof j.version === 'string' && j.version.length > 0
+          const j = JSON.parse(body) as { status?: unknown; version?: unknown; challenge?: unknown; proof?: unknown }
+          publicOk = j.status === 'ok' && typeof j.version === 'string' && j.version.length > 0
+          proof = j.proof ?? null
+          echoed = j.challenge ?? null
         } catch {
-          ok = false
+          publicOk = false
         }
+        // GR-005: with a credential provider, liveness is not identity —
+        // ok requires OUR fresh challenge echoed back with a valid HMAC.
+        // Without a provider the legacy public-signature check applies
+        // (framing/classification unit tests; production always provides).
+        if (opts?.localCredential === undefined) {
+          done(publicOk, true)
+          return
+        }
+        let secret: string | null = null
+        try {
+          secret = opts.localCredential()
+        } catch {
+          secret = null
+        }
+        const ok =
+          publicOk &&
+          typeof secret === 'string' &&
+          secret.length > 0 &&
+          typeof challenge === 'string' &&
+          echoed === challenge &&
+          verifyRouterProof(secret, challenge, proof)
         done(ok, true)
       })
     })
@@ -380,7 +425,7 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
     probing = true
     try {
       const port = opts.port()
-      const probe = await probeRouterHealth(port)
+      const probe = await probeRouterHealth(port, { localCredential: opts.localCredential })
       if (!started) return
       if (probe.ok) {
         // healthy router on the port: ours (managed) or external (attached)

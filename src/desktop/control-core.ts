@@ -526,6 +526,15 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     }
     supervisor = createRouterSupervisor({
       port: () => domain.configShow().port,
+      // GR-005: the supervisor proves router identity per probe against the
+      // same DPAPI-held credential a legitimate router serves proofs with.
+      localCredential: () => {
+        try {
+          return domain.localCredential()
+        } catch {
+          return null
+        }
+      },
       routerCmd: () => opts.routerCmd ?? defaultRouterCommand(),
       stateDir: paths.state,
       probeIntervalMs: opts.probeIntervalMs,

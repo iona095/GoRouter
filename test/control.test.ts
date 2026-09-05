@@ -707,6 +707,12 @@ async function cli(env: Record<string, string>, args: string[], input?: string):
   return out
 }
 
+/** GR-005: read the seeded local credential (state ref + DPAPI blob). */
+function readLocalCredential(stateDir: string): string {
+  const stateJson = JSON.parse(readFileSync(join(stateDir, 'state.json'), 'utf8')) as { localCredentialRef: string }
+  return dpapiUnprotect(readFileSync(join(stateDir, 'secrets', `${stateJson.localCredentialRef}.bin`), 'utf8').trim())
+}
+
 async function seedState(stateDir: string, port: number, accounts: Array<[string, string]>): Promise<void> {
   const env = cliEnv(stateDir)
   await cli(env, ['setup'])
@@ -1052,7 +1058,12 @@ describe('real pipe integration', () => {
     const stateDir = freshStateDir()
     const port = await freePort()
     const marker = join(stateDir, 'spawns.log')
-    const fake = Bun.spawn([process.execPath, 'test/fake-router.ts', String(port), '--marker', marker], {
+    // GR-005: the attach candidate must prove identity (challenge HMAC over
+    // the seeded local credential); seed first, then hand the credential to
+    // the proof-capable fake.
+    await seedState(stateDir, port, [])
+    const credential = readLocalCredential(stateDir)
+    const fake = Bun.spawn([process.execPath, 'test/fake-router.ts', String(port), '--marker', marker, '--secret', credential], {
       cwd: ROOT,
       stdout: 'ignore',
       stderr: 'ignore',
@@ -1069,7 +1080,6 @@ describe('real pipe integration', () => {
         },
         10_000,
       )
-      await seedState(stateDir, port, [])
       const pipeName = uniquePipe('attach')
       const proc = spawnService(stateDir, pipeName, [process.execPath, 'test/fake-router.ts', '<port>'])
       try {
@@ -1083,6 +1093,52 @@ describe('real pipe integration', () => {
         // no additional spawn: the marker still has exactly the external start
         await sleep(2500)
         expect(markerLines(marker).length).toBe(1)
+        await client.close()
+      } finally {
+        await stopService(proc)
+      }
+    } finally {
+      try {
+        fake.kill()
+      } catch {
+        /* ignore */
+      }
+    }
+  })
+
+  test('spoofed public /healthz stays port_conflict (no attach without proof)', async () => {
+    // GR-005: the exact public health JSON without a challenge proof must
+    // never classify as ours — the desktop must not attach, must not spawn
+    // over it, and must report port_conflict.
+    const stateDir = freshStateDir()
+    const port = await freePort()
+    await seedState(stateDir, port, [])
+    const fake = Bun.spawn([process.execPath, 'test/fake-router.ts', String(port)], {
+      cwd: ROOT,
+      stdout: 'ignore',
+      stderr: 'ignore',
+    })
+    try {
+      await waitFor(
+        async () => {
+          try {
+            const r = await fetch(`http://127.0.0.1:${port}/healthz`)
+            return r.ok
+          } catch {
+            return false
+          }
+        },
+        10_000,
+      )
+      const pipeName = uniquePipe('spoof')
+      const proc = spawnService(stateDir, pipeName, [process.execPath, 'test/fake-router.ts', '<port>'])
+      try {
+        const token = await waitForAdminToken(stateDir)
+        const client = await connectPipe(pipeName, token)
+        await waitFor(async () => ((await client.request('snapshot')) as Snapshot).router.state === 'port_conflict', 15_000)
+        const snap = (await client.request('snapshot')) as Snapshot
+        expect(snap.router.mode).toBe('none')
+        expect(snap.router.pid).toBeNull()
         await client.close()
       } finally {
         await stopService(proc)

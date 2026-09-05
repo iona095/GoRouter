@@ -38,6 +38,7 @@ import {
 import type { StateStore, Lane } from "./state.ts";
 import type { Journal, TerminalOutcome } from "./journal.ts";
 import { resolvePaths, type Paths } from "./paths.ts";
+import { ROUTER_CHALLENGE_HEADER, isValidChallenge, computeRouterProof } from "./router-proof.ts";
 import { loadRegistry, isFresh, isCooldown } from "./models/registry.ts";
 import { maybeRefreshOnStartup, refreshRegistry } from "./models/refresh.ts";
 import { createDshClient } from "./models/dsh-client.ts";
@@ -752,7 +753,25 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
     // CURRENT-007: minimal unauthenticated surface — exactly the supervisor
     // probe signature (status + version). Routes, aliases, journal, and
     // state detail stay behind authenticated channels (control pipe, CLI).
+    // GR-005: the public shape stays static, but a well-formed challenge is
+    // answered with an HMAC proof keyed by the local credential, so the
+    // supervisor can distinguish OUR router from a parroting listener.
     if (path === "/healthz") {
+      const challenge = req.headers.get(ROUTER_CHALLENGE_HEADER);
+      if (isValidChallenge(challenge)) {
+        try {
+          const cred = deps.state.localCredential();
+          return Response.json({
+            status: "ok",
+            version: SERVER_VERSION,
+            challenge,
+            proof: computeRouterProof(cred, challenge),
+          });
+        } catch {
+          // unconfigured: fall through to the minimal public response (a
+          // supervisor holding a credential will not accept it as proof).
+        }
+      }
       return Response.json({ status: "ok", version: SERVER_VERSION });
     }
 
