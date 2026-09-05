@@ -145,6 +145,20 @@ function validateLocalAuth(req: Request, localCred: string): boolean {
  * adapter validates these same headers before consuming a single body byte,
  * so unauthenticated senders are rejected at framing cost, not buffer cost.
  */
+/**
+ * R3-001: declared-body detection on raw headers. Absent or zero
+ * Content-Length is bodyless; any other present value (positive, malformed,
+ * or multi-value) fails closed to "declared". Transfer-Encoding is
+ * rejected before admission by the adapter; its presence here also counts
+ * as declared so the verdict stays correct as a standalone contract.
+ */
+function hasDeclaredBody(headers: Headers): boolean {
+  if (headers.get("transfer-encoding") !== null) return true;
+  const cl = headers.get("content-length");
+  if (cl === null) return false;
+  return !/^\s*0\s*$/.test(cl);
+}
+
 function validateLocalAuthHeaders(headers: Headers, localCred: string): boolean {
   const candidates = [
     extractBearerToken(headers.get("authorization")),
@@ -159,14 +173,30 @@ function validateLocalAuthHeaders(headers: Headers, localCred: string): boolean 
 
 /**
  * GR-003: pre-body admission verdict for one inbound request. Runs on raw
- * headers only (no body consumed): unknown lanes reject 404, /healthz stays
- * public, lane traffic requires the local credential (401) and a configured
- * credential (503). Mirrors the handler's routing so admission and dispatch
- * can never disagree on what is routable.
+ * headers only (no body consumed): unknown lanes reject 404, bodyless
+ * GET/HEAD /healthz stays public (R3-001), lane traffic requires the local
+ * credential (401) and a configured credential (503). Mirrors the
+ * handler's routing so admission and dispatch can never disagree on what
+ * is routable.
+ *
+ * R3-001: the /healthz exemption is liveness-only. A declared body
+ * (Content-Length other than 0, or a Transfer-Encoding the adapter has
+ * not already rejected) is refused here — before aggregate-budget
+ * acquisition — so credentialless senders cannot spend the body budget
+ * through the public endpoint. Non-GET/HEAD methods are not part of the
+ * public surface either.
  */
-function admitPreBody(rawTarget: string, headers: Headers, localCredential: () => string): AdmitVerdict {
+function admitPreBody(rawTarget: string, headers: Headers, localCredential: () => string, method: string): AdmitVerdict {
   const rawPath = rawTarget.split("?")[0] ?? "/";
-  if (rawPath === "/healthz") return { ok: true };
+  if (rawPath === "/healthz") {
+    if (method !== "GET" && method !== "HEAD") {
+      return { ok: false, status: 404, type: "GoRouterRouteError", message: "/healthz only supports bodyless GET" };
+    }
+    if (hasDeclaredBody(headers)) {
+      return { ok: false, status: 400, type: "GoRouterRouteError", message: "/healthz does not accept a request body" };
+    }
+    return { ok: true };
+  }
   const lane =
     rawPath === "/go/v1" || rawPath.startsWith("/go/v1/")
       ? "go"
@@ -979,7 +1009,7 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       server = createInboundHttpServer(handler, {
         hostname: host,
         port,
-        admit: ({ rawTarget, headers }) => admitPreBody(rawTarget, headers, () => deps.state.localCredential()),
+        admit: ({ rawTarget, method, headers }) => admitPreBody(rawTarget, headers, () => deps.state.localCredential(), method),
       }, journalReject);
       let actualPort: number;
       try {
