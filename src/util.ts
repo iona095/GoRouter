@@ -104,30 +104,42 @@ import { writeFileSync, renameSync, openSync, closeSync, fsyncSync, unlinkSync, 
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
+// GR-011: every failure stage (serialize, write, fsync, rename) unlinks the
+// staging file before propagating. A leaked tmp would collide with the next
+// attempt's staging name and wedge the writer; the target is intact either
+// way because rename is the only commit point.
+function cleanupTmpOnFailure<T>(tmp: string, fd: number, op: () => T): T {
+  try {
+    return op();
+  } catch (e) {
+    try { closeSync(fd); } catch { /* already closed */ }
+    tryUnlink(tmp);
+    throw e;
+  }
+}
+
 export function atomicWriteJson(file: string, value: unknown): void {
   const dir = dirname(file);
   const tmp = join(dir, `.${randomUUID()}.tmp`);
   const fd = openSync(tmp, "w", 0o600);
-  try {
+  cleanupTmpOnFailure(tmp, fd, () => {
     writeFileSync(fd, JSON.stringify(value, null, 2) + "\n", "utf8");
     fsyncSync(fd);
-  } finally {
     closeSync(fd);
-  }
-  renameSync(tmp, file);
+    renameSync(tmp, file);
+  });
 }
 
 export function atomicWriteBytes(file: string, bytes: Uint8Array): void {
   const dir = dirname(file);
   const tmp = join(dir, `.${randomUUID()}.tmp`);
   const fd = openSync(tmp, "w", 0o600);
-  try {
+  cleanupTmpOnFailure(tmp, fd, () => {
     writeFileSync(fd, bytes);
     fsyncSync(fd);
-  } finally {
     closeSync(fd);
-  }
-  renameSync(tmp, file);
+    renameSync(tmp, file);
+  });
 }
 
 export function tryUnlink(file: string): void {
