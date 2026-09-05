@@ -35,7 +35,7 @@ import {
   redact,
   safeJsonStringify,
 } from "./util.ts";
-import type { StateStore, Lane } from "./state.ts";
+import type { StateStore, Lane, RouteSnapshot } from "./state.ts";
 import type { Journal, TerminalOutcome } from "./journal.ts";
 import { resolvePaths, type Paths } from "./paths.ts";
 import { ROUTER_CHALLENGE_HEADER, isValidChallenge, computeRouterProof } from "./router-proof.ts";
@@ -383,17 +383,19 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       return dispatch(lane, suffix, new URL(req.url).search, req);
     }
 
-    // At this point we have a registry with data for this lane: check route snapshot before serving cache
-    // so that dangling/missing-secret still fails closed (503/500) rather than silently serving stale cache.
+    // At this point we have a registry with data for this lane: resolve the
+    // route snapshot EXACTLY ONCE (GR-006). The same immutable object gates
+    // admission (dangling/missing-secret still fails closed via dispatch)
+    // AND populates the journal — a route change between two lookups must
+    // never attribute the request to an account it was not admitted under.
+    let snapshot: RouteSnapshot;
     try {
-      deps.state.resolveSnapshot(lane);
+      snapshot = deps.state.resolveSnapshot(lane);
     } catch (e) {
       // Fall back to dispatch so the existing route-error handling (journal + 503/500) applies
       return dispatch(lane, suffix, new URL(req.url).search, req);
     }
-
-    let snapForJournal: { accountId: string; alias: string } | null = null;
-    try { const s = deps.state.resolveSnapshot(lane); snapForJournal = { accountId: s.accountId, alias: s.alias }; } catch {}
+    const snapForJournal = { accountId: snapshot.accountId, alias: snapshot.alias };
 
     // fresh cache -> serve immediately without upstream
     if (fresh) {
