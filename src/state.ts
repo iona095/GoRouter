@@ -110,6 +110,33 @@ export function isValidPort(port: unknown): port is number {
 }
 
 /**
+ * GR-007 — journalMaxRecords invariant: a safe positive integer, bounded
+ * above. SQLite's `LIMIT ... OFFSET ?` rejects fractional/non-integer
+ * offsets with "datatype mismatch" and degrades the journal, so anything
+ * else must never persist (configSet) or load (normalizeState).
+ */
+export const JOURNAL_MAX_RECORDS_MIN = 1;
+export const JOURNAL_MAX_RECORDS_MAX = 10_000_000;
+export function isValidJournalMaxRecords(v: unknown): v is number {
+  return (
+    typeof v === "number" &&
+    Number.isSafeInteger(v) &&
+    v >= JOURNAL_MAX_RECORDS_MIN &&
+    v <= JOURNAL_MAX_RECORDS_MAX
+  );
+}
+
+/**
+ * GR-007 — journalRetentionDays invariant. Fractional days ARE allowed (the
+ * retention cutoff is continuous-day math, so 1.5 days is meaningful and
+ * harmless); the value must be finite, positive, and at most 10 years.
+ */
+export const JOURNAL_RETENTION_DAYS_MAX = 3650;
+export function isValidRetentionDays(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v) && v > 0 && v <= JOURNAL_RETENTION_DAYS_MAX;
+}
+
+/**
  * Allowed upstream authorities. Real stored OpenCode credentials may only be
  * forwarded to the OpenCode origin (https://opencode.ai — current live and
  * documented authority for both Go and Zen lanes) or to loopback HTTP test
@@ -362,8 +389,16 @@ function normalizeState(parsed: unknown): StateFile {
       out.settings.upstreamZen = v.ok ? v.url.toString().replace(/\/+$/, "") : DEFAULT_UPSTREAM_ZEN;
       if (!v.ok) log.error(`state upstreamZen invalid, failing closed to default: ${v.reason}`);
     }
-    if (typeof s.journalRetentionDays === "number") out.settings.journalRetentionDays = s.journalRetentionDays;
-    if (typeof s.journalMaxRecords === "number") out.settings.journalMaxRecords = s.journalMaxRecords;
+    // GR-007: persisted retention values validate identically to configSet
+    // (a hand-edited file must fail closed to defaults, never degrade SQLite).
+    if (typeof s.journalRetentionDays === "number") {
+      if (isValidRetentionDays(s.journalRetentionDays)) out.settings.journalRetentionDays = s.journalRetentionDays;
+      else log.error(`state journalRetentionDays '${s.journalRetentionDays}' invalid; failing closed to ${base.settings.journalRetentionDays}`);
+    }
+    if (typeof s.journalMaxRecords === "number") {
+      if (isValidJournalMaxRecords(s.journalMaxRecords)) out.settings.journalMaxRecords = s.journalMaxRecords;
+      else log.error(`state journalMaxRecords '${s.journalMaxRecords}' invalid; failing closed to ${base.settings.journalMaxRecords}`);
+    }
   }
   // CURRENT-001 layer 2: a malformed local credential ref fails closed to
   // unconfigured (operator must re-run setup) rather than flowing to the store.

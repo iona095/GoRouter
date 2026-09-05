@@ -306,18 +306,23 @@ function openSqliteJournal(dbPath: string, retentionDays: number, maxRecords: nu
     },
     prune(checkpoint = true) {
       runSafe(() => {
-        if (retentionDays > 0) {
-          const cutoff = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+        // GR-007 backstop: construction args are validated at the config and
+        // state boundaries, but never trust them here — a fractional OFFSET
+        // would degrade the journal, so clamp to the valid domain instead.
+        const retention = Number.isFinite(retentionDays) && retentionDays > 0 ? retentionDays : 0;
+        const max = Number.isSafeInteger(maxRecords) && maxRecords > 0 ? maxRecords : 0;
+        if (retention > 0) {
+          const cutoff = new Date(Date.now() - retention * 86_400_000).toISOString();
           db.prepare("DELETE FROM request_journal WHERE started_at_utc < ?").run(cutoff);
         }
-        if (maxRecords > 0) {
+        if (max > 0) {
           db.prepare(`
             DELETE FROM request_journal WHERE id IN (
               SELECT id FROM request_journal
               ORDER BY started_at_utc DESC
               LIMIT -1 OFFSET ?
             )
-          `).run(maxRecords);
+          `).run(max);
         }
         // keep the WAL bounded between checkpoints (retention is row-based)
         if (checkpoint) db.exec("PRAGMA wal_checkpoint(TRUNCATE);");

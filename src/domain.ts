@@ -28,6 +28,10 @@ import {
   validateAlias,
   validateUpstreamUrl,
   isValidPort,
+  isValidJournalMaxRecords,
+  isValidRetentionDays,
+  JOURNAL_MAX_RECORDS_MAX,
+  JOURNAL_RETENTION_DAYS_MAX,
   LANES,
   type StateFile,
   type Lane,
@@ -475,10 +479,22 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         let parsed: unknown = value;
         if (key === "port" || key === "journalRetentionDays" || key === "journalMaxRecords") {
           parsed = Number(value);
-          if (!Number.isFinite(parsed) || (parsed as number) <= 0) throw new Error(`invalid numeric value '${value}'`);
+          // GR-007: key-specific messages first (they subsume positivity),
+          // generic guard retained as the backstop for any numeric key.
           // CURRENT-012: fractional ports are silently truncated by listen —
           // reject them at the authoritative mutation boundary instead.
           if (key === "port" && !isValidPort(parsed)) throw new Error(`invalid port '${value}': must be an integer 1..65535`);
+          // GR-007: fractional journalMaxRecords deterministically degrades
+          // SQLite (LIMIT/OFFSET datatype mismatch) — reject at the same
+          // boundary instead of accepting a config that breaks observability.
+          if (key === "journalMaxRecords" && !isValidJournalMaxRecords(parsed)) {
+            throw new Error(`invalid journalMaxRecords '${value}': must be an integer 1..${JOURNAL_MAX_RECORDS_MAX}`);
+          }
+          // GR-007: fractional retention days are meaningful (continuous-day
+          // cutoff math) and stay allowed; non-positive/unbounded rejected.
+          if (key === "journalRetentionDays" && !isValidRetentionDays(parsed)) {
+            throw new Error(`invalid journalRetentionDays '${value}': must be a finite number > 0 and <= ${JOURNAL_RETENTION_DAYS_MAX}`);
+          }
         }
         if (key === "upstreamGo" || key === "upstreamZen") {
           const v = validateUpstreamUrl(value);
