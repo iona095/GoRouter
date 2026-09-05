@@ -49,12 +49,23 @@ const ERROR_CODES: Record<ErrorCode, true> = {
   internal: true,
 }
 
+/**
+ * R3-007: symmetric outbound queued-bytes ceiling (inbound lines are
+ * capped at MAX_LINE_BYTES). A single queued frame above the inbound cap
+ * is already suspicious, and an accumulation above it means a stalled
+ * consumer — either way the socket is dropped instead of grown.
+ */
+export const MAX_QUEUED_OUTBOUND_BYTES = 1024 * 1024;
+
 export function serveControlPipe(
   pipeName: string,
   token: string,
   handle: TransportHandle,
   onHello?: () => void,
   onError?: (err: Error) => void,
+  // R3-007: observability seam for the backpressure gate (tests + operator
+  // metrics): invoked once per stalled socket dropped instead of queued for.
+  onStalledDrop?: () => void,
 ): ControlTransport {
   const clients = new Set<Socket>()
   const server: Server = net.createServer((socket) => {
@@ -68,10 +79,28 @@ export function serveControlPipe(
     // that never succeeded leaves the socket unsubscribed.
     let helloOk = false
 
+    // R3-007: outbound backpressure. Inbound framing is capped at 1 MiB
+    // per line, but queued outbound bytes were unbounded: an
+    // authenticated-but-stalled client could grow control-service memory
+    // without limit. A frame that would push the queued bytes past the cap
+    // destroys the socket instead of queueing more.
     function send(obj: unknown): void {
       if (socket.destroyed) return
+      let line: string
       try {
-        socket.write(JSON.stringify(obj) + '\n')
+        line = JSON.stringify(obj) + '\n'
+      } catch {
+        socket.destroy()
+        return
+      }
+      if (socket.writableLength + Buffer.byteLength(line) > MAX_QUEUED_OUTBOUND_BYTES) {
+        log.warn('control pipe client stalled: dropping connection instead of queueing unbounded output')
+        try { onStalledDrop?.() } catch { /* observability only */ }
+        socket.destroy()
+        return
+      }
+      try {
+        socket.write(line)
       } catch {
         socket.destroy()
       }
@@ -194,11 +223,32 @@ export function serveControlPipe(
   server.listen(pipeName)
 
   function push(event: string, data: unknown): void {
-    const line = JSON.stringify({ event, data }) + '\n'
+    let line: string
+    try {
+      line = JSON.stringify({ event, data }) + '\n'
+    } catch {
+      return
+    }
+    const pending = Buffer.byteLength(line)
     for (const c of [...clients]) {
       try {
-        c.write(line)
+        // R3-007: drop (do not queue for) a subscriber whose queued bytes
+        // already exceed the ceiling — it stopped reading — or a single
+        // frame larger than the ceiling, which mirrors the inbound line
+        // cap and has no legitimate broadcast use. Either condition alone
+        // drops; ordinary small events always reach healthy subscribers.
+        // (Under runtimes that report queue growth honestly the backlog
+        // rule also trips on gradual accumulation of small events.)
+        if (c.destroyed || c.writableLength > MAX_QUEUED_OUTBOUND_BYTES || pending > MAX_QUEUED_OUTBOUND_BYTES) {
+          log.warn('control pipe push subscriber stalled: dropping instead of queueing unbounded output')
+          try { onStalledDrop?.() } catch { /* observability only */ }
+          clients.delete(c)
+          c.destroy()
+        } else {
+          c.write(line)
+        }
       } catch {
+        clients.delete(c)
         c.destroy()
       }
     }
