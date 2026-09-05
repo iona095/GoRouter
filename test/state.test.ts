@@ -32,7 +32,7 @@ describe("corrupt state quarantine (F-19)", () => {
     const store = createStateStore(resolvePaths(dir), memSecrets());
     const s = store.read();
     expect(s.accounts).toEqual([]);
-    expect(store.health()).toEqual({ corrupt: true });
+    expect(store.health()).toEqual({ corrupt: true, unsupportedSchemaVersion: null });
     // Original moved away to a timestamped backup holding the evidence.
     expect(existsSync(stateJson)).toBe(false);
     const backups = readdirSync(dir).filter((f) => f.startsWith("state.json.corrupt-"));
@@ -49,7 +49,7 @@ describe("corrupt state quarantine (F-19)", () => {
     // refuse rather than commit defaults over the only copy.
     const store = createStateStore(paths, memSecrets(), { quarantine: () => null });
     store.read();
-    expect(store.health()).toEqual({ corrupt: true });
+    expect(store.health()).toEqual({ corrupt: true, unsupportedSchemaVersion: null });
     expect(existsSync(stateJson)).toBe(true); // quarantine could not move it
     expect(() => store.mutate((s) => { s.settings.port = 9999; }))
       .toThrow(/refusing to write: state\.json is corrupt.*restore a backup or delete state\.json/);
@@ -59,7 +59,7 @@ describe("corrupt state quarantine (F-19)", () => {
     // and the next load heals the flag.
     writeFileSync(stateJson, JSON.stringify({ schemaVersion: 1, localCredentialRef: null, accounts: [], routes: {}, settings: { port: 9999 } }));
     store.mutate((s) => { s.settings.host = "127.0.0.1"; });
-    expect(store.health()).toEqual({ corrupt: false });
+    expect(store.health()).toEqual({ corrupt: false, unsupportedSchemaVersion: null });
   });
 
   test("same-process delete+setup repairs: missing file heals the flag (B0)", () => {
@@ -73,7 +73,7 @@ describe("corrupt state quarantine (F-19)", () => {
     // quarantine already moved it): the next read finds no file, clears the
     // flag, and setup-grade mutations work WITHOUT a process restart.
     store.read();
-    expect(store.health()).toEqual({ corrupt: false });
+    expect(store.health()).toEqual({ corrupt: false, unsupportedSchemaVersion: null });
     store.mutate((s) => { s.settings.port = 9999; });
     expect(existsSync(stateJson)).toBe(true);
     expect(store.read().settings.port).toBe(9999);
@@ -91,7 +91,7 @@ describe("corrupt state quarantine (F-19)", () => {
     const store = createStateStore(paths, memSecrets(), { quarantine: () => { quarantines++; return null; } });
     const s = store.read();
     expect(s.accounts).toEqual([]);
-    expect(store.health()).toEqual({ corrupt: true });
+    expect(store.health()).toEqual({ corrupt: true, unsupportedSchemaVersion: null });
     expect(quarantines).toBe(1);
     rmSync(paths.stateJson, { recursive: true, force: true });
   });

@@ -11,6 +11,7 @@
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { Database } from 'bun:sqlite'
+import { log } from '../util.ts'
 import type { Paths } from '../paths.ts'
 import type { SecretStore } from '../secret-store.ts'
 import type { Domain } from '../domain.ts'
@@ -500,7 +501,14 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
       if (created && credential !== null) {
         const desk = desktop.read()
         if (desk.freshStateCreatedAtUtc === null) {
-          desktop.write({ ...desk, freshStateCreatedAtUtc: new Date().toISOString() })
+          // GR-004: a version-gated desktop.json refuses this best-effort
+          // marker — the service must still start (the refusal, not a dead
+          // service, is the fail-closed behavior).
+          try {
+            desktop.write({ ...desk, freshStateCreatedAtUtc: new Date().toISOString() })
+          } catch (e) {
+            log.warn(`fresh-state marker not recorded: ${e instanceof Error ? e.message : String(e)}`)
+          }
         }
       }
     } else {

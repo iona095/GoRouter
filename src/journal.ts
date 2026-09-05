@@ -180,11 +180,22 @@ function openSqliteJournal(dbPath: string, retentionDays: number, maxRecords: nu
     const stmt = db.prepare("INSERT OR REPLACE INTO journal_meta (key, value) VALUES (?, ?)");
     stmt.run("schema_version", String(JOURNAL_SCHEMA_VERSION));
     stmt.run("created_at_utc", utcNow());
+  } else {
+    // GR-004: an existing journal carries its writer's version stamp. Adopt
+    // a stamp-less legacy file as ours; refuse anything newer (or otherwise
+    // not ours) WITHOUT restamping it — the throw below degrades to the
+    // in-memory journal and the on-disk version is never rewritten.
+    const row = db.prepare("SELECT value FROM journal_meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
+    if (row === undefined) {
+      db.prepare("INSERT OR REPLACE INTO journal_meta (key, value) VALUES (?, ?)").run(
+        "schema_version",
+        String(JOURNAL_SCHEMA_VERSION),
+      );
+    } else if (Number(row.value) !== JOURNAL_SCHEMA_VERSION) {
+      try { db.close(); } catch { /* best effort */ }
+      throw new Error(`unsupported journal schema version ${row.value} (this binary supports version ${JOURNAL_SCHEMA_VERSION}); journal file left untouched`);
+    }
   }
-  db.prepare("INSERT OR REPLACE INTO journal_meta (key, value) VALUES (?, ?)").run(
-    "schema_version",
-    String(JOURNAL_SCHEMA_VERSION),
-  );
 
   let degraded = false;
   let lastError: string | null = null;

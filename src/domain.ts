@@ -81,6 +81,8 @@ export interface StatusView {
   initialized: boolean;
   localCredentialConfigured: boolean;
   stateCorrupt: boolean;
+  /** On-disk schema version when it is not ours (GR-004 gate active). */
+  stateUnsupportedVersion: number | null;
   routes: RouteView[];
   accounts: AccountView[];
   settings: StateFile["settings"];
@@ -469,6 +471,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         initialized: s.localCredentialRef !== null,
         localCredentialConfigured: s.localCredentialRef !== null && secrets.exists(s.localCredentialRef),
         stateCorrupt: state.health().corrupt,
+        stateUnsupportedVersion: state.health().unsupportedSchemaVersion,
         routes: viewRoutes(s),
         accounts: s.accounts.map((a) => viewAccount(s, secrets, a)),
         settings: { ...s.settings },

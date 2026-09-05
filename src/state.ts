@@ -195,8 +195,12 @@ export interface StateStore {
   resolveSnapshot(lane: Lane): RouteSnapshot;
   /** Resolve the local client credential (for auth), or throw. */
   localCredential(): string;
-  /** Whether the most recent state load failed (corruption/read errors). */
-  health(): { corrupt: boolean };
+  /**
+   * Store health. `unsupportedSchemaVersion` is the on-disk schema version
+   * when it is not ours (GR-004): the file is served as defaults and every
+   * write is refused until the operator restores a supported version.
+   */
+  health(): { corrupt: boolean; unsupportedSchemaVersion: number | null };
 }
 
 export function createStateStore(paths: Paths, secrets: SecretStore, opts: { quarantine?: typeof quarantineCorruptFile } = {}): StateStore {
@@ -210,6 +214,9 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
   // re-read cost; an unstable ino only costs a re-read, never correctness).
   let cache: { mtimeMs: number; size: number; ino: number; state: StateFile } | null = null;
   let corrupt = false;
+  // GR-004: on-disk schema version newer (or otherwise not ours). While set,
+  // the file is served as defaults and never overwritten by this binary.
+  let unsupportedSchema: number | null = null;
 
   // Path of the most recent quarantine backup (for refusal messages).
   let lastQuarantine: string | null = null;
@@ -237,6 +244,21 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
     );
   }
 
+  /**
+   * GR-004 compatibility gate (B0 for versions): an older binary must never
+   * rewrite a newer schema it does not understand — a routine mutation would
+   * silently drop fields and break the upgrade/rollback path. Refuse until
+   * the operator restores a supported version (or deletes the file).
+   */
+  function refuseIfUnsupported(): void {
+    if (unsupportedSchema === null) return;
+    throw new Error(
+      `refusing to write: state.json has unsupported schema version ${unsupportedSchema} ` +
+      `(this binary supports version ${STATE_SCHEMA_VERSION}); ` +
+      `upgrade GoRouter or restore a version-${STATE_SCHEMA_VERSION} backup`,
+    );
+  }
+
   function load(): StateFile {
     const p = paths.stateJson;
     if (!existsSync(p)) {
@@ -248,6 +270,13 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
         log.warn(`state.json absent; clearing corrupt flag (evidence${lastQuarantine ? ` preserved at ${lastQuarantine}` : " was never quarantined — operator reset"}); repair via setup allowed`);
         corrupt = false;
         lastQuarantine = null;
+        cache = null;
+      }
+      // GR-004: deleting the unsupported file (per the refusal message) is
+      // the documented repair — clear the gate so re-setup can proceed.
+      if (unsupportedSchema !== null) {
+        log.warn(`state.json absent; clearing unsupported-schema gate (was v${unsupportedSchema}); repair via setup allowed`);
+        unsupportedSchema = null;
         cache = null;
       }
       return defaultState();
@@ -276,14 +305,28 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       log.error(`state.json corrupt; evidence quarantined, serving defaults (path=${p})`);
       return defaultState();
     }
+    // GR-004: a numeric version that is not ours is a compatibility gate,
+    // not metadata. Serve defaults and refuse every write — never normalize
+    // (which would drop unknown fields) and never overwrite. A missing or
+    // non-numeric version keeps the legacy tolerance (treated as v1).
+    const onDiskVersion = (parsed as { schemaVersion?: unknown }).schemaVersion;
+    if (typeof onDiskVersion === "number" && onDiskVersion !== STATE_SCHEMA_VERSION) {
+      unsupportedSchema = onDiskVersion;
+      corrupt = false;
+      cache = null;
+      log.error(`state.json has unsupported schema version ${onDiskVersion} (this binary supports v${STATE_SCHEMA_VERSION}); serving defaults, writes refused`);
+      return defaultState();
+    }
     const state = normalizeState(parsed);
     corrupt = false;
+    unsupportedSchema = null; // healed: a supported version supersedes the gate
     lastQuarantine = null; // healed: prior evidence is superseded, never name it again
     cache = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, state };
     return state;
   }
 
   function write(state: StateFile): void {
+    refuseIfUnsupported();
     refuseIfCorrupt();
     atomicWriteJson(paths.stateJson, state);
     cache = null; // force a fresh read next time
@@ -294,6 +337,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
     write,
     mutate(fn) {
       const state = load();
+      refuseIfUnsupported();
       refuseIfCorrupt();
       fn(state);
       write(state);
@@ -334,7 +378,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       return secrets.get(state.localCredentialRef);
     },
     health() {
-      return { corrupt };
+      return { corrupt, unsupportedSchemaVersion: unsupportedSchema };
     },
   };
 }
@@ -344,7 +388,9 @@ function normalizeState(parsed: unknown): StateFile {
   if (typeof parsed !== "object" || parsed === null) return base;
   const raw = parsed as Record<string, unknown>;
   const out: StateFile = base;
-  if (typeof raw.schemaVersion === "number") out.schemaVersion = raw.schemaVersion;
+  // GR-004: only our own version number is preserved (load() gates anything
+  // else before normalizeState ever runs; this is defense in depth).
+  if (raw.schemaVersion === STATE_SCHEMA_VERSION) out.schemaVersion = raw.schemaVersion;
   if (Array.isArray(raw.accounts)) {
     out.accounts = raw.accounts.filter(isAccountRecord).map((a) => ({ ...a }));
   }
