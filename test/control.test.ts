@@ -126,6 +126,7 @@ function freshCore(opts?: {
   paths: ReturnType<typeof resolvePaths>
   stateDir: string
   secrets: ReturnType<typeof memSecrets>
+  domain: ReturnType<typeof createDomain>
 } {
   const stateDir = freshStateDir()
   const paths = resolvePaths(stateDir)
@@ -153,7 +154,7 @@ function freshCore(opts?: {
     probeIntervalMs: opts?.probeIntervalMs,
   })
   const handlers = createOpHandlers({ core, domain })
-  return { core, handlers, paths, stateDir, secrets }
+  return { core, handlers, paths, stateDir, secrets, domain }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,12 +602,22 @@ describe('in-process control core', () => {
 
   test('app.exit stops the managed child', async () => {
     const port = await freePort()
-    const { core, handlers, stateDir } = freshCore({
+    // GR-005: the managed fake must prove identity or supervision never
+    // reaches running. The credential exists once the domain is created, so
+    // extend the argv (spawn happens after start) before starting.
+    const routerArgv = [process.execPath, 'test/fake-router.ts', '<port>']
+    const { core, handlers, stateDir, domain } = freshCore({
       firstRunDone: true,
       port,
-      routerCmd: { argv: [process.execPath, 'test/fake-router.ts', '<port>'], cwd: ROOT },
+      routerCmd: { argv: routerArgv, cwd: ROOT },
       backoffMs: [100, 200],
     })
+    // in-process domains skip CLI setup: create the local credential so the
+    // managed fake can prove identity (spawn happens after start). memSecrets
+    // is in-memory, so take setup()'s returned credential, not the disk blob.
+    const { credential: managedCred } = domain.setup()
+    if (!managedCred) throw new Error('setup did not create a local credential')
+    routerArgv.push('--secret', managedCred)
     core.start()
     // adopted state -> auto-start spawns the managed router
     await waitFor(() => core.snapshot().router.state === 'running' && core.snapshot().router.mode === 'managed', 10_000)
@@ -647,7 +658,12 @@ describe('in-process control core', () => {
 
   test('router.stop on an attached router -> external error', async () => {
     const port = await freePort()
-    const fake = Bun.spawn([process.execPath, 'test/fake-router.ts', String(port)], {
+    // GR-005: the attach candidate must prove identity; the in-process
+    // domain's credential is read before the external fake starts.
+    const { core, handlers, domain } = freshCore({ firstRunDone: true, port, probeIntervalMs: 300 })
+    const { credential } = domain.setup()
+    if (!credential) throw new Error('setup did not create a local credential')
+    const fake = Bun.spawn([process.execPath, 'test/fake-router.ts', String(port), '--secret', credential], {
       cwd: ROOT,
       stdout: 'ignore',
       stderr: 'ignore',
@@ -664,7 +680,6 @@ describe('in-process control core', () => {
         },
         10_000,
       )
-      const { core, handlers } = freshCore({ firstRunDone: true, port, probeIntervalMs: 300 })
       core.start()
       await waitFor(() => core.snapshot().router.state === 'running' && core.snapshot().router.mode === 'attached', 10_000)
       await expect(handlers('router.stop', {})).rejects.toMatchObject({ code: 'external' })
@@ -969,7 +984,9 @@ describe('real pipe integration', () => {
     j.close()
 
     const pipeName = uniquePipe('main')
-    const proc = spawnService(stateDir, pipeName, [process.execPath, 'test/fake-router.ts', '<port>'])
+    // GR-005: the managed fake must prove identity over the seeded credential.
+    const credential = readLocalCredential(stateDir)
+    const proc = spawnService(stateDir, pipeName, [process.execPath, 'test/fake-router.ts', '<port>', '--secret', credential])
     try {
       const token = await waitForAdminToken(stateDir)
       const client = await connectPipe(pipeName, token)

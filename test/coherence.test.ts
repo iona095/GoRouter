@@ -367,9 +367,11 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
     const port1 = await freePort()
     const upstream1 = await startMockUpstream()
     servers.push({ stop: () => upstream1.stop() })
-    await initState(dir1, { port: port1, upstream: upstream1.baseUrl, routeGo: true })
+    // GR-005: the managed fake must prove identity (challenge HMAC over the
+    // seeded local credential) or supervision never reaches running.
+    const { localCredential: cred1 } = await initState(dir1, { port: port1, upstream: upstream1.baseUrl, routeGo: true })
     const pipe1 = `\\\\.\\pipe\\gorouter-ctrl-test-${randomBytes(6).toString("hex")}`
-    const h1 = spawnService(dir1, { pipePath: pipe1, routerCmdJson: [BUN, FAKE_ROUTER, "<port>"] })
+    const h1 = spawnService(dir1, { pipePath: pipe1, routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--secret", cred1] })
     const c1 = await connectClient(h1)
     await c1.waitSnapshot((s) => routerRunning(s) && s.router.port === port1, 15_000)
     const hz = await fetch(`http://127.0.0.1:${port1}/healthz`)
@@ -441,10 +443,10 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
   test("d: supervisor attaches to an already-running external router and never spawns", async () => {
     const dir = freshStateDir()
     const port = await freePort()
-    await initState(dir, { port })
+    const { localCredential } = await initState(dir, { port })
     const markerExt = join(dir, "marker-ext.txt")
     const markerSvc = join(dir, "marker-svc.txt")
-    const ext = Bun.spawn([BUN, FAKE_ROUTER, String(port), "--marker", markerExt], {
+    const ext = Bun.spawn([BUN, FAKE_ROUTER, String(port), "--marker", markerExt, "--secret", localCredential], {
       cwd: REPO_ROOT,
       stdout: "pipe",
       stderr: "pipe",
@@ -458,7 +460,7 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
     const pipePath = `\\\\.\\pipe\\gorouter-ctrl-test-${randomBytes(6).toString("hex")}`
     const h = spawnService(dir, {
       pipePath,
-      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", markerSvc],
+      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", markerSvc, "--secret", localCredential],
     })
     const client = await connectClient(h)
     const snap = await client.waitSnapshot(
@@ -534,12 +536,12 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
   test("f2b: dev-mode app.exit stopRouter:true actually terminates the managed child", async () => {
     const dir = freshStateDir()
     const port = await freePort()
-    await initState(dir, { port })
+    const { localCredential: credStop } = await initState(dir, { port })
     const marker = join(dir, "marker-stop.txt")
     const pipePath = `\\\\.\\pipe\\gorouter-ctrl-test-${randomBytes(6).toString("hex")}`
     const h = spawnService(dir, {
       pipePath,
-      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker],
+      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker, "--secret", credStop],
     })
     const client = await connectClient(h)
     const running = await client.waitSnapshot((s) => routerRunning(s), 20_000)
@@ -566,12 +568,12 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
   test("m: service death with stopRouter:false recovers — a fresh service start brings routing back", async () => {
     const dir = freshStateDir()
     const port = await freePort()
-    await initState(dir, { port })
+    const { localCredential: credRecover } = await initState(dir, { port })
     const marker = join(dir, "marker-recover.txt")
     const pipePath = `\\\\.\\pipe\\gorouter-ctrl-test-${randomBytes(6).toString("hex")}`
     const h = spawnService(dir, {
       pipePath,
-      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker],
+      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker, "--secret", credRecover],
     })
     const client = await connectClient(h)
     await client.waitSnapshot((s) => s.router.state === "running", 20_000)
@@ -592,7 +594,7 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
     // fresh service on the same pipe + state dir
     const h2 = spawnService(dir, {
       pipePath,
-      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker],
+      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker, "--secret", credRecover],
     })
     const client2 = await connectClient(h2)
     const running2 = await client2.waitSnapshot((s) => s.router.state === "running", 20_000)
@@ -724,12 +726,12 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
   test("i: CLI-side port change recycles the managed router onto the new port", async () => {
     const dir = freshStateDir()
     const portA = await freePort()
-    await initState(dir, { port: portA })
+    const { localCredential: credPort } = await initState(dir, { port: portA })
     const marker = join(dir, "marker-port.txt")
     const pipePath = `\\\\.\\pipe\\gorouter-ctrl-test-${randomBytes(6).toString("hex")}`
     const h = spawnService(dir, {
       pipePath,
-      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker],
+      routerCmdJson: [BUN, FAKE_ROUTER, "<port>", "--marker", marker, "--secret", credPort],
     })
     const client = await connectClient(h)
     await client.waitSnapshot((s) => routerRunning(s) && s.router.port === portA, 20_000)
