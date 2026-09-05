@@ -46,10 +46,13 @@ accounts are supported; the immediate scenario uses two.
     senders never reach the 25 MiB per-request buffer, the 100 MiB
     process-wide aggregate budget (declared bytes reserved up front), or the
     120 s absolute upload deadline — and never reach upstream dispatch.
-    Every pre-dispatch reject (admission, framing, over-budget) mints a
-    journal row and echoes its id as `X-Gorouter-Request-Id`, then answers
-    with `Connection: close` and destroys the socket after flush: the
-    session's connection is severed by design, so unread framing can never
+    Every application-level pre-dispatch reject that reaches GoRouter's
+    request callback (admission, framing, over-budget) mints a journal row
+    and echoes its id as `X-Gorouter-Request-Id`. Parser-level Bun
+    rejections (malformed request line, TE+Content-Length conflicts)
+    occur before the application and cannot be journaled. Each reject answers
+    with `Connection: close` and destroys the socket after flush, severing
+    the session's connection by design, so unread framing can never
     be dispatched as a pipelined follow-up on a reused connection.
 1. Path must match `/go/v1/*` or `/zen/v1/*`; anything else → local 404/400.
 2. Local client auth: `Authorization: Bearer <local credential>` validated

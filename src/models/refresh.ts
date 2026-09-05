@@ -146,12 +146,17 @@ export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promi
   const p = (async (): Promise<RefreshResult> => {
     const lockPath = refreshLockPath(paths);
     let nonce: string | null = null;
+    // R3-008: a non-EEXIST claim throw (EACCES/ENOSPC/EROFS/...) is a local
+    // filesystem failure, NOT a held lock. Only the held-lock case may
+    // enter the waiter path; a failed claim reports explicitly and fast.
+    let claimError: string | null = null;
     try {
       nonce = tryClaimRefreshLock(lockPath);
     } catch (e) {
-      log.warn(`models refresh claim failed, proceeding unclaimed: ${e instanceof Error ? e.message : String(e)}`);
+      claimError = e instanceof Error ? e.message : String(e);
+      log.warn(`models refresh claim failed, failing explicitly: ${claimError}`);
     }
-    if (nonce === null) {
+    if (nonce === null && claimError === null) {
       // Another process is refreshing: wait for its publish and serve that
       // instead of double-hitting upstream.
       const cleared = await waitForRefreshLock(lockPath, opts.refreshWaitMs ?? REFRESH_WAIT_MS);
@@ -166,11 +171,12 @@ export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promi
         // claim ourselves instead of reporting busy.
         try {
           nonce = tryClaimRefreshLock(lockPath);
-        } catch {
+        } catch (e) {
           nonce = null;
+          if (claimError === null) claimError = e instanceof Error ? e.message : String(e);
         }
       }
-      if (nonce === null) {
+      if (nonce === null && claimError === null) {
         return {
           success: false,
           registry: cur,
@@ -181,6 +187,17 @@ export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promi
           diff: [],
         };
       }
+    }
+    if (nonce === null && claimError !== null) {
+      // Filesystem failure, not a held lock: explicit error, no busy
+      // misreport, no pointless wait (the waiter path above was skipped).
+      return {
+        success: false,
+        registry: loadRegistry(paths),
+        error: `models refresh unavailable (lock claim failed: ${claimError})`,
+        fromCache: false,
+        diff: [],
+      };
     }
     try {
       return await doRefresh(paths, opts);
