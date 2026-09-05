@@ -33,7 +33,7 @@ import type { JournalRowView, Snapshot } from '../src/desktop/protocol.ts'
 import { createDomain } from '../src/domain.ts'
 import { resolvePaths, ensureStateDirs } from '../src/paths.ts'
 import { dpapiUnprotect } from '../src/secret-store.ts'
-import { createJournal } from '../src/journal.ts'
+import { createJournal, type Journal } from '../src/journal.ts'
 import { memSecrets } from './harness.ts'
 import type { RouterCommand } from '../src/desktop/supervisor.ts'
 
@@ -196,7 +196,10 @@ describe('in-process control core', () => {
     // Both handles stay pinned (holders) for the whole test: a GC-collected
     // handle closes its connection, and last-close checkpoints the WAL,
     // moving the main file under us and voiding the attribution.
-    const holders: unknown[] = []
+    // BL-001: holders are closed explicitly in `finally` — relying on GC
+    // finalization to release the files left cleanup racing collection for
+    // up to a minute under parallel load (T-D04 flake).
+    const holders: Journal[] = []
     const seed = createJournal(paths.journalDb, 30, 100000)
     holders.push(seed)
     const se = seed.begin({
@@ -282,6 +285,10 @@ describe('in-process control core', () => {
     } finally {
       unsub()
       core.stop()
+      // BL-001: explicit dispose ordering — writers first (last-close may
+      // checkpoint the WAL, post-proof and harmless), then the shared
+      // afterEach rm only races bun:sqlite's short deferred release.
+      for (const h of holders.splice(0)) h.close()
     }
   })
 

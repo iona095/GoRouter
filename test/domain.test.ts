@@ -112,9 +112,44 @@ describe("domain mutations apply exactly once", () => {
     domain.setup();
     domain.configSet("port", "8899");
     expect(domain.configShow().port).toBe(8899);
-    expect(() => domain.configSet("port", "70000")).toThrow(/port out of range/);
+    expect(() => domain.configSet("port", "70000")).toThrow(/integer 1\.\.65535/);
     expect(domain.configShow().port).toBe(8899);
     expect(() => domain.configSet("host", "0.0.0.0")).toThrow(/non-loopback/);
+  });
+
+  test("CURRENT-012: fractional/NaN/Infinity/negative/oversize ports rejected, never persisted", () => {
+    const { domain } = fresh();
+    domain.setup();
+    domain.configSet("port", "45999");
+    expect(domain.configShow().port).toBe(45999);
+    for (const bad of ["45999.5", "8787.1", "NaN", "Infinity", "-1", "0", "65536", "abc"]) {
+      expect(() => domain.configSet("port", bad)).toThrow();
+      expect(domain.configShow().port).toBe(45999); // rejection never persists
+    }
+  });
+
+  test("CURRENT-012: isValidPort invariant accepts only integer 1..65535", async () => {
+    const { isValidPort } = await import("../src/state.ts");
+    expect(isValidPort(8787)).toBe(true);
+    expect(isValidPort(45999)).toBe(true);
+    expect(isValidPort(1)).toBe(true);
+    expect(isValidPort(65535)).toBe(true);
+    for (const bad of [45999.5, 8787.1, NaN, Infinity, -Infinity, -1, 0, 65536, "8787", null, undefined, {}]) {
+      expect(isValidPort(bad)).toBe(false);
+    }
+  });
+
+  test("CURRENT-012: crafted fractional port in state.json fails closed to default; 0 preserved", async () => {
+    const { stateDir } = fresh();
+    const { resolvePaths } = await import("../src/paths.ts");
+    const { createStateStore } = await import("../src/state.ts");
+    const { memSecrets } = await import("./harness.ts");
+    const paths = resolvePaths(stateDir);
+    const store = createStateStore(paths, memSecrets());
+    store.mutate((s) => { (s.settings as unknown as Record<string, unknown>).port = 45999.5; });
+    expect(createStateStore(paths, memSecrets()).read().settings.port).toBe(8787);
+    store.mutate((s) => { s.settings.port = 0; }); // explicit ephemeral marker survives
+    expect(createStateStore(paths, memSecrets()).read().settings.port).toBe(0);
   });
 
   test("setup is idempotent; local credential generated once", () => {

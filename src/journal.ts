@@ -14,7 +14,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { monotonicMs, utcNow, log, extractUpstreamRequestIds } from "./util.ts";
+import { monotonicMs, utcNow, log, safeJsonStringify, extractUpstreamRequestIds } from "./util.ts";
 
 export const JOURNAL_SCHEMA_VERSION = 1;
 
@@ -80,7 +80,72 @@ export interface Journal {
   close(): void;
 }
 
+/**
+ * CURRENT-005 — journal construction fallback. Storage must NEVER block
+ * routing: when the SQLite file cannot be opened (missing/unwritable
+ * parent, corrupt header at open, disk-full DDL), fall back to a bounded
+ * in-memory journal that stays observable (degraded + lastError evidence)
+ * and keeps recording. The healthy synchronous path is untouched.
+ */
 export function createJournal(dbPath: string, retentionDays: number, maxRecords: number): Journal {
+  try {
+    return openSqliteJournal(dbPath, retentionDays, maxRecords);
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    log.error(`journal unavailable at ${dbPath} (${reason}); continuing with in-memory degraded journal (routing unaffected)`);
+    return createMemoryJournal(`open failed: ${reason}`, retentionDays, maxRecords);
+  }
+}
+
+/** Bounded in-memory evidence ring for the degraded fallback (never throws). */
+const MEMORY_JOURNAL_MAX_ROWS = 1000;
+
+function createMemoryJournal(openError: string, retentionDays: number, maxRecords: number): Journal {
+  const rows = new Map<string, JournalEntry>();
+  return {
+    begin(init) {
+      const entry: JournalEntry = {
+        routerRequestId: randomUUID(),
+        startedAtUtc: utcNow(),
+        completedAtUtc: null,
+        durationMs: null,
+        ...init,
+      };
+      if (rows.size >= MEMORY_JOURNAL_MAX_ROWS) {
+        const oldest = rows.keys().next();
+        if (!oldest.done) rows.delete(oldest.value);
+      }
+      rows.set(entry.routerRequestId, entry);
+      return entry;
+    },
+    complete(entry, finalize) {
+      const cur = rows.get(entry.routerRequestId);
+      if (cur) {
+        cur.completedAtUtc = finalize.completedAtUtc;
+        cur.durationMs = finalize.durationMs;
+        cur.terminalOutcome = finalize.terminalOutcome;
+        cur.httpStatus = finalize.httpStatus;
+        cur.upstreamRequestIds = finalize.upstreamRequestIds.map(String);
+      }
+    },
+    stats(): JournalStats {
+      return {
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        records: rows.size,
+        oldestRecordAtUtc: null,
+        newestRecordAtUtc: null,
+        degraded: true,
+        lastError: openError,
+        retentionDays,
+        maxRecords,
+      };
+    },
+    prune() { /* nothing persisted */ },
+    close() { /* nothing to release */ },
+  };
+}
+
+function openSqliteJournal(dbPath: string, retentionDays: number, maxRecords: number): Journal {
   const fresh = !existsSync(dbPath);
   const db = new Database(dbPath, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
@@ -203,7 +268,8 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
           Math.max(0, Math.round(finalize.durationMs)),
           finalize.terminalOutcome,
           finalize.httpStatus,
-          JSON.stringify(finalize.upstreamRequestIds),
+          // CURRENT-004: cycle-safe (byte-identical for plain id arrays).
+          safeJsonStringify(finalize.upstreamRequestIds),
           entry.routerRequestId,
         );
       });
@@ -258,6 +324,14 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
       });
     },
     close() {
+      // BL-001: finalize compiled statements BEFORE db.close(). Unfinalized
+      // statements keep the Windows file handle alive until GC finalizes
+      // them, which under parallel worker load stretched past a minute and
+      // flaked cleanup (T-D04). Deterministic finalize reduces post-close
+      // release to milliseconds; the retry loops absorb the remainder.
+      for (const s of [insertStmt, updateStmt, statsMetaStmt, statsCountStmt, statsOldestStmt, statsNewestStmt]) {
+        try { s.finalize(); } catch { /* already finalized */ }
+      }
       db.close();
     },
   };

@@ -38,7 +38,7 @@ import { createSecretStore } from "./secret-store.ts";
 import { createDomain } from "./domain.ts";
 import { createJournal } from "./journal.ts";
 import { createServer } from "./server.ts";
-import { createStateStore, validateUpstreamUrl, LANES, type Lane } from "./state.ts";
+import { createStateStore, validateUpstreamUrl, isValidPort, LANES, type Lane } from "./state.ts";
 import { log, redact } from "./util.ts";
 
 const USAGE = `Usage: gorouter <command> [args]
@@ -281,8 +281,9 @@ async function main(argv: string[]): Promise<number> {
       }
       if (port !== undefined) {
         const pv = Number(port);
-        if (!Number.isFinite(pv) || pv <= 0 || pv > 65535) {
-          console.error(`invalid --port value '${port}'`);
+        // CURRENT-012: --port shares the integer invariant (no silent truncation).
+        if (!isValidPort(pv)) {
+          console.error(`invalid --port value '${port}': must be an integer 1..65535`);
           return 1;
         }
         s0.settings.port = pv;

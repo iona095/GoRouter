@@ -17,7 +17,7 @@
  *  auth, routing regression — all deterministic.
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
@@ -25,6 +25,7 @@ import { createStateStore, makeAccount } from "../src/state.ts";
 import { createJournal } from "../src/journal.ts";
 import { createServer } from "../src/server.ts";
 import { memSecrets, LOCAL_KEY, authHeaders, startMockUpstream, startTestRouter as _unused, readYamlFile } from "./harness.ts";
+import { newRef } from "../src/secret-store.ts";
 import { createDomain } from "../src/domain.ts";
 import {
   MODELS_SCHEMA_VERSION,
@@ -773,6 +774,60 @@ describe("concurrent coalescing (single-flight)", () => {
     expect(s2).toEqual(s3);
     expect(s1.outcome).toBe("current");
   });
+
+  test("CURRENT-002: different port/client/registry fly separately (no cross-caller results)", async () => {
+    const regA = authoritativeReg(["a"], ["b"]);
+    const storeA = initStore(["a"], ["b"]);
+    let mutateCalls = 0;
+    const mkClient = (goIds: string[], zenIds: string[]): DshClient => {
+      let go = goIds.map((id) => makeModel(id));
+      let zen = zenIds.map((id) => makeModel(id));
+      let rev = 0;
+      return {
+        async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
+        async mutate(dg, dz, exp) {
+          mutateCalls++;
+          await new Promise((r) => setTimeout(r, 30));
+          if (exp !== rev) throw new DshConflictError(exp, rev);
+          go = [...dg]; zen = [...dz]; rev += 1;
+          return { revision: rev };
+        },
+      };
+    };
+    // Different expectedPort: separate flights, separate outcomes (old code
+    // would hand the 9999 caller the 8787 flight's status).
+    const cPort = mkClient(["a"], ["b"]);
+    const [s8787, s9999] = await Promise.all([
+      reconcileDshCatalog(regA, cPort, { approvalStore: storeA, expectedPort: 8787 }),
+      reconcileDshCatalog(regA, cPort, { approvalStore: storeA, expectedPort: 9999 }),
+    ]);
+    expect(s8787.outcome).toBe("no-op"); // live already matches desired
+    expect(s9999.outcome).toBe("error");
+    expect(s9999.bindingValid).toBe(false);
+    // Different client identity: separate flights even with identical inputs
+    // (live state differs from desired so each flight mutates its own client).
+    const c1 = mkClient([], []);
+    const c2 = mkClient([], []);
+    const before = mutateCalls;
+    const [sc1, sc2] = await Promise.all([
+      reconcileDshCatalog(regA, c1, { approvalStore: storeA }),
+      reconcileDshCatalog(regA, c2, { approvalStore: storeA }),
+    ]);
+    expect(mutateCalls - before).toBe(2);
+    expect(sc1.outcome).toBe("current");
+    expect(sc2.outcome).toBe("current");
+    // Different registry content: separate flights.
+    const regB = authoritativeReg(["a", "new"], ["b"]);
+    const storeB = initStore(["a", "new"], ["b"]);
+    const c3 = mkClient([], []);
+    const c4 = mkClient([], []);
+    const beforeB = mutateCalls;
+    await Promise.all([
+      reconcileDshCatalog(regA, c4, { approvalStore: storeA }),
+      reconcileDshCatalog(regB, c3, { approvalStore: storeB }),
+    ]);
+    expect(mutateCalls - beforeB).toBe(2);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -793,7 +848,7 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
     expect(reloaded!.activeGoCount).toBe(st.activeGoCount);
     expect(reloaded!.committedRevision).toBe(st.committedRevision);
     // also via domain
-    const secrets = memSecrets(); secrets.put("sec_local", LOCAL_KEY);
+    const secrets = memSecrets(); const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const domainRestart = createDomain(paths, secrets);
     const view = domainRestart.modelsStatus();
     expect(view.dshSync).not.toBeNull();
@@ -1051,10 +1106,10 @@ describe("Slice A regression (deterministic, no live network)", () => {
     const stateDir = mkdtempSync(join(tmpdir(), "gorouter-dsh-auth-"));
     dirs.push(stateDir);
     const paths = resolvePaths(stateDir); ensureStateDirs(paths);
-    const secrets = memSecrets(); secrets.put("sec_local", LOCAL_KEY);
+    const secrets = memSecrets(); const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
-    state.mutate((s)=>{ s.localCredentialRef="sec_local"; s.settings.port=0; s.settings.upstreamGo=upstream.baseUrl; s.settings.upstreamZen=upstream.baseUrl; });
-    state.mutate((s)=>{ const ref="sec_a1"; secrets.put(ref,"sk-a1"); s.accounts.push(makeAccount("a1",ref)); });
+    state.mutate((s)=>{ s.localCredentialRef=localRef; s.settings.port=0; s.settings.upstreamGo=upstream.baseUrl; s.settings.upstreamZen=upstream.baseUrl; });
+    state.mutate((s)=>{ const ref=newRef(); secrets.put(ref,"sk-a1"); s.accounts.push(makeAccount("a1",ref)); });
     for (const lane of ["go","zen"] as const) { const a = state.read().accounts.find(x=>x.alias==="a1")!; state.mutate(st=>{ st.routes[lane].accountId=a.id; }); }
     const fresh = registryFile({ updatedAtMs: Date.now(), goIds:["cached"], zenIds:["cached"] });
     storeRegistry(paths, fresh);
@@ -1080,10 +1135,10 @@ describe("Slice A regression (deterministic, no live network)", () => {
     const stateDir = mkdtempSync(join(tmpdir(), "gorouter-dsh-infer-"));
     dirs.push(stateDir);
     const paths = resolvePaths(stateDir); ensureStateDirs(paths);
-    const secrets = memSecrets(); secrets.put("sec_local", LOCAL_KEY);
+    const secrets = memSecrets(); const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
-    state.mutate((s)=>{ s.localCredentialRef="sec_local"; s.settings.port=0; s.settings.upstreamGo=upstream.baseUrl; s.settings.upstreamZen=upstream.baseUrl; });
-    state.mutate((s)=>{ const ref="sec_a1"; secrets.put(ref,"sk-a1"); s.accounts.push(makeAccount("a1",ref)); });
+    state.mutate((s)=>{ s.localCredentialRef=localRef; s.settings.port=0; s.settings.upstreamGo=upstream.baseUrl; s.settings.upstreamZen=upstream.baseUrl; });
+    state.mutate((s)=>{ const ref=newRef(); secrets.put(ref,"sk-a1"); s.accounts.push(makeAccount("a1",ref)); });
     for (const lane of ["go","zen"] as const) { const a = state.read().accounts.find(x=>x.alias==="a1")!; state.mutate(st=>{ st.routes[lane].accountId=a.id; }); }
     const fresh = registryFile({ updatedAtMs: Date.now(), goIds:["cached"], zenIds:["cached"] });
     storeRegistry(paths, fresh);
@@ -1131,6 +1186,20 @@ describe("local-only guards & narrow persistence", () => {
     expect(isLoopbackHostname("evil.com")).toBe(false);
     expect(isLocalOnlyDshEndpoint("http://127.0.0.1:3080/api")).toBe(true);
     expect(isLocalOnlyDshEndpoint("http://evil.com/api")).toBe(false);
+    // CURRENT-011: DNS names with a 127. prefix are NOT loopback.
+    expect(isLoopbackHostname("127.evil.example")).toBe(false);
+    expect(isLoopbackHostname("127.0.0.1.evil.example")).toBe(false);
+    expect(isLoopbackHostname("127.0.0.0.1")).toBe(false);
+    expect(isLoopbackHostname("1127.0.0.1")).toBe(false);
+    expect(isLoopbackHostname("")).toBe(false);
+    expect(isLocalOnlyDshEndpoint("http://127.evil.example/api")).toBe(false);
+    expect(isLocalOnlyDshEndpoint("http://127.0.0.1.evil.example/api")).toBe(false);
+    // Intended loopback forms still accepted.
+    expect(isLoopbackHostname("127.0.0.2")).toBe(true);
+    expect(isLoopbackHostname("127.255.255.255")).toBe(true);
+    expect(isLoopbackHostname("::1")).toBe(true);
+    expect(isLoopbackHostname("LOCALHOST")).toBe(true); // case-insensitive
+    expect(isLocalOnlyDshEndpoint("http://127.0.0.2:8787/api")).toBe(true);
     // Windows drive paths like "C:\..." are parsed as URL with scheme "c:" and rejected as non-http; posix/relative file paths are local
     expect(isLocalOnlyDshEndpoint("/tmp/dsh-settings.yaml")).toBe(true);
     expect(isLocalOnlyDshEndpoint("settings.yaml")).toBe(true);
@@ -1165,9 +1234,9 @@ describe("registry refresh success survives DSH failure (domain integration)", (
     const stateDir = mkdtempSync(join(tmpdir(), "gorouter-dsh-domain-"));
     dirs.push(stateDir);
     const paths = resolvePaths(stateDir); ensureStateDirs(paths);
-    const secrets = memSecrets(); secrets.put("sec_local", LOCAL_KEY);
+    const secrets = memSecrets(); const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state2 = createStateStore(paths, secrets);
-    state2.mutate((s2)=>{ s2.localCredentialRef="sec_local"; s2.settings.upstreamGo=upstream.baseUrl; s2.settings.upstreamZen=upstream.baseUrl; });
+    state2.mutate((s2)=>{ s2.localCredentialRef=localRef; s2.settings.upstreamGo=upstream.baseUrl; s2.settings.upstreamZen=upstream.baseUrl; });
     const domain3 = createDomain(paths, secrets);
     const failingDsh: DshClient = {
       async read() { return { revision: 0, go: [makeModel("fresh-model")], zen: [makeModel("fresh-model")], ...RAW_BINDINGS }; },
@@ -1612,6 +1681,51 @@ describe("R3-1 FILE_SHARED_LOCK_MECHANISM — FINAL_CHECK_TO_RENAME_RACE + CROSS
     const finalSnap = await client.read();
     expect(finalSnap).not.toBeNull();
     await readYamlFile(settingsPath); // still parseable after the races
+  });
+
+  test("CURRENT-006: orphan <file>.lock (crashed holder) reclaimed — mutate succeeds, never wedged", async () => {
+    const { FileDshClient } = await import("../src/models/dsh-client.ts");
+    const dir = mkdtempSync(join(tmpdir(), "gorouter-dsh-orphan-"));
+    dirs.push(dir);
+    const settingsPath = join(dir, "settings.yaml");
+    writeFileSync(settingsPath, JSON.stringify({
+      "llm-pi-ai": { providers: { "gorouter-go": { models: [{ id: "seed-go" }] }, "gorouter-zen": { models: [{ id: "seed-zen" }] } } },
+    }), "utf8");
+    // Simulate a crashed holder: dead-pid claim, 11s old (past the orphan ceiling).
+    const lockPath = `${settingsPath}.lock`;
+    writeFileSync(lockPath, JSON.stringify({ pid: 2147483647, ts: Date.now() - 11_000, nonce: "orphan" }), "utf8");
+    const ancient = new Date(Date.now() - 11_000);
+    utimesSync(lockPath, ancient, ancient);
+    const client = new FileDshClient(settingsPath);
+    const snap = await client.read();
+    expect(snap).not.toBeNull();
+    const res = await client.mutate([...snap!.go, makeModel("reclaimed-go")], snap!.zen, snap!.revision);
+    expect(res.revision).toBeGreaterThanOrEqual(0);
+    const after = await client.read();
+    expect(after!.go.map((m) => m.id)).toContain("reclaimed-go");
+  });
+
+  test("CURRENT-006: live holder never displaced — waiter times out with the atomic-write message", async () => {
+    const { FileDshClient } = await import("../src/models/dsh-client.ts");
+    const { withFileLockAsyncAt } = await import("../src/lock.ts");
+    const dir = mkdtempSync(join(tmpdir(), "gorouter-dsh-livedisp-"));
+    dirs.push(dir);
+    const settingsPath = join(dir, "settings.yaml");
+    writeFileSync(settingsPath, JSON.stringify({
+      "llm-pi-ai": { providers: { "gorouter-go": { models: [{ id: "seed-go" }] }, "gorouter-zen": { models: [{ id: "seed-zen" }] } } },
+    }), "utf8");
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((r) => { releaseGate = r; });
+    const holder = withFileLockAsyncAt(`${settingsPath}.lock`, { timeoutMs: 10_000 }, async () => {
+      await gate;
+      return "holder-done";
+    });
+    await Bun.sleep(50);
+    const client = new FileDshClient(settingsPath);
+    const snap = await client.read();
+    await expect(client.mutate(snap!.go, snap!.zen, snap!.revision)).rejects.toThrow(/timed out waiting for the writer lock/);
+    releaseGate();
+    expect(await holder).toBe("holder-done");
   });
 
   test("REVISION_SAFE is PASS only when FINAL_CHECK_TO_RENAME_RACE and CROSS_PROCESS_LOST_UPDATE_PROOF both PASS (meta)", () => {

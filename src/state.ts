@@ -11,7 +11,7 @@
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { atomicWriteJson, log, quarantineCorruptFile } from "./util.ts";
-import type { SecretStore } from "./secret-store.ts";
+import { isValidSecretRef, type SecretStore } from "./secret-store.ts";
 import type { Paths } from "./paths.ts";
 
 export const STATE_SCHEMA_VERSION = 1;
@@ -60,6 +60,19 @@ export interface RouteSnapshot {
 
 export const DEFAULT_UPSTREAM_GO = "https://opencode.ai/zen/go/v1";
 export const DEFAULT_UPSTREAM_ZEN = "https://opencode.ai/zen/v1";
+
+/**
+ * CURRENT-012 — single shared port invariant.
+ *
+ * A servable port is an integer in 1..65535. Fractional values must never
+ * persist: the listener truncates them silently, so accepting one would
+ * serve on a port the operator never chose. Port 0 (OS-assigned ephemeral)
+ * is intentionally NOT valid here — it is allowed only where explicitly
+ * intended (in-process/test servers that never persist it as configuration).
+ */
+export function isValidPort(port: unknown): port is number {
+  return typeof port === "number" && Number.isInteger(port) && port >= 1 && port <= 65535;
+}
 
 /**
  * Allowed upstream authorities. Real stored OpenCode credentials may only be
@@ -129,7 +142,11 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
   // failing quarantine to pin the refuse-while-unpreserved path, which real
   // filesystems trigger only on rare rename failures.
   const quarantineFile = opts.quarantine ?? quarantineCorruptFile;
-  let cache: { mtimeMs: number; size: number; state: StateFile } | null = null;
+  // CURRENT-010: identity includes ino (file index). All writers are atomic
+  // renames, which mint a new file identity — so a same-size replacement in
+  // the same mtime tick can never false-hit (the digest-equivalent without
+  // re-read cost; an unstable ino only costs a re-read, never correctness).
+  let cache: { mtimeMs: number; size: number; ino: number; state: StateFile } | null = null;
   let corrupt = false;
 
   // Path of the most recent quarantine backup (for refusal messages).
@@ -174,7 +191,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       return defaultState();
     }
     const st = statSync(p);
-    if (cache && cache.mtimeMs === st.mtimeMs && cache.size === st.size) return cache.state;
+    if (cache && cache.mtimeMs === st.mtimeMs && cache.size === st.size && cache.ino === st.ino) return cache.state;
     let raw: string;
     try {
       raw = readFileSync(p, "utf8");
@@ -198,7 +215,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
     const state = normalizeState(parsed);
     corrupt = false;
     lastQuarantine = null; // healed: prior evidence is superseded, never name it again
-    cache = { mtimeMs: st.mtimeMs, size: st.size, state };
+    cache = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, state };
     return state;
   }
 
@@ -279,7 +296,14 @@ function normalizeState(parsed: unknown): StateFile {
   }
   if (typeof raw.settings === "object" && raw.settings !== null) {
     const s = raw.settings as Record<string, unknown>;
-    if (typeof s.port === "number") out.settings.port = s.port;
+    // CURRENT-012: fractional/out-of-range persisted ports fail closed to
+    // the loopback default (mirrors the non-loopback host rule below).
+    // Port 0 is preserved as-is: it is the explicit ephemeral marker used by
+    // in-process/test servers, never a truncated fractional.
+    if (s.port === 0 || isValidPort(s.port)) out.settings.port = s.port as number;
+    else if (typeof s.port === "number") {
+      log.error(`state port '${s.port}' is not an integer 1..65535; failing closed to ${base.settings.port}`);
+    }
     // host is validated: a non-loopback value fails closed to loopback
     if (typeof s.host === "string") {
       const loopback = s.host === "127.0.0.1" || s.host === "localhost" || s.host === "::1";
@@ -304,17 +328,22 @@ function normalizeState(parsed: unknown): StateFile {
     if (typeof s.journalRetentionDays === "number") out.settings.journalRetentionDays = s.journalRetentionDays;
     if (typeof s.journalMaxRecords === "number") out.settings.journalMaxRecords = s.journalMaxRecords;
   }
-  if (typeof raw.localCredentialRef === "string") out.localCredentialRef = raw.localCredentialRef;
+  // CURRENT-001 layer 2: a malformed local credential ref fails closed to
+  // unconfigured (operator must re-run setup) rather than flowing to the store.
+  if (isValidSecretRef(raw.localCredentialRef)) out.localCredentialRef = raw.localCredentialRef;
   return out;
 }
 
 function isAccountRecord(v: unknown): v is AccountRecord {
   if (typeof v !== "object" || v === null) return false;
   const a = v as Record<string, unknown>;
+  // CURRENT-001 layer 2: accounts carrying malformed secret refs are
+  // dropped at load (same precedent as other malformed account entries),
+  // so a crafted state.json cannot smuggle an escaping ref into the store.
   return (
     typeof a.id === "string" &&
     typeof a.alias === "string" &&
-    typeof a.secretRef === "string"
+    isValidSecretRef(a.secretRef)
   );
 }
 

@@ -19,7 +19,7 @@ import { createJournal } from "../src/journal.ts";
 import { createServer } from "../src/server.ts";
 import { memSecrets, LOCAL_KEY, authHeaders, startMockUpstream } from "./harness.ts";
 import { createDomain } from "../src/domain.ts";
-import { createSecretStore } from "../src/secret-store.ts";
+import { createSecretStore, newRef } from "../src/secret-store.ts";
 import {
   MODELS_SCHEMA_VERSION,
   MODELS_TTL_MS,
@@ -80,7 +80,7 @@ function freshPaths() {
 function makeDomainAt(paths: ReturnType<typeof resolvePaths>) {
   const secrets = memSecrets();
   // seed a local credential so state is considered initialized where needed
-  secrets.put("sec_local", LOCAL_KEY);
+  const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
   return { paths, secrets, domain: createDomain(paths, secrets) };
 }
 
@@ -1145,17 +1145,17 @@ describe("server /models cache and auth", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     for (const alias of ["a1"]) {
       state.mutate((s) => {
-        const ref = "sec_" + alias;
+        const ref = newRef(); // CURRENT-001: canonical ref
         secrets.put(ref, "sk-" + alias);
         s.accounts.push(makeAccount(alias, ref));
       });
@@ -1200,16 +1200,16 @@ describe("server /models cache and auth", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -1251,16 +1251,16 @@ describe("server /models cache and auth", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -1305,16 +1305,16 @@ describe("server /models cache and auth", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -1366,16 +1366,16 @@ describe("server /models cache and auth", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -1420,16 +1420,16 @@ describe("server /models cache and auth", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -1731,10 +1731,10 @@ describe("CLI subcommands", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
@@ -1876,16 +1876,16 @@ describe("CHALLENGE 2 — non-blocking startup", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -2088,16 +2088,16 @@ describe("CHALLENGE 5 — bootstrap, Windows atomic, journal", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const secrets = memSecrets();
-    secrets.put("sec_local", LOCAL_KEY);
+    const localRef = newRef(); secrets.put(localRef, LOCAL_KEY);
     const state = createStateStore(paths, secrets);
     state.mutate((s) => {
-      s.localCredentialRef = "sec_local";
+      s.localCredentialRef = localRef;
       s.settings.port = 0;
       s.settings.upstreamGo = upstream.baseUrl;
       s.settings.upstreamZen = upstream.baseUrl;
     });
     state.mutate((s) => {
-      const ref = "sec_a1";
+      const ref = newRef();
       secrets.put(ref, "sk-a1");
       s.accounts.push(makeAccount("a1", ref));
     });
@@ -2121,7 +2121,8 @@ describe("CHALLENGE 5 — bootstrap, Windows atomic, journal", () => {
     const rows = (() => {
       const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
       const db = new Database(paths.journalDb, { readonly: true });
-      try { return db.query("SELECT endpoint_family, lane FROM request_journal ORDER BY id DESC LIMIT 1").all() as Array<{ endpoint_family: string; lane: string }>; } finally { db.close(); }
+      const stmt = db.query("SELECT endpoint_family, lane FROM request_journal ORDER BY id DESC LIMIT 1");
+      try { return stmt.all() as Array<{ endpoint_family: string; lane: string }>; } finally { try { stmt.finalize(); } catch { /* already finalized */ } db.close(); }
     })();
     expect(rows[0]!.endpoint_family).toBe("models");
     expect(rows[0]!.lane).toBe("go");

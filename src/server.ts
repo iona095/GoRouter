@@ -33,6 +33,7 @@ import {
   utcNow,
   log,
   redact,
+  safeJsonStringify,
 } from "./util.ts";
 import type { StateStore, Lane } from "./state.ts";
 import type { Journal, TerminalOutcome } from "./journal.ts";
@@ -63,6 +64,22 @@ interface DispatchResult {
   outcome: TerminalOutcome;
   upstreamRequestIds: string[];
   statusText?: string;
+}
+
+/**
+ * CURRENT-008 — pre-header (TTFB) deadline for upstream dispatch.
+ *
+ * Bounds the wait for upstream response HEADERS so a hung upstream fails
+ * fast instead of holding a dispatch forever. The deadline is cleared the
+ * moment headers arrive: body streaming afterwards is unbounded, so
+ * legitimate long-gap streams (SSE heartbeats, slow models) are unaffected.
+ * Client aborts still win over the deadline (truthful outcome).
+ */
+export let upstreamHeaderTimeoutMs = 60_000;
+
+/** Test seam for the pre-header deadline (restores must follow in finally). */
+export function setUpstreamHeaderTimeoutMsForTests(ms: number): void {
+  upstreamHeaderTimeoutMs = ms;
 }
 
 function localError(status: number, type: string, message: string): Response {
@@ -250,7 +267,8 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
 
   function serveModelsCache(lane: Lane, reg: import("./models/types.ts").RegistryFile, fromCache: "hit" | "stale"): Response {
     const snap = lane === "go" ? reg.go! : reg.zen!;
-    const body = JSON.stringify({ object: "list", data: snap.models });
+    // CURRENT-004: cycle-safe (byte-identical for plain registry data).
+    const body = safeJsonStringify({ object: "list", data: snap.models });
     const age = Date.now() - Date.parse(reg.updatedAtUtc);
     return new Response(body, {
       status: 200,
@@ -637,6 +655,18 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
       else reqSignal.addEventListener("abort", syncAbortCompleter, { once: true });
     }
 
+    // CURRENT-008: race the header phase against the pre-header deadline.
+    // The timer is cleared as soon as headers arrive; streaming after that
+    // is unbounded (long-gap streams preserved).
+    const clientSignal = (req as Request & { signal?: AbortSignal }).signal;
+    const headerCtrl = new AbortController();
+    let headerTimedOut = false;
+    const headerTimer = setTimeout(() => {
+      headerTimedOut = true;
+      headerCtrl.abort();
+    }, upstreamHeaderTimeoutMs);
+    const forwardAbort = (): void => headerCtrl.abort();
+    if (clientSignal) clientSignal.addEventListener("abort", forwardAbort, { once: true });
     let upstreamRes: Response;
     try {
       upstreamRes = await fetch(upstreamUrl, {
@@ -644,7 +674,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         headers: forwardHeaders,
         body: req.body,
         redirect: "manual",
-        signal: (req as Request & { signal?: AbortSignal }).signal,
+        signal: clientSignal ? AbortSignal.any([clientSignal, headerCtrl.signal]) : headerCtrl.signal,
       });
     } catch (e) {
       const reqSignal = (req as Request & { signal?: AbortSignal }).signal;
@@ -658,11 +688,21 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
         res.headers.set("x-gorouter-request-id", entry.routerRequestId);
         return res;
       }
+      if (headerTimedOut) {
+        log.warn(`upstream headers timed out lane=${lane} id=${entry.routerRequestId} after ${upstreamHeaderTimeoutMs}ms`);
+        completeEntry("upstream_error", 504, [], monotonicMs() - started);
+        const res = localError(504, "GoRouterUpstreamError", "upstream OpenCode headers timed out");
+        res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+        return res;
+      }
       log.warn(`upstream fetch failed lane=${lane} id=${entry.routerRequestId}: ${e instanceof Error ? e.message : e}`);
       completeEntry("upstream_error", 502, [], monotonicMs() - started);
       const res = localError(502, "GoRouterUpstreamError", "upstream OpenCode request failed");
       res.headers.set("x-gorouter-request-id", entry.routerRequestId);
       return res;
+    } finally {
+      clearTimeout(headerTimer);
+      clientSignal?.removeEventListener("abort", forwardAbort);
     }
 
     // --- build proxied response ------------------------------------------------
@@ -709,24 +749,11 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
   const handler = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     const path = url.pathname;
+    // CURRENT-007: minimal unauthenticated surface — exactly the supervisor
+    // probe signature (status + version). Routes, aliases, journal, and
+    // state detail stay behind authenticated channels (control pipe, CLI).
     if (path === "/healthz") {
-      const st = deps.state.read();
-      const journal = deps.journal.stats();
-      const routes: Record<string, { accountId: string | null; alias: string | null }> = {};
-      for (const lane of ["go", "zen"] as const) {
-        const id = st.routes[lane].accountId;
-        const alias = id ? st.accounts.find((a) => a.id === id)?.alias ?? null : null;
-        routes[lane] = { accountId: id, alias };
-      }
-      return Response.json({
-        status: "ok",
-        version: SERVER_VERSION,
-        loopbackOnly: st.settings.host === "127.0.0.1" || st.settings.host === "::1" || st.settings.host === "localhost",
-        routes,
-        automaticFallback: "disabled",
-        state: deps.state.health(),
-        journal,
-      });
+      return Response.json({ status: "ok", version: SERVER_VERSION });
     }
 
     let lane: Lane | null = null;

@@ -10,6 +10,7 @@ import { join, resolve } from "node:path";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { randomUUID, createHash } from "node:crypto";
 import { redact } from "../util.ts";
+import { withFileLockAsyncAt } from "../lock.ts";
 import { isLoopbackHostname, DSH_NAMESPACE, DSH_GO_PATH, DSH_ZEN_PATH } from "./dsh-types.ts";
 import type { ModelEntry } from "./types.ts";
 
@@ -77,7 +78,8 @@ function resolveDshHome(configured?: string | null): string {
       try {
         const u = new URL(t);
         const host = u.hostname.toLowerCase();
-        if (host !== "" && host !== "localhost" && host !== "127.0.0.1") {
+        // CURRENT-011: canonical loopback only (no startsWith trust, no remote host).
+        if (host !== "" && !isLoopbackHostname(host)) {
           throw new Error("DSH_HOME file:// must be local (no remote host)");
         }
       } catch (e) {
@@ -121,11 +123,12 @@ function dshSettingsPath(settingsPath?: string | null, dshHome?: string | null):
       throw new Error("dsh settingsPath must be a local file path, not a remote URL");
     }
     if (p.startsWith("file://")) {
-      // Validate file:// is local-only: hostname must be empty or localhost
+      // Validate file:// is local-only: hostname must be empty or loopback.
       try {
         const u = new URL(p);
         const host = u.hostname.toLowerCase();
-        if (host !== "" && host !== "localhost" && host !== "127.0.0.1") {
+        // CURRENT-011: canonical loopback only (no startsWith trust).
+        if (host !== "" && !isLoopbackHostname(host)) {
           throw new Error("dsh settingsPath file:// must be local (no remote host): " + p);
         }
       } catch (e) {
@@ -226,57 +229,29 @@ async function renderSettingsYaml(
 }
 
 /**
- * FILE_SHARED_LOCK_MECHANISM: DSH-native <file>.lock sibling via wx exclusive create.
+ * FILE_SHARED_LOCK_MECHANISM: DSH-native <file>.lock sibling via the shared
+ * ownership-safe async core (../lock.ts withFileLockAsyncAt — CURRENT-006).
  * Same convention as @deepseek-ai/dsh-atomic-write/withFileLock and
- * @deepseek-ai/dsh-settings-file/FileSettingsProvider.persistSection.
- * Lock path = filename + ".lock", created wx (mode 0o600), pid body, contention
- * retried 20ms→200ms exponential until 2s deadline, removed on both outcomes.
- * This serializes cross-process read-modify-write cycles; readers stay lock-free
- * via atomic rename commit. FileDshClient.mutate holds this lock across the
- * entire read→validate→render→writeFileAtomic critical section, so FINAL_CHECK_TO_RENAME
- * cannot be bypassed by a concurrent DSH writer.
+ * @deepseek-ai/dsh-settings-file/FileSettingsProvider.persistSection:
+ * lock path = filename + ".lock", wx exclusive create (mode 0o600),
+ * 2s acquire deadline, nonce ownership claims, dead-holder/absolute-ceiling
+ * reclaim, ownership-checked release. A crashed holder's orphan is reclaimed
+ * by the next acquirer instead of wedging writers forever; a live holder is
+ * never displaced. This serializes cross-process read-modify-write cycles;
+ * readers stay lock-free via atomic rename commit. FileDshClient.mutate holds
+ * this lock across the entire read→validate→render→writeFileAtomic critical
+ * section, so FINAL_CHECK_TO_RENAME cannot be bypassed by a concurrent DSH
+ * writer.
  */
-const LOCK_RETRY_INITIAL_MS = 20;
-const LOCK_RETRY_MAX_MS = 200;
 const DEFAULT_LOCK_WAIT_MS = 2000;
-
-async function isLockContention(error: unknown, lockPath: string): Promise<boolean> {
-  const code = (error as Record<string, unknown> | null)?.code as string | undefined;
-  if (code === "EEXIST") return true;
-  if (code !== "EPERM") return false;
-  try {
-    const { lstat } = await import("node:fs/promises");
-    await lstat(lockPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 async function withFileLock<T>(filename: string, operation: () => Promise<T>, waitMs: number = DEFAULT_LOCK_WAIT_MS): Promise<T> {
   const lockPath = `${filename}.lock`;
-  const deadline = Date.now() + waitMs;
-  let delay = LOCK_RETRY_INITIAL_MS;
-  for (;;) {
-    try {
-      const { writeFile } = await import("node:fs/promises");
-      await writeFile(lockPath, `${process.pid}\n`, { mode: 0o600, flag: "wx" });
-      break;
-    } catch (error) {
-      if (!await isLockContention(error, lockPath)) throw error;
-    }
-    if (Date.now() >= deadline) throw new Error(`atomic-write: timed out waiting for the writer lock at ${lockPath}`);
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    delay = Math.min(delay * 2, LOCK_RETRY_MAX_MS);
-  }
-  try {
-    return await operation();
-  } finally {
-    try {
-      const { rm } = await import("node:fs/promises");
-      await rm(lockPath, { force: true });
-    } catch {}
-  }
+  return withFileLockAsyncAt(lockPath, {
+    timeoutMs: waitMs,
+    mode: 0o600,
+    timeoutMessage: `atomic-write: timed out waiting for the writer lock at ${lockPath}`,
+  }, operation);
 }
 
 async function writeFileAtomic(filename: string, content: string, mode: number = 0o600): Promise<void> {

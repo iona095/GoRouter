@@ -148,6 +148,8 @@ describe("journal persistence and retention", () => {
       const st = j.stats();
       expect(st.records).toBe(8); // 5 old pruned by age
       j.close();
+      // BL-001: finalize before close — no GC-dependent handle linger.
+      try { ins.finalize(); } catch { /* already finalized */ }
       db.close();
 
       const j2 = createJournal(dbPath, 7, 3);
@@ -174,9 +176,11 @@ describe("journal persistence and retention", () => {
     router.journal.close();
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
     expect(res.status).toBe(200); // routing must not be blocked
-    const health = (await (await fetch(`${router.baseUrl}/healthz`)).json()) as { journal: { degraded: boolean; lastError: string | null } };
-    expect(health.journal.degraded).toBe(true);
-    expect(health.journal.lastError).toBeTruthy();
+    // CURRENT-007: degraded evidence moved off the unauthenticated surface;
+    // the same journal handle reports it (control pipe journal.stats agrees).
+    const stats = router.journal.stats();
+    expect(stats.degraded).toBe(true);
+    expect(stats.lastError).toBeTruthy();
     upstream.stop();
   });
 });

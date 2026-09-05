@@ -27,6 +27,7 @@ import {
   makeAccount,
   validateAlias,
   validateUpstreamUrl,
+  isValidPort,
   LANES,
   type StateFile,
   type Lane,
@@ -473,7 +474,9 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         if (key === "port" || key === "journalRetentionDays" || key === "journalMaxRecords") {
           parsed = Number(value);
           if (!Number.isFinite(parsed) || (parsed as number) <= 0) throw new Error(`invalid numeric value '${value}'`);
-          if (key === "port" && (parsed as number) > 65535) throw new Error("port out of range");
+          // CURRENT-012: fractional ports are silently truncated by listen —
+          // reject them at the authoritative mutation boundary instead.
+          if (key === "port" && !isValidPort(parsed)) throw new Error(`invalid port '${value}': must be an integer 1..65535`);
         }
         if (key === "upstreamGo" || key === "upstreamZen") {
           const v = validateUpstreamUrl(value);

@@ -96,8 +96,9 @@ http_status, upstream_request_ids (allowlist: `x-request-id`,
 
 Retention: `journalRetentionDays` (default 30) and `journalMaxRecords`
 (default 100k), pruned on startup and every 64 inserts. Journal storage
-faults set `degraded` (visible in `/healthz` and `journal stats`) and never
-block routing.
+faults set `degraded` (visible in `journal stats` and the control-pipe
+`journal.stats`; unauthenticated `/healthz` carries status/version only) and
+never block routing.
 
 ## Live upstream evidence (current, captured 2026-08-08)
 

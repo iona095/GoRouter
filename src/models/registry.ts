@@ -81,7 +81,9 @@ export function loadRegistry(paths: Paths): RegistryFile | null {
 // Slice B.2: mtime/size memo, same pattern as state.ts — /models is the only
 // uncached file read on a request path. Keyed by path (tests use many state
 // dirs); absent files are never cached so creation is observed immediately.
-let peekCache: { path: string; mtimeMs: number; size: number; result: { exists: boolean; corrupt: boolean; file: RegistryFile | null } } | null = null;
+// CURRENT-010: identity includes ino (atomic registry replaces mint a new
+// file identity — same-size/same-tick replacements never false-hit).
+let peekCache: { path: string; mtimeMs: number; size: number; ino: number; result: { exists: boolean; corrupt: boolean; file: RegistryFile | null } } | null = null;
 
 export function peekRegistry(paths: Paths): { exists: boolean; corrupt: boolean; file: RegistryFile | null } {
   const p = registryPathFor(paths);
@@ -89,19 +91,19 @@ export function peekRegistry(paths: Paths): { exists: boolean; corrupt: boolean;
     if (peekCache?.path === p) peekCache = null;
     return { exists: false, corrupt: false, file: null };
   }
-  let sig: { mtimeMs: number; size: number };
+  let sig: { mtimeMs: number; size: number; ino: number };
   try {
     const st = statSync(p);
-    sig = { mtimeMs: st.mtimeMs, size: st.size };
+    sig = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino };
   } catch {
     if (peekCache?.path === p) peekCache = null;
     return { exists: false, corrupt: false, file: null };
   }
-  if (peekCache && peekCache.path === p && peekCache.mtimeMs === sig.mtimeMs && peekCache.size === sig.size) {
+  if (peekCache && peekCache.path === p && peekCache.mtimeMs === sig.mtimeMs && peekCache.size === sig.size && peekCache.ino === sig.ino) {
     return peekCache.result;
   }
   const result = peekRegistryUncached(p);
-  peekCache = { path: p, mtimeMs: sig.mtimeMs, size: sig.size, result };
+  peekCache = { path: p, mtimeMs: sig.mtimeMs, size: sig.size, ino: sig.ino, result };
   return result;
 }
 

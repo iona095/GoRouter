@@ -103,7 +103,8 @@ export function isLocalOnlyDshEndpoint(value: string): boolean {
       if (u.protocol !== "file:") return false;
       const host = u.hostname.toLowerCase();
       if (host === "") return true;
-      if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" || host.startsWith("127.")) return true;
+      // CURRENT-011: canonical loopback only (no startsWith trust).
+      if (isLoopbackHostname(host)) return true;
       return false;
     } catch {
       return false;
@@ -119,7 +120,8 @@ export function isLocalOnlyDshEndpoint(value: string): boolean {
       if (u.protocol === "file:") {
         const h = u.hostname.toLowerCase();
         if (h === "") return true;
-        if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]" || h.startsWith("127.")) return true;
+        // CURRENT-011: canonical loopback only (no startsWith trust).
+        if (isLoopbackHostname(h)) return true;
         return false;
       }
       return false;
@@ -138,7 +140,8 @@ export function isLocalOnlyDshEndpoint(value: string): boolean {
       if (u.protocol === "file:") {
         const h = u.hostname.toLowerCase();
         if (h === "") return true;
-        if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]" || h.startsWith("127.")) return true;
+        // CURRENT-011: canonical loopback only (no startsWith trust).
+        if (isLoopbackHostname(h)) return true;
         return false;
       }
       return false;
@@ -154,8 +157,21 @@ export function isLocalOnlyDshEndpoint(value: string): boolean {
   return true;
 }
 
-/** Check if a hostname is loopback (for DSH_WEB_URL validation). */
+/**
+ * CURRENT-011 — canonical loopback classification (for DSH_WEB_URL validation).
+ *
+ * Accepts exactly: `localhost`, `127.0.0.1`, the full 127.0.0.0/8 IPv4 range
+ * as dotted quads, and `::1`. URL parsing already normalizes exotic IPv4
+ * spellings (127.1, 0x7f.1, integer forms) to canonical quads before this
+ * runs, so a strict quad check is complete. DNS names that merely begin
+ * with `127.` (127.evil.example, 127.0.0.1.evil.example) are REJECTED —
+ * `startsWith("127.")` must never be used as host trust.
+ */
 export function isLoopbackHostname(hostname: string): boolean {
-  const h = hostname.toLowerCase();
-  return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]" || h.startsWith("127.");
+  const h = hostname.trim().toLowerCase();
+  if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]") return true;
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  if (m[1] !== "127") return false;
+  return Number(m[2]) <= 255 && Number(m[3]) <= 255 && Number(m[4]) <= 255;
 }

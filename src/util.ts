@@ -52,6 +52,50 @@ export function redact(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// CURRENT-004 — bounded, cycle-safe serialization for the (few) paths that
+// stringify non-trivial objects (dispatch responses, journal string fields).
+// Normal paths preserve object identity: inputs are never mutated or
+// replaced, and acyclic values serialize byte-identically to JSON.stringify
+// (no behavior change where adopted). Cyclic/over-deep inputs emit bounded
+// markers instead of throwing (a throw inside a response/journal path would
+// surface as a 500 or an unhandled rejection).
+// ---------------------------------------------------------------------------
+
+/** Max nesting depth before safeJsonStringify truncates with a marker. */
+export const SAFE_JSON_MAX_DEPTH = 50;
+
+function decycle(value: unknown, depth: number, ancestors: Set<object>): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (ancestors.has(value)) return "[Circular]";
+  if (depth >= SAFE_JSON_MAX_DEPTH) return "[MaxDepth]";
+  ancestors.add(value);
+  try {
+    // Preserve JSON.stringify semantics for toJSON carriers (Date and kin):
+    // serialize the toJSON() projection, still cycle/depth-guarded. A
+    // throwing toJSON becomes a marker (this helper never throws).
+    const maybeToJson = (value as { toJSON?: unknown }).toJSON;
+    if (typeof maybeToJson === "function") {
+      try {
+        return decycle((maybeToJson as () => unknown).call(value), depth + 1, ancestors);
+      } catch {
+        return "[Unserializable]";
+      }
+    }
+    if (Array.isArray(value)) return value.map((v) => decycle(v, depth + 1, ancestors));
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = decycle(v, depth + 1, ancestors);
+    return out;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+/** JSON.stringify that never throws on cycles/depth (bounded markers). */
+export function safeJsonStringify(value: unknown): string {
+  return JSON.stringify(decycle(value, 0, new Set()));
+}
+
+// ---------------------------------------------------------------------------
 // Atomic file writes (temp + fsync + rename) so concurrent readers never see
 // a half-written state file.
 // ---------------------------------------------------------------------------

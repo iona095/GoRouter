@@ -122,6 +122,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   let stateBaseline = false
   let lastStateMtime = 0
   let lastStateSize = -1
+  let lastStateIno = -1
   let journalBaseline = false
   const lastJournalSig = new Map<string, string>()
 
@@ -169,10 +170,11 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   }
   let roHandle: RoHandle | null = null
 
+  // CURRENT-010: sibling sigs include ino (same-keyed cache family).
   function dbSig(): string | null {
     try {
       const st = statSync(paths.journalDb)
-      return `${st.mtimeMs}:${st.size}`
+      return `${st.mtimeMs}:${st.size}:${st.ino}`
     } catch {
       return null
     }
@@ -185,7 +187,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     const sigPart = (p: string): string => {
       try {
         const st = statSync(p)
-        return `${st.mtimeMs}:${st.size}`
+        return `${st.mtimeMs}:${st.size}:${st.ino}`
       } catch {
         return '-'
       }
@@ -195,14 +197,24 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     return `${main}|${sigPart(paths.journalDb + '-wal')}|${sigPart(paths.journalDb + '-shm')}`
   }
 
+  // BL-001: finalize statements BEFORE db.close (same GC-finalization
+  // dependence as the writer journal — the readonly handle lingered too).
   function closeRoHandle(): void {
     if (roHandle) {
+      const h = roHandle
+      roHandle = null
+      for (const s of [h.metaStmt, h.countStmt, h.oldestStmt, h.newestStmt, h.recentStmt]) {
+        try {
+          s.finalize()
+        } catch {
+          /* already finalized */
+        }
+      }
       try {
-        roHandle.db.close()
+        h.db.close()
       } catch {
         /* already closed */
       }
-      roHandle = null
     }
   }
 
@@ -425,10 +437,12 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   // mtime poll (CLI coherence)
   // ------------------------------------------------------------------
 
-  function statSafe(p: string): { mtimeMs: number; size: number } | null {
+  // CURRENT-010: identity includes ino (atomic replaces mint a new file
+  // identity — same-size/same-tick replacements are still detected).
+  function statSafe(p: string): { mtimeMs: number; size: number; ino: number } | null {
     try {
       const st = statSync(p)
-      return { mtimeMs: st.mtimeMs, size: st.size }
+      return { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino }
     } catch {
       return null
     }
@@ -441,9 +455,11 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
         stateBaseline = true
         lastStateMtime = sj.mtimeMs
         lastStateSize = sj.size
-      } else if (sj.mtimeMs !== lastStateMtime || sj.size !== lastStateSize) {
+        lastStateIno = sj.ino
+      } else if (sj.mtimeMs !== lastStateMtime || sj.size !== lastStateSize || sj.ino !== lastStateIno) {
         lastStateMtime = sj.mtimeMs
         lastStateSize = sj.size
+        lastStateIno = sj.ino
         noteChange()
       }
     }
@@ -453,7 +469,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     for (const p of [paths.journalDb, `${paths.journalDb}-wal`, `${paths.journalDb}-shm`]) {
       const jd = statSafe(p)
       if (!jd) continue
-      const key = `${jd.mtimeMs}:${jd.size}`
+      const key = `${jd.mtimeMs}:${jd.size}:${jd.ino}`
       const prev = lastJournalSig.get(p)
       if (prev === undefined) {
         if (!journalBaseline) lastJournalSig.set(p, key)

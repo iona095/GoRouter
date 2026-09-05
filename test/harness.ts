@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SecretStore } from "../src/secret-store.ts";
+import { newRef, type SecretStore } from "../src/secret-store.ts";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore, makeAccount, type StateStore, type Lane } from "../src/state.ts";
 import { createJournal, type Journal } from "../src/journal.ts";
@@ -117,10 +117,13 @@ export async function startTestRouter(opts: {
   const paths = resolvePaths(stateDir);
   ensureStateDirs(paths);
   const secrets = memSecrets();
-  secrets.put("sec_local", opts.localKey ?? LOCAL_KEY);
+  // CURRENT-001: the harness mints canonical refs exactly like production
+  // (newRef), so state-load containment filtering exercises the real path.
+  const localRef = newRef();
+  secrets.put(localRef, opts.localKey ?? LOCAL_KEY);
   const state = createStateStore(paths, secrets);
   state.mutate((s) => {
-    s.localCredentialRef = "sec_local";
+    s.localCredentialRef = localRef;
     s.settings.port = 0;
     s.settings.upstreamGo = opts.upstreamGo ?? opts.upstreamBase;
     s.settings.upstreamZen = opts.upstreamZen ?? opts.upstreamBase;
@@ -129,7 +132,7 @@ export async function startTestRouter(opts: {
   });
   for (const a of opts.accounts ?? []) {
     state.mutate((s) => {
-      const ref = `sec_${a.alias}`;
+      const ref = newRef();
       secrets.put(ref, a.key);
       s.accounts.push(makeAccount(a.alias, ref));
     });
@@ -182,9 +185,12 @@ export function authHeaders(extra?: Record<string, string>): Headers {
 export function readJournalRows(dbPath: string): Array<Record<string, unknown>> {
   const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
   const db = new Database(dbPath, { readonly: true });
+  // BL-001: finalize before close — no GC-dependent handle linger.
+  const stmt = db.query("SELECT * FROM request_journal ORDER BY id");
   try {
-    return db.query("SELECT * FROM request_journal ORDER BY id").all() as Array<Record<string, unknown>>;
+    return stmt.all() as Array<Record<string, unknown>>;
   } finally {
+    try { stmt.finalize(); } catch { /* already finalized */ }
     db.close();
   }
 }

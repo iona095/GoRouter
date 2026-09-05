@@ -44,7 +44,9 @@ describe("secret-at-rest protections", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "sk-super-secret-value-12345" }], routes: { go: "a1" } });
     const raw = readFileSync(router.paths.stateJson, "utf8");
     expect(raw).not.toContain("sk-super-secret-value-12345");
-    expect(raw).toContain("sec_a1");
+    // CURRENT-001: persisted refs are canonical (sec_<32 hex>), never key material.
+    expect(raw).toMatch(/sec_[0-9a-f]{32}/);
+    expect(raw).not.toContain("sec_a1");
     expect(raw).toContain("secretRef");
     upstream.stop();
   });
@@ -52,14 +54,15 @@ describe("secret-at-rest protections", () => {
   test("DPAPI blob file does not contain the plaintext key", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gorouter-dpapi-"));
     try {
-      const { createSecretStore } = await import("../src/secret-store.ts");
+      const { createSecretStore, newRef } = await import("../src/secret-store.ts");
       const store = createSecretStore(join(dir, "secrets"));
-      store.put("sec_x", "sk-plaintext-key-value-999");
-      const blob = readFileSync(join(dir, "secrets", "sec_x.bin"), "utf8");
+      const ref = newRef();
+      store.put(ref, "sk-plaintext-key-value-999");
+      const blob = readFileSync(join(dir, "secrets", `${ref}.bin`), "utf8");
       expect(blob).not.toContain("sk-plaintext-key-value-999");
-      expect(store.get("sec_x")).toBe("sk-plaintext-key-value-999");
-      store.delete("sec_x");
-      expect(store.exists("sec_x")).toBe(false);
+      expect(store.get(ref)).toBe("sk-plaintext-key-value-999");
+      store.delete(ref);
+      expect(store.exists(ref)).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -226,8 +229,11 @@ describe("loopback and upstream safety", () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     expect(router.state.read().settings.host).toBe("127.0.0.1");
-    const health = (await (await fetch(`${router.baseUrl}/healthz`)).json()) as { loopbackOnly: boolean };
-    expect(health.loopbackOnly).toBe(true);
+    // CURRENT-007: loopbackOnly left the unauthenticated surface; the bound
+    // host in state remains the authority (healthz keeps status/version only).
+    const health = (await (await fetch(`${router.baseUrl}/healthz`)).json()) as Record<string, unknown>;
+    expect(health.status).toBe("ok");
+    expect("loopbackOnly" in health).toBe(false);
     upstream.stop();
   });
 

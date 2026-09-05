@@ -88,16 +88,19 @@ describe("local path routing", () => {
     upstream.stop();
   });
 
-  test("healthz exposes routes and journal without secrets", async () => {
+  // CURRENT-007: unauthenticated /healthz is exactly the supervisor probe
+  // signature — routes/aliases/journal never leave the box unauthenticated.
+  test("healthz exposes only status and version (minimal surface)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "sk-health-secret-1" }], routes: { go: "a1", zen: "a1" } });
     const res = await fetch(`${router.baseUrl}/healthz`);
     expect(res.status).toBe(200);
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.status).toBe("ok");
+    expect(typeof body.version).toBe("string");
+    expect(Object.keys(body).sort()).toEqual(["status", "version"]);
     expect(JSON.stringify(body)).not.toContain("sk-health-secret-1");
-    expect(JSON.stringify(body)).toContain("a1");
-    expect(JSON.stringify(body)).toContain("automaticFallback");
+    expect(JSON.stringify(body)).not.toContain("a1");
     upstream.stop();
   });
 });
@@ -128,7 +131,8 @@ describe("route resolution failures fail closed", () => {
   test("missing secret -> 500, no upstream", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    router.secrets.delete("sec_a1");
+    // CURRENT-001: refs are canonical newRef values; resolve the live one from state.
+    router.secrets.delete(router.state.read().accounts[0]!.secretRef);
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
     expect(res.status).toBe(500);
     expect(upstream.requests.length).toBe(0);
@@ -545,17 +549,18 @@ describe("bodyless responses and journal terminalization", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     // dangling: remove the account behind the route
     const originalId = router.state.read().accounts[0]!.id;
+    // CURRENT-001: canonical ref captured before the dangling wipe.
+    const originalRef = router.state.read().accounts[0]!.secretRef;
     router.state.mutate((s) => { s.accounts = []; });
     const dangling = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
     expect(dangling.status).toBe(503);
     expect(dangling.headers.get("x-gorouter-request-id")).toBeTruthy();
     // restore the account under its original id, then delete its secret -> missing-secret 500
     router.state.mutate((s) => {
-      const ref = "sec_a1";
-      router.secrets.put(ref, "k");
-      s.accounts = [{ id: originalId, alias: "a1", secretRef: ref, createdAtUtc: new Date().toISOString(), updatedAtUtc: new Date().toISOString() }];
+      router.secrets.put(originalRef, "k");
+      s.accounts = [{ id: originalId, alias: "a1", secretRef: originalRef, createdAtUtc: new Date().toISOString(), updatedAtUtc: new Date().toISOString() }];
     });
-    router.secrets.delete("sec_a1");
+    router.secrets.delete(originalRef);
     const missing = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
     expect(missing.status).toBe(500);
     expect(missing.headers.get("x-gorouter-request-id")).toBeTruthy();
@@ -792,6 +797,60 @@ describe("opencode session header", () => {
     const v = upstream.requests[0]!.headers.get("x-opencode-session");
     expect(v).toBeTruthy();
     expect(v).not.toContain(LOCAL_KEY);
+    upstream.stop();
+  });
+});
+
+describe("CURRENT-008 pre-header (TTFB) deadline", () => {
+  test("hung upstream fails fast with 504 and journals upstream_error", async () => {
+    const { setUpstreamHeaderTimeoutMsForTests } = await import("../src/server.ts");
+    const upstream = await startMockUpstream(() => new Promise<Response>(() => {})); // never responds
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
+    setUpstreamHeaderTimeoutMsForTests(300);
+    try {
+      const t0 = Date.now();
+      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+      expect(Date.now() - t0).toBeLessThan(30_000); // fails fast, never hangs
+      expect(res.status).toBe(504);
+      expect(res.headers.get("x-gorouter-request-id")).toBeTruthy();
+      await res.text();
+      const rows = readJournalRows(router.paths.journalDb);
+      expect(rows.length).toBe(1);
+      expect(rows[0]!.terminal_outcome).toBe("upstream_error");
+      expect(rows[0]!.http_status).toBe(504);
+    } finally {
+      setUpstreamHeaderTimeoutMsForTests(60_000);
+    }
+    upstream.stop();
+  });
+
+  test("slow body chunks after fast headers stream fully (deadline cleared at headers)", async () => {
+    const { setUpstreamHeaderTimeoutMsForTests } = await import("../src/server.ts");
+    // Headers + first chunk flush immediately; later chunks gap 400ms each
+    // (past the 300ms header deadline) — streaming must be unaffected.
+    const upstream = await startMockUpstream(() => {
+      const enc = new TextEncoder();
+      let i = 0;
+      const rest = ["b", "c"];
+      const stream = new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(enc.encode("a")); },
+        async pull(c) {
+          if (i >= rest.length) { try { c.close(); } catch { /* canceled */ } return; }
+          await new Promise((r) => setTimeout(r, 400));
+          try { c.enqueue(enc.encode(rest[i]!)); i++; } catch { /* canceled */ }
+        },
+      });
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+    });
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
+    setUpstreamHeaderTimeoutMsForTests(300);
+    try {
+      const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { headers: authHeaders() });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("abc"); // 800ms of gaps sailed through
+    } finally {
+      setUpstreamHeaderTimeoutMsForTests(60_000);
+    }
     upstream.stop();
   });
 });

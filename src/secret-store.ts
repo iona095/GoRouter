@@ -13,7 +13,7 @@
  */
 import { spawnSync } from "node:child_process";
 import { readFileSync, existsSync, statSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, relative, sep, isAbsolute } from "node:path";
 import { randomBytes } from "node:crypto";
 import { atomicWriteBytes, tryUnlink, log } from "./util.ts";
 
@@ -135,20 +135,49 @@ export function newRef(): string {
   return `sec_${randomBytes(16).toString("hex")}`;
 }
 
+/**
+ * CURRENT-001 — canonical secret-ref allowlist (single validator).
+ *
+ * The only refs the product ever mints are `newRef()` values
+ * (`sec_` + 32 lowercase hex chars) plus the one fixed admin-token ref
+ * `sec_desktop_admin`. Anything else is malformed and must never reach the
+ * filesystem. To mint a new fixed ref in the future, extend this validator
+ * explicitly — unknown shapes fail closed.
+ */
+const SECRET_REF_RE = /^sec_(?:[0-9a-f]{32}|desktop_admin)$/;
+export function isValidSecretRef(ref: unknown): ref is string {
+  return typeof ref === "string" && SECRET_REF_RE.test(ref);
+}
+
 export function createSecretStore(secretsDir: string): SecretStore {
   try {
     mkdirSync(secretsDir, { recursive: true });
   } catch { /* caller may re-create; put() will fail loudly otherwise */ }
-  const cache = new Map<string, { mtimeMs: number; size: number; value: string }>();
+  // CURRENT-010: identity includes ino — atomic blob replaces mint a new
+  // file identity, so same-size/same-tick replacements never false-hit.
+  const cache = new Map<string, { mtimeMs: number; size: number; ino: number; value: string }>();
 
   function blobPath(ref: string): string {
-    return join(secretsDir, `${ref}.bin`);
+    // CURRENT-001 layer 1: malformed refs never become paths.
+    if (!isValidSecretRef(ref)) {
+      throw new Error("invalid secret ref (must be sec_<32 lowercase hex> or sec_desktop_admin)");
+    }
+    const base = resolve(secretsDir);
+    const p = resolve(base, `${ref}.bin`);
+    // CURRENT-001 layer 3: provable containment. With the allowlist above,
+    // rel is always `<ref>.bin`, but verify anyway so a future validator
+    // relaxation cannot silently escape the secrets directory.
+    const rel = relative(base, p);
+    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new Error("secret ref escapes secrets directory");
+    }
+    return p;
   }
 
-  function statOf(ref: string): { mtimeMs: number; size: number } | null {
+  function statOf(ref: string): { mtimeMs: number; size: number; ino: number } | null {
     try {
       const st = statSync(blobPath(ref));
-      return { mtimeMs: st.mtimeMs, size: st.size };
+      return { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino };
     } catch {
       return null;
     }
@@ -156,27 +185,33 @@ export function createSecretStore(secretsDir: string): SecretStore {
 
   return {
     put(ref, plaintext) {
+      // Validate the path BEFORE any crypto/disk I/O so a hostile ref
+      // cannot trigger side effects before it is rejected.
+      const target = blobPath(ref);
       const blob = dpapiProtect(plaintext);
-      atomicWriteBytes(blobPath(ref), Buffer.from(blob, "utf8"));
+      atomicWriteBytes(target, Buffer.from(blob, "utf8"));
       const st = statOf(ref);
-      cache.set(ref, { mtimeMs: st?.mtimeMs ?? 0, size: st?.size ?? 0, value: plaintext });
+      cache.set(ref, { mtimeMs: st?.mtimeMs ?? 0, size: st?.size ?? 0, ino: st?.ino ?? 0, value: plaintext });
     },
     get(ref) {
+      if (!isValidSecretRef(ref)) throw new Error("invalid secret ref");
       const st = statOf(ref);
       if (!st) throw new Error(`secret missing: ${ref}`);
       const cached = cache.get(ref);
-      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.value;
+      if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size && cached.ino === st.ino) return cached.value;
       if (!existsSync(blobPath(ref))) throw new Error(`secret missing: ${ref}`);
       const blob = readFileSync(blobPath(ref), "utf8").trim();
       const value = dpapiUnprotect(blob);
-      cache.set(ref, { mtimeMs: st.mtimeMs, size: st.size, value });
+      cache.set(ref, { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, value });
       return value;
     },
     delete(ref) {
+      if (!isValidSecretRef(ref)) throw new Error("invalid secret ref");
       cache.delete(ref);
       tryUnlink(blobPath(ref));
     },
     exists(ref) {
+      if (!isValidSecretRef(ref)) throw new Error("invalid secret ref");
       return statOf(ref) !== null;
     },
   };

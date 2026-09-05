@@ -10,8 +10,9 @@
  * publication.
  */
 
-import type { RegistryFile, ModelEntry } from "./types.ts";
+import type { RegistryFile, ModelEntry, LaneSnapshot } from "./types.ts";
 import { MAX_REVISION_RETRIES, emptyDshSyncStatus } from "./dsh-types.ts";
+import { tupleKey } from "./dsh-approvals.ts";
 import type { DshSyncStatus } from "./dsh-types.ts";
 import type { DshClient, DshSnapshot } from "./dsh-client.ts";
 import { isConflictError } from "./dsh-client.ts";
@@ -33,11 +34,40 @@ export interface DshSyncOptions {
   approvalStore?: ApprovalStoreLoad;
 }
 
-// Single-flight for concurrent syncs
-let inFlight: Promise<DshSyncStatus> | null = null;
+// CURRENT-002 — single-flight keyed by the semantic inputs (registry
+// identity/revision, expectedPort, client/binding identity, approval-store
+// view). Same-key concurrent callers coalesce; different-key callers fly
+// separately, so caller B can never receive caller A's committed result.
+const inFlight = new Map<string, Promise<DshSyncStatus>>();
+
+let nextClientId = 1;
+const clientIds = new WeakMap<object, number>();
+function clientIdFor(client: DshClient): number {
+  let id = clientIds.get(client);
+  if (id === undefined) {
+    id = nextClientId++;
+    clientIds.set(client, id);
+  }
+  return id;
+}
+
+function registryKey(registry: RegistryFile): string {
+  const ids = (snap: LaneSnapshot | null): string =>
+    (snap?.models ?? []).map((m) => m.id).sort().join(",");
+  return `${registry.updatedAtUtc}|go:${ids(registry.go)}|zen:${ids(registry.zen)}`;
+}
+
+function approvalStoreKey(store: ApprovalStoreLoad | undefined): string {
+  if (!store || store.state !== "initialized") return store?.state ?? "none";
+  return `initialized:${store.store.approvals.map((a) => tupleKey(a)).sort().join(",")}`;
+}
+
+function flightKey(registry: RegistryFile, client: DshClient, opts: DshSyncOptions): string {
+  return [registryKey(registry), `port:${opts.expectedPort ?? 8787}`, `client:${clientIdFor(client)}`, approvalStoreKey(opts.approvalStore)].join("\n");
+}
 
 export function clearDshSyncSingleFlightForTests(): void {
-  inFlight = null;
+  inFlight.clear();
 }
 
 function nowIso(): string {
@@ -79,11 +109,15 @@ export async function reconcileDshCatalog(
   persist?: (status: DshSyncStatus) => void,
   loadStatus?: () => DshSyncStatus | null,
 ): Promise<DshSyncStatus> {
-  if (inFlight) return inFlight;
+  const key = flightKey(registry, client, opts);
+  const existing = inFlight.get(key);
+  if (existing) return existing;
   const p = doReconcile(registry, client, opts, persist, loadStatus).finally(() => {
-    inFlight = null;
+    // Identity-guarded cleanup (same discipline as models/refresh.ts): only
+    // remove our own flight, never a successor's.
+    if (inFlight.get(key) === p) inFlight.delete(key);
   });
-  inFlight = p;
+  inFlight.set(key, p);
   return p;
 }
 
