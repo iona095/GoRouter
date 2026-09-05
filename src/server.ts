@@ -201,6 +201,44 @@ function admitPreBody(rawTarget: string, headers: Headers, localCredential: () =
  * so encodings nested deeper than 3 levels (N>3) are out of scope by design
  * and are not chased further. The bound is intentionally not raised.
  */
+/**
+ * GR-008 — byte-preserving query sanitization.
+ *
+ * The local credential must never leak into a forwarded query (a client may
+ * misplace it there), but structured parse-and-reserialize rewrites raw
+ * bytes even when nothing needs stripping (%20 vs +, bare keys, duplicate
+ * order, malformed escapes) and a key-wide delete removes unrelated safe
+ * duplicates. So: return the raw query VERBATIM unless it can carry the
+ * credential; otherwise drop only the tainted raw pair(s), keeping every
+ * clean pair byte-identical. Decoding happens for DETECTION only.
+ */
+export function stripCredentialFromQuery(search: string, secret: string): { search: string; stripped: boolean } {
+  if (!search || !secret) return { search: search || "", stripped: false };
+  // Fast path: no raw occurrence and no valid percent-escape that could hide
+  // an encoded credential — the query cannot carry the secret; verbatim.
+  if (!search.includes(secret) && !/%[0-9a-f]{2}/i.test(search)) return { search, stripped: false };
+  const q = search.startsWith("?") ? search.slice(1) : search;
+  const kept: string[] = [];
+  let stripped = false;
+  for (const pair of q.split("&")) {
+    if (pair.includes(secret) || decodeIncludes(pair, secret)) {
+      stripped = true;
+      continue;
+    }
+    kept.push(pair);
+  }
+  return { search: kept.length > 0 ? `?${kept.join("&")}` : "", stripped };
+}
+
+/** True when the raw pair decodes (query "+" = space) to a secret carrier. */
+function decodeIncludes(pair: string, secret: string): boolean {
+  try {
+    return decodeURIComponent(pair.replace(/\+/g, " ")).includes(secret);
+  } catch {
+    return false; // malformed escapes are opaque — kept verbatim, never matched
+  }
+}
+
 export function isPathWithinLaneBase(finalPathname: string, basePathname: string): boolean {
   let decoded = finalPathname;
   for (let i = 0; i < 3; i++) {
@@ -612,25 +650,15 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
     upstreamUrl.pathname = basePathname.endsWith("/")
       ? basePathname.slice(0, -1) + suffix
       : basePathname + suffix;
-    // strip the local credential from query params if present (client misplacement).
-    // Deliberately no entropy floor here (unlike the header/session substring
-    // scans): a query-param delete has no innocent-id rotation/spam vector,
-    // so exact-or-substring always strips.
-    // Slice A.2: empty query (the common case) skips parse/serialize entirely.
-    if (!search) {
-      upstreamUrl.search = "";
-    } else {
-      const searchParams = new URLSearchParams(search);
-      let stripped = false;
-      for (const [k, v] of [...searchParams]) {
-        if (v === localCred || v.includes(localCred)) {
-          searchParams.delete(k);
-          stripped = true;
-        }
-      }
-      if (stripped) log.warn(`local credential stripped from query params (lane=${lane})`);
-      upstreamUrl.search = searchParams.toString() ? "?" + searchParams.toString() : "";
-    }
+    // Strip the local credential from query params if present (client
+    // misplacement). Deliberately no entropy floor here (unlike the
+    // header/session substring scans): a query-param delete has no
+    // innocent-id rotation/spam vector, so exact-or-substring always strips —
+    // but ONLY the tainted pair (GR-008: safe duplicates and raw bytes stay
+    // verbatim, including the empty-query fast path).
+    const cleaned = stripCredentialFromQuery(search, localCred);
+    if (cleaned.stripped) log.warn(`local credential stripped from query params (lane=${lane})`);
+    upstreamUrl.search = cleaned.search;
     if (upstreamUrl.origin !== parts.origin) {
       log.error(`refusing upstream URL outside fixed authority (lane=${lane})`);
       completeEntry("local_error", 500, [], monotonicMs() - started);

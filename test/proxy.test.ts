@@ -179,9 +179,9 @@ describe("protocol transparency", () => {
     // rejected (narrowing #6) — the request dispatches normally
     expect(res.status).toBe(200);
     const req = upstream.requests[0]!;
-    // the query is preserved semantically; URLSearchParams canonicalization
-    // (invalid %zz -> %25zz) is pre-existing behavior
-    expect(new URL(req.url).search).toBe("?x=%25zz");
+    // GR-008: the raw query is byte-preserved (no parse-and-reserialize, so
+    // a malformed escape is forwarded verbatim, never canonicalized).
+    expect(new URL(req.url).search).toBe("?x=%zz");
     upstream.stop();
   });
 
