@@ -157,6 +157,14 @@ export function createSecretStore(secretsDir: string): SecretStore {
   // CURRENT-010: identity includes ino — atomic blob replaces mint a new
   // file identity, so same-size/same-tick replacements never false-hit.
   const cache = new Map<string, { mtimeMs: number; size: number; ino: number; value: string }>();
+  // R3-005: brief negative cache for DECRYPT failures. A corrupt (or
+  // identity-mismatched) blob would otherwise pay a synchronous PowerShell
+  // spawn — hundreds of milliseconds, up to ~90s across retries — on EVERY
+  // read, including the control snapshot probe. Keyed on blob identity so a
+  // rewritten blob is retried immediately; missing blobs stay uncached
+  // (cheap stat-only reads that setup/create flows legitimately poll).
+  const DECRYPT_FAIL_TTL_MS = 30_000;
+  const failCache = new Map<string, { mtimeMs: number; size: number; ino: number; atMs: number; message: string }>();
 
   function blobPath(ref: string): string {
     // CURRENT-001 layer 1: malformed refs never become paths.
@@ -192,6 +200,7 @@ export function createSecretStore(secretsDir: string): SecretStore {
       const blob = dpapiProtect(plaintext);
       atomicWriteBytes(target, Buffer.from(blob, "utf8"));
       const st = statOf(ref);
+      failCache.delete(ref);
       cache.set(ref, { mtimeMs: st?.mtimeMs ?? 0, size: st?.size ?? 0, ino: st?.ino ?? 0, value: plaintext });
     },
     get(ref) {
@@ -200,9 +209,22 @@ export function createSecretStore(secretsDir: string): SecretStore {
       if (!st) throw new Error(`secret missing: ${ref}`);
       const cached = cache.get(ref);
       if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size && cached.ino === st.ino) return cached.value;
+      const failed = failCache.get(ref);
+      if (failed && failed.mtimeMs === st.mtimeMs && failed.size === st.size && failed.ino === st.ino &&
+        Date.now() - failed.atMs < DECRYPT_FAIL_TTL_MS) {
+        throw new Error(failed.message);
+      }
       if (!existsSync(blobPath(ref))) throw new Error(`secret missing: ${ref}`);
       const blob = readFileSync(blobPath(ref), "utf8").trim();
-      const value = dpapiUnprotect(blob);
+      let value: string;
+      try {
+        value = dpapiUnprotect(blob);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        failCache.set(ref, { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, atMs: Date.now(), message });
+        throw e;
+      }
+      failCache.delete(ref);
       cache.set(ref, { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, value });
       return value;
     },
@@ -211,6 +233,7 @@ export function createSecretStore(secretsDir: string): SecretStore {
     delete(ref) {
       if (!isValidSecretRef(ref)) throw new Error("invalid secret ref");
       cache.delete(ref);
+      failCache.delete(ref);
       const p = blobPath(ref);
       if (!existsSync(p)) return false;
       tryUnlink(p);

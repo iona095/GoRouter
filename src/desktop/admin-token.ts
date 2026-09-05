@@ -21,10 +21,25 @@ export const ADMIN_TOKEN_REF = 'sec_desktop_admin'
 const ADMIN_TOKEN_LOCK_TIMEOUT_MS = 5_000
 
 /**
- * Return the admin token, creating the DPAPI blob if absent (inside the
- * mutation lock, never overwriting). Never logs the value.
+ * Return the admin token, creating the DPAPI blob if absent. Never logs
+ * the value.
+ *
+ * R3-005: the read fast-path runs OUTSIDE the mutation lock — a cold or
+ * failing DPAPI decrypt (synchronous PowerShell, up to tens of seconds)
+ * must never hold state mutations hostage. Only creation takes the lock,
+ * with a re-check inside, so concurrently starting services still agree on
+ * one token and an existing blob is never overwritten. A present-but-
+ * unreadable blob fails closed (manual repair); it is never replaced.
  */
 export function ensureAdminToken(paths: Paths, secrets: SecretStore): string {
+  try {
+    if (secrets.exists(ADMIN_TOKEN_REF)) return secrets.get(ADMIN_TOKEN_REF)
+  } catch {
+    // Missing/corrupt/failing read falls through to the locked section,
+    // which re-checks and either reads, creates, or surfaces the failure.
+    // (A just-recorded decrypt failure is nearly free on re-attempt thanks
+    // to the store's negative failure cache.)
+  }
   return withFileLock(lockPathFor(paths.state), ADMIN_TOKEN_LOCK_TIMEOUT_MS, () => {
     if (secrets.exists(ADMIN_TOKEN_REF)) {
       return secrets.get(ADMIN_TOKEN_REF)
