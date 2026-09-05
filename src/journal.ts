@@ -100,6 +100,30 @@ export function createJournal(dbPath: string, retentionDays: number, maxRecords:
 /** Bounded in-memory evidence ring for the degraded fallback (never throws). */
 const MEMORY_JOURNAL_MAX_ROWS = 1000;
 
+/**
+ * R3-002 read-only compatibility probe. Opens an existing DB without
+ * `create` and read-only, so SQLite performs no writes: no journal-mode
+ * change, no table/index creation. Throws the unsupported-version error
+ * for a stamped future version; stamp-less legacy files (no journal_meta
+ * table or no stamp row) pass and are adopted by the writable init.
+ */
+function probeJournalCompatibility(dbPath: string): void {
+  const probe = new Database(dbPath, { create: false, readonly: true });
+  try {
+    const meta = probe.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'journal_meta'",
+    ).get() as { name: string } | null | undefined;
+    if (meta == null) return; // stamp-less legacy: adoption handled below
+    const row = probe.prepare("SELECT value FROM journal_meta WHERE key = 'schema_version'").get() as { value: string } | null | undefined;
+    if (row == null) return; // meta table without a stamp: legacy adoption
+    if (Number(row.value) !== JOURNAL_SCHEMA_VERSION) {
+      throw new Error(`unsupported journal schema version ${row.value} (this binary supports version ${JOURNAL_SCHEMA_VERSION}); journal file left untouched`);
+    }
+  } finally {
+    try { probe.close(); } catch { /* best effort */ }
+  }
+}
+
 function createMemoryJournal(openError: string, retentionDays: number, maxRecords: number): Journal {
   const rows = new Map<string, JournalEntry>();
   return {
@@ -147,6 +171,13 @@ function createMemoryJournal(openError: string, retentionDays: number, maxRecord
 
 function openSqliteJournal(dbPath: string, retentionDays: number, maxRecords: number): Journal {
   const fresh = !existsSync(dbPath);
+  if (!fresh) {
+    // R3-002: compatibility preflight BEFORE any mutating PRAGMA/DDL. The
+    // read-only probe never creates tables/indexes and never changes the
+    // journal mode, so a future-version file is refused byte-identical.
+    // Stamp-less legacy files pass the probe and are adopted below.
+    probeJournalCompatibility(dbPath);
+  }
   const db = new Database(dbPath, { create: true });
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA synchronous = NORMAL;");
@@ -185,8 +216,8 @@ function openSqliteJournal(dbPath: string, retentionDays: number, maxRecords: nu
     // a stamp-less legacy file as ours; refuse anything newer (or otherwise
     // not ours) WITHOUT restamping it — the throw below degrades to the
     // in-memory journal and the on-disk version is never rewritten.
-    const row = db.prepare("SELECT value FROM journal_meta WHERE key = 'schema_version'").get() as { value: string } | undefined;
-    if (row === undefined) {
+    const row = db.prepare("SELECT value FROM journal_meta WHERE key = 'schema_version'").get() as { value: string } | null | undefined;
+    if (row == null) {
       db.prepare("INSERT OR REPLACE INTO journal_meta (key, value) VALUES (?, ?)").run(
         "schema_version",
         String(JOURNAL_SCHEMA_VERSION),
