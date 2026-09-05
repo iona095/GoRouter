@@ -1,0 +1,24 @@
+# F-06: minimal CI so the quality gates stop drifting.
+# The suite is Windows-native (DPAPI secret store, named-pipe control
+# channel, PowerShell-gated paths), so it runs on windows-latest.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Tests
+        run: bun test

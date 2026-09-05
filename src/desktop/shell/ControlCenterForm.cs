@@ -2375,14 +2375,20 @@ public sealed class ControlCenterForm : Form
         SetAccountsFeedback("Removing account…", isError: false);
         try
         {
-            var response = await _channel.CallAsync("account.remove", new { alias, force = true }, 15_000);
+            // F-26: force only when the dialog presented and confirmed the
+            // lane-clearing consequence. Otherwise fail closed on the server:
+            // an account concurrently routed after the snapshot must refuse,
+            // not silently clear the lane.
+            var routed = (account?.UsedBy.Count ?? 0) > 0;
+            var response = await _channel.CallAsync("account.remove", new { alias, force = routed }, 15_000);
             if (response.Ok)
             {
                 var cleared = response.TryDataAs<RemoveResult>(out var result) ? result?.ClearedLanes ?? Array.Empty<string>() : Array.Empty<string>();
+                var credentialNote = result?.SecretDeleted == false ? " Stored credential was already gone." : "";
                 SetAccountsFeedback(
                     cleared.Count > 0
-                        ? $"Account '{alias}' removed. Lane selection cleared ({string.Join(", ", cleared.Select(l => l.ToUpperInvariant()))})."
-                        : $"Account '{alias}' removed.",
+                        ? $"Account '{alias}' removed. Lane selection cleared ({string.Join(", ", cleared.Select(l => l.ToUpperInvariant()))}).{credentialNote}"
+                        : $"Account '{alias}' removed.{credentialNote}",
                     isError: false);
             }
             else

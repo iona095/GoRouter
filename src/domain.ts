@@ -118,7 +118,7 @@ export interface Domain {
   accountUpdate(alias: string, secret: string): AccountView;
   accountList(): AccountView[];
   accountRename(alias: string, newAlias: string): { renamed: AccountView; previousAlias: string };
-  accountRemove(alias: string, force: boolean): { removed: AccountView; clearedLanes: Lane[] };
+  accountRemove(alias: string, force: boolean): { removed: AccountView; clearedLanes: Lane[]; secretDeleted: boolean };
   accountTest(alias: string, lanes: Lane[]): Promise<ProbeResult[]>;
   routeSet(lane: Lane, aliasOrId: string): RouteView;
   routeClear(lane: Lane): void;
@@ -402,9 +402,11 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         removed = account;
         secretRef = account.secretRef;
       });
-      if (secretRef) secrets.delete(secretRef);
+      // F-26: report whether the blob was actually removed (it may have
+      // vanished out-of-band; the account removal itself still succeeded).
+      const secretDeleted = secretRef ? secrets.delete(secretRef) : false;
       // post-removal view: usedBy is empty and secretPresent false by construction
-      return { removed: viewAccount(state.read(), secrets, removed!), clearedLanes };
+      return { removed: viewAccount(state.read(), secrets, removed!), clearedLanes, secretDeleted };
     },
 
     async accountTest(alias, lanes) {
@@ -575,7 +577,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       if (result.success && result.registry) {
         try {
           const client = opts.dshClient ?? createDshClient();
-          const dshStatus = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(paths), expectedPort: s.settings.port }, (st) => {
+          const dshStatus = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(paths), reloadApprovalStore: () => loadApprovalStore(paths), expectedPort: s.settings.port }, (st) => {
             try { storeDshSyncStatus(paths, st); } catch {}
           });
           return { ...result, dshSync: dshStatus };
@@ -596,7 +598,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const reg = loadRegistry(paths);
       if (!reg || !reg.go || !reg.zen) return null;
       const client = opts.dshClient ?? createDshClient();
-      const status = await reconcileDshCatalog(reg, client, { approvalStore: loadApprovalStore(paths), expectedPort: state.read().settings.port }, (st) => {
+      const status = await reconcileDshCatalog(reg, client, { approvalStore: loadApprovalStore(paths), reloadApprovalStore: () => loadApprovalStore(paths), expectedPort: state.read().settings.port }, (st) => {
         try { storeDshSyncStatus(paths, st); } catch {}
       });
       return status;

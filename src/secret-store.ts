@@ -127,7 +127,8 @@ export interface SecretStore {
   /** Read a secret; uses cache unless the blob changed. Throws when missing. */
   get(ref: string): string;
   /** Delete a secret blob. */
-  delete(ref: string): void;
+  /** Remove the blob. Returns true only if a blob was actually removed. */
+  delete(ref: string): boolean;
   exists(ref: string): boolean;
 }
 
@@ -205,10 +206,15 @@ export function createSecretStore(secretsDir: string): SecretStore {
       cache.set(ref, { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, value });
       return value;
     },
+    // F-26: report whether a blob was actually removed — callers must
+    // not claim "secret blob deleted" when nothing was there.
     delete(ref) {
       if (!isValidSecretRef(ref)) throw new Error("invalid secret ref");
       cache.delete(ref);
-      tryUnlink(blobPath(ref));
+      const p = blobPath(ref);
+      if (!existsSync(p)) return false;
+      tryUnlink(p);
+      return !existsSync(p);
     },
     exists(ref) {
       if (!isValidSecretRef(ref)) throw new Error("invalid secret ref");

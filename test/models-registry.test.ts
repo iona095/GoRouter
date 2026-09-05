@@ -415,6 +415,16 @@ describe("fetcher normalization", () => {
     const longId: FetchFn = async () => Response.json({ object: "list", data: [{ id: "x".repeat(257) }] }, { status: 200 });
     await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: longId })).rejects.toThrow(/too long/);
   });
+
+  test("F-05: fetch timeout covers the response body (stalled body rejects)", async () => {
+    // Headers arrive, then the body stalls forever: pre-fix the timeout was
+    // disarmed after headers and refresh wedged permanently.
+    const stall: FetchFn = async () => new Response(
+      new ReadableStream({ start() { /* never enqueue, never close */ } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+    await expect(fetchLane("go", "https://opencode.ai/zen/go/v1", { fetchFn: stall })).rejects.toThrow(/timeout/);
+  }, 30000);
 });
 
 // ---------------------------------------------------------------------------

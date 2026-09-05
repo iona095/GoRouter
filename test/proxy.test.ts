@@ -4,11 +4,18 @@
  * coherence, and no-restart route switching.
  */
 import { describe, test, expect, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { startMockUpstream, startTestRouter, authHeaders, readJournalRows, LOCAL_KEY, sseStream, type TestRouter } from "./harness.ts";
+import { createSecretStore } from "../src/secret-store.ts";
+import { redact } from "../src/util.ts";
 
 const routers: TestRouter[] = [];
+const scratchDirs: string[] = [];
 afterEach(() => {
   for (const r of routers.splice(0)) r.stop();
+  for (const d of scratchDirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 async function newRouter(opts: Parameters<typeof startTestRouter>[0]) {
@@ -482,6 +489,95 @@ describe("endpoint-family authentication (current OpenCode gateway surfaces)", (
     expect(req.headers.get("x-goog-api-key")).toBeNull(); // other family headers stripped
     upstream.stop();
   });
+});
+
+describe("credential containment (F-09/F-10/F-11)", () => {
+  // Canaries shaped to match every SECRET_SCAN family (positive controls
+  // below prove the scanners see them, so absence assertions are non-vacuous).
+  const LOCAL_CANARY = `Bearer ${LOCAL_KEY}`;
+  const ACCOUNT_CANARY = "sk-live-canary-0123456789abcdef";
+
+  test("F-10: seeded canaries reach no sink (logs, journal, error bodies)", async () => {
+    // Positive control: the raw canaries ARE visible pre-redaction…
+    expect(LOCAL_CANARY).toContain(LOCAL_KEY);
+    expect(ACCOUNT_CANARY).toContain("sk-live-canary");
+    // …and the production redactor removes them.
+    expect(redact(`hdr ${LOCAL_CANARY} key ${ACCOUNT_CANARY}`)).not.toContain(LOCAL_KEY);
+    expect(redact(`hdr ${LOCAL_CANARY} key ${ACCOUNT_CANARY}`)).not.toContain(ACCOUNT_CANARY);
+
+    const lines: string[] = [];
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+    console.error = (...a: unknown[]) => { lines.push(a.map(String).join(" ")); };
+    try {
+      const upstream = await startMockUpstream();
+      const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: ACCOUNT_CANARY }], routes: { go: "a1" } });
+      // Canary in every inbound carrier at once.
+      const res = await fetch(`${router.baseUrl}/go/v1/models?api_key=${LOCAL_KEY}&x=1`, {
+        headers: authHeaders({ "x-custom-echo": ACCOUNT_CANARY, "x-opencode-session": `conv-${LOCAL_KEY}` }),
+      });
+      expect(res.status).toBe(200);
+      // Error surfaces must not echo the carriers either.
+      const bad = await fetch(`${router.baseUrl}/go/v1//${LOCAL_KEY}?k=${ACCOUNT_CANARY}`, { headers: authHeaders() });
+      expect(bad.status).toBe(400);
+      const badBody = await bad.text();
+      expect(badBody).not.toContain(LOCAL_KEY);
+      expect(badBody).not.toContain(ACCOUNT_CANARY);
+      const rows = readJournalRows(router.paths.journalDb);
+      const serialized = JSON.stringify(rows);
+      expect(serialized).not.toContain(LOCAL_KEY);
+      expect(serialized).not.toContain(ACCOUNT_CANARY);
+      upstream.stop();
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+    }
+    const dumped = lines.join("\n");
+    expect(dumped).not.toContain(LOCAL_KEY);
+    expect(dumped).not.toContain(ACCOUNT_CANARY);
+  });
+
+  test("F-11: local credential in the query string never reaches upstream", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    // Exact value, substring value, and encoded value in three positions.
+    for (const q of [`api_key=${LOCAL_KEY}`, `x=1&tok=Bearer-${LOCAL_KEY}-tail&y=2`, `q=${encodeURIComponent(LOCAL_KEY)}`]) {
+      const res = await fetch(`${router.baseUrl}/go/v1/models?${q}`, { headers: authHeaders() });
+      expect(res.status, q).toBe(200);
+    }
+    expect(upstream.requests.length).toBe(3);
+    for (const req of upstream.requests) {
+      expect(req.url).not.toContain(LOCAL_KEY);
+      expect(new URL(req.url).search).not.toContain(LOCAL_KEY);
+    }
+    // Empty-query control still proxies (the framing fast path is unaffected).
+    const plain = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    expect(plain.status).toBe(200);
+    upstream.stop();
+  });
+
+  test("F-09: cached-path injection uses the live secret across rotation (real store)", async () => {
+    const upstream = await startMockUpstream();
+    const secretsDir = mkdtempSync(join(tmpdir(), "gorouter-f09-"));
+    scratchDirs.push(secretsDir);
+    const secrets = createSecretStore(secretsDir);
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-one" }], routes: { go: "a1" }, secrets });
+    const get = () => fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    // Cold (DPAPI decrypt) then warm (stat-cache hit): same live secret.
+    expect((await get()).status).toBe(200);
+    expect((await get()).status).toBe(200);
+    expect(upstream.requests.length).toBe(2);
+    for (const req of upstream.requests) {
+      expect(req.headers.get("authorization")).toBe("Bearer key-one");
+    }
+    // Rotate out-of-band via the same atomic-rename writer product code uses.
+    const ref = router.state.read().accounts.find((a) => a.alias === "a1")!.secretRef;
+    secrets.put(ref, "key-two");
+    expect((await get()).status).toBe(200);
+    expect(upstream.requests[2]!.headers.get("authorization")).toBe("Bearer key-two");
+    upstream.stop();
+  }, 120000);
 });
 
 describe("bodyless responses and journal terminalization", () => {

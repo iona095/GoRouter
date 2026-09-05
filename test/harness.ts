@@ -23,7 +23,7 @@ export function memSecrets(initial?: Record<string, string>): SecretStore {
       if (v === undefined) throw new Error(`secret missing: ${ref}`);
       return v;
     },
-    delete(ref) { map.delete(ref); },
+    delete(ref) { return map.delete(ref); },
     exists(ref) { return map.has(ref); },
   };
 }
@@ -107,6 +107,8 @@ export async function startTestRouter(opts: {
   upstreamZen?: string;
   upstreamHandler?: (req: Request) => Promise<Response> | Response;
   accounts?: Array<{ alias: string; key: string }>;
+  /** Override the secret store (default in-memory). Pass the real DPAPI store for cached-path injection tests. */
+  secrets?: SecretStore;
   /** Override the local control credential (default LOCAL_KEY): short values pin the exact-match containment floor. */
   localKey?: string;
   routes?: Partial<Record<Lane, string>>;
@@ -116,7 +118,7 @@ export async function startTestRouter(opts: {
   const stateDir = mkdtempSync(join(tmpdir(), "gorouter-test-"));
   const paths = resolvePaths(stateDir);
   ensureStateDirs(paths);
-  const secrets = memSecrets();
+  const secrets = opts.secrets ?? memSecrets();
   // CURRENT-001: the harness mints canonical refs exactly like production
   // (newRef), so state-load containment filtering exercises the real path.
   const localRef = newRef();

@@ -188,8 +188,8 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
       case 'account.remove': {
         const alias = requireString(params, 'alias')
         const force = params.force === true
-        const { removed, clearedLanes } = domain.accountRemove(alias, force)
-        return { removed: accountData(removed), clearedLanes }
+        const { removed, clearedLanes, secretDeleted } = domain.accountRemove(alias, force)
+        return { removed: accountData(removed), clearedLanes, secretDeleted }
       }
 
       case 'account.test': {
@@ -381,8 +381,11 @@ async function main(): Promise<void> {
     },
     (err) => {
       if ((err as { code?: string }).code === 'EADDRINUSE') {
-        console.error('control service is already running (pipe in use); exiting')
-        process.exit(1)
+        // F-01: exit 3 (distinct from generic failure) with a squat marker:
+        // the name may be held by another instance — or by a rogue process
+        // squatting the pipe. The shell treats 3 as "do not trust the pipe".
+        console.error('control pipe bind failed (pipe in use, exit 3): if no other service is running, a rogue process may be squatting the pipe name')
+        process.exit(3)
       }
     },
   )
@@ -391,9 +394,9 @@ async function main(): Promise<void> {
     await transport.listening
   } catch (err) {
     // bind failed (pipe in use or otherwise): never started supervision, so
-    // no child exists to orphan — exit cleanly
-    console.error(`control pipe bind failed: ${err instanceof Error ? err.message : String(err)}`)
-    process.exit(1)
+    // no child exists to orphan — exit cleanly with the F-01 bind code (3)
+    console.error(`control pipe bind failed (exit 3): ${err instanceof Error ? err.message : String(err)}`)
+    process.exit(3)
   }
 
   // SEC-01: node:net's default pipe DACL grants read to Everyone/Anonymous;

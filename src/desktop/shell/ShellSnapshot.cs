@@ -250,6 +250,10 @@ public sealed class RemoveResult
 
     [JsonPropertyName("clearedLanes")]
     public IReadOnlyList<string> ClearedLanes { get; init; } = Array.Empty<string>();
+
+    // F-26: null = unknown (older service); only an explicit false is reported.
+    [JsonPropertyName("secretDeleted")]
+    public bool? SecretDeleted { get; init; }
 }
 
 /// <summary>account.test response row (probe.ts ProbeResult).</summary>

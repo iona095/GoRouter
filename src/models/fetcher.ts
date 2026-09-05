@@ -21,26 +21,49 @@ export const MAX_CATALOG_BYTES = 5 * 1024 * 1024;
 export const MAX_CATALOG_MODELS = 10_000;
 export const MAX_MODEL_ID_LENGTH = 256;
 
-async function readCappedBody(res: Response, cap: number, what: string): Promise<Uint8Array> {
+// F-05: the fetch timeout must cover the response BODY, not just headers.
+// A stalled body leaves reader.read() pending forever, so the loop races
+// each read against the abort signal (mock fetchFns may ignore the signal,
+// hence the explicit race rather than relying on stream erroring).
+async function readCappedBody(res: Response, cap: number, what: string, signal?: AbortSignal): Promise<Uint8Array> {
   const declared = Number(res.headers.get("content-length") ?? NaN);
   if (Number.isFinite(declared) && declared > cap) {
     throw new Error(`${what}: body too large (declared ${declared} > ${cap} bytes)`);
   }
   const reader = res.body?.getReader();
   if (!reader) return new Uint8Array(0);
+  let onAbort: (() => void) | null = null;
+  const aborted = new Promise<never>((_, reject) => {
+    if (!signal) return; // no deadline: race relies on the reader alone
+    if (signal.aborted) { reject(new Error(`${what}: fetch timeout`)); return; }
+    onAbort = () => reject(new Error(`${what}: fetch timeout`));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // Swallow the race's late rejection once the body completes first: the
+  // abort listener is removed below, but an already-queued rejection must
+  // not surface as an unhandled rejection.
+  aborted.catch(() => {});
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      total += value.length;
-      if (total > cap) {
-        try { await reader.cancel(); } catch { /* best effort */ }
-        throw new Error(`${what}: body too large (over ${cap} bytes)`);
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) break;
+      if (value) {
+        total += value.length;
+        if (total > cap) {
+          try { await reader.cancel(); } catch { /* best effort */ }
+          throw new Error(`${what}: body too large (over ${cap} bytes)`);
+        }
+        chunks.push(value);
       }
-      chunks.push(value);
     }
+  } catch (e) {
+    try { await reader.cancel(); } catch { /* best effort: free the stalled producer */ }
+    throw e;
+  } finally {
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    try { reader.releaseLock(); } catch { /* already closed/cancelled */ }
   }
   const out = new Uint8Array(total);
   let off = 0;
@@ -115,23 +138,29 @@ export async function fetchLane(
     clearTimeout(timeout);
     throw new Error(`lane ${lane}: fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  clearTimeout(timeout);
-  if (res.status !== 200) {
-    // Capped read: the error body itself is untrusted and must not be buffered whole.
-    const bodyBytes = await readCappedBody(res, MAX_CATALOG_BYTES, `lane ${lane} error`).catch(() => new Uint8Array(0));
-    const bodySnippet = new TextDecoder().decode(bodyBytes.slice(0, 300));
-    throw new Error(`lane ${lane}: upstream status ${res.status} ${bodySnippet}`);
-  }
-  let raw: unknown;
+  // F-05: the timeout stays armed across the body reads below (it used to be
+  // disarmed here, so a stalled body wedged refresh permanently). Cleared in
+  // the finally once headers + body + parse are all done.
   try {
-    const bodyBytes = await readCappedBody(res, MAX_CATALOG_BYTES, `lane ${lane}`);
-    raw = JSON.parse(new TextDecoder().decode(bodyBytes));
-  } catch (e) {
-    if (e instanceof Error && /body too large/.test(e.message)) throw e;
-    throw new Error(`lane ${lane}: invalid JSON: ${e instanceof Error ? e.message : String(e)}`);
+    if (res.status !== 200) {
+      // Capped read: the error body itself is untrusted and must not be buffered whole.
+      const bodyBytes = await readCappedBody(res, MAX_CATALOG_BYTES, `lane ${lane} error`, controller.signal).catch(() => new Uint8Array(0));
+      const bodySnippet = new TextDecoder().decode(bodyBytes.slice(0, 300));
+      throw new Error(`lane ${lane}: upstream status ${res.status} ${bodySnippet}`);
+    }
+    let raw: unknown;
+    try {
+      const bodyBytes = await readCappedBody(res, MAX_CATALOG_BYTES, `lane ${lane}`, controller.signal);
+      raw = JSON.parse(new TextDecoder().decode(bodyBytes));
+    } catch (e) {
+      if (e instanceof Error && /body too large/.test(e.message)) throw e;
+      throw new Error(`lane ${lane}: invalid JSON: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const models = normalizeModelsResponse(raw, lane);
+    return { fetchedAtUtc: new Date().toISOString(), models };
+  } finally {
+    clearTimeout(timeout);
   }
-  const models = normalizeModelsResponse(raw, lane);
-  return { fetchedAtUtc: new Date().toISOString(), models };
 }
 
 export { normalizeModelsResponse };

@@ -46,6 +46,19 @@ internal static class Selftest
     }
     public static int Run(string[] args)
     {
+        // F-01 regression host: headless pipe-squat test, before any WinForms init.
+        // SCOPE GUARD: this branch covers ONLY the F-01/F-08 shell boundary.
+        if (args.Length > 1 && args[1] == "pipe-squat")
+        {
+            return PipeSquatSelftest.Run(args).GetAwaiter().GetResult();
+        }
+
+        // F-08 regression host (same shell-boundary scope guard).
+        if (args.Length > 1 && args[1] == "dispatch-test")
+        {
+            return DispatchSelftest.Run(args).GetAwaiter().GetResult();
+        }
+
         NativeDpi.SetPerMonitorV2();
         ApplicationConfiguration.Initialize();
 

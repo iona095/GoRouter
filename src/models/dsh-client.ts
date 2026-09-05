@@ -60,6 +60,15 @@ export interface DshClient {
   read(): Promise<DshSnapshot | null>;
   /** Mutate both lanes atomically. Throws DshConflictError on stale revision. */
   mutate(desiredGo: ModelEntry[], desiredZen: ModelEntry[], expectedRevision: number): Promise<{ revision: number }>;
+  /**
+   * F-17 (CURRENT-002 reopened): stable semantic target identity for
+   * reconcile single-flight keying. Production constructs a FRESH client
+   * object per call, so object identity never coalesces — the key must be
+   * the target (file path / base URL), equal across instances on the same
+   * target. Optional so legacy test doubles without a declared target
+   * still typecheck; such clients never coalesce (fail-closed).
+   */
+  identity?(): string;
 }
 
 // --- File seam helpers ---
@@ -360,6 +369,10 @@ function validateLoopbackUrl(value: string): URL {
 
 export class FileDshClient implements DshClient {
   private filePath: string;
+  /** F-17: stable semantic identity — the resolved settings path. */
+  identity(): string {
+    return `file:${this.filePath}`;
+  }
   constructor(settingsPath?: string | null, dshHome?: string | null) {
     this.filePath = dshSettingsPath(settingsPath, dshHome);
     // Validate local-only
@@ -482,6 +495,10 @@ export class HttpDshClient implements DshClient {
   private baseUrl: string;
   private hostHeader: string;
   private timeoutMs: number;
+  /** F-17: stable semantic identity — the normalized origin. */
+  identity(): string {
+    return `http:${this.baseUrl}`;
+  }
   constructor(webUrl: string, opts: { timeoutMs?: number } = {}) {
     const u = validateLoopbackUrl(webUrl);
     this.baseUrl = u.origin;
@@ -626,13 +643,16 @@ export function createDshClient(opts: DshClientOptions = {}): DshClient {
   return new FileDshClient(opts.settingsPath ?? null, opts.dshHome ?? null);
 }
 
-/** For tests: injectable in-memory client. */
-export function createMemoryDshClient(initial: { go: ModelEntry[]; zen: ModelEntry[]; revision?: number; rawGoProvider?: Record<string, unknown> | null; rawZenProvider?: Record<string, unknown> | null }): DshClient & { mutations: number; history: Array<{ go: ModelEntry[]; zen: ModelEntry[]; rev: number }> } {
+let nextMemClientId = 1;
+
+/** For tests: injectable in-memory client. Optional identity declares the simulated target for single-flight keying. */
+export function createMemoryDshClient(initial: { go: ModelEntry[]; zen: ModelEntry[]; revision?: number; rawGoProvider?: Record<string, unknown> | null; rawZenProvider?: Record<string, unknown> | null }, identity?: string): DshClient & { mutations: number; history: Array<{ go: ModelEntry[]; zen: ModelEntry[]; rev: number }> } {
   let rev = initial.revision ?? 0;
   let go = [...initial.go];
   let zen = [...initial.zen];
   const history: Array<{ go: ModelEntry[]; zen: ModelEntry[]; rev: number }> = [];
   return {
+    identity() { return `mem:${identity ?? `auto-${nextMemClientId++}`}`; },
     async read() { return { revision: rev, go: [...go], zen: [...zen], rawGoProvider: initial.rawGoProvider ?? null, rawZenProvider: initial.rawZenProvider ?? null }; },
     mutations: 0,
     history,

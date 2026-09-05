@@ -16,6 +16,41 @@ import type { Paths } from "./paths.ts";
 
 export const STATE_SCHEMA_VERSION = 1;
 
+/** F-13: bounded attempts for a single state.json read. */
+export const STATE_READ_ATTEMPTS = 3;
+
+/**
+ * F-13: transient filesystem failures that must NOT quarantine a good
+ * state.json on first sight (AV/indexer locks surface as these on Windows).
+ * Corruption (JSON.parse) and all other codes fail closed immediately.
+ * Test seam: pure classifier.
+ */
+const TRANSIENT_READ_CODES = new Set(["EBUSY", "EAGAIN", "EINTR", "EPERM"]);
+export function isTransientReadError(e: unknown): boolean {
+  if (!e || (typeof e !== "object" && typeof e !== "function")) return false;
+  const code = (e as { code?: unknown }).code;
+  return typeof code === "string" && TRANSIENT_READ_CODES.has(code);
+}
+
+/**
+ * F-13: read through transient failures with bounded backoff, then throw.
+ * Test seam: the reader and sleeper are injected (production passes
+ * readFileSync/Bun.sleepSync). Non-transient errors throw on first attempt.
+ */
+export function readWithTransientRetry(read: () => string, sleepMs: (ms: number) => void = (ms) => Bun.sleepSync(ms)): string {
+  let last: unknown = null;
+  for (let attempt = 0; attempt < STATE_READ_ATTEMPTS; attempt++) {
+    try {
+      return read();
+    } catch (e) {
+      last = e;
+      if (!isTransientReadError(e) || attempt + 1 >= STATE_READ_ATTEMPTS) throw e;
+      sleepMs(25 * (attempt + 1));
+    }
+  }
+  throw last;
+}
+
 export type Lane = "go" | "zen";
 
 export const LANES: Lane[] = ["go", "zen"];
@@ -194,12 +229,14 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
     if (cache && cache.mtimeMs === st.mtimeMs && cache.size === st.size && cache.ino === st.ino) return cache.state;
     let raw: string;
     try {
-      raw = readFileSync(p, "utf8");
-    } catch {
+      // F-13: a transient lock must not quarantine a good file on first sight.
+      raw = readWithTransientRetry(() => readFileSync(p, "utf8"));
+    } catch (e) {
       corrupt = true;
       quarantine(p);
       cache = null;
-      log.warn(`state read failed; using defaults (path=${p})`);
+      const code = (e as { code?: unknown }).code;
+      log.warn(`state read failed${typeof code === "string" ? ` (${code}, after ${STATE_READ_ATTEMPTS} attempts)` : ""}; using defaults (path=${p})`);
       return defaultState();
     }
     let parsed: unknown;

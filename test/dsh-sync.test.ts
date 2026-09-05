@@ -831,6 +831,128 @@ describe("concurrent coalescing (single-flight)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 10b. F-17 / CURRENT-002 reopened: stable semantic client identity
+// ---------------------------------------------------------------------------
+// Production constructs a FRESH client per reconcile call (server.ts /
+// domain.ts call createDshClient() inline), so keying the single-flight on
+// object identity never coalesces in production while shared-object unit
+// tests do. The flight key must be the stable semantic target identity. A
+// shared-client test is NO LONGER acceptable evidence for CURRENT-002:
+// every test below uses separately constructed clients.
+
+describe("F-17/CURRENT-002 reopened: stable semantic client identity", () => {
+  test("separately-constructed clients on the SAME target coalesce to one mutate", async () => {
+    const reg = authoritativeReg(["a", "new"], ["b"]);
+    const opts = { approvalStore: initStore(["a", "new"], ["b"]) };
+    const mkSameTarget = () => {
+      let rev = 0;
+      let go: ModelEntry[] = [makeModel("a")];
+      let zen: ModelEntry[] = [makeModel("b")];
+      let mutateCalls = 0;
+      const client: DshClient = {
+        identity() { return "mem:shared-target"; },
+        async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
+        async mutate(dg, dz, exp) {
+          mutateCalls++;
+          await new Promise((r) => setTimeout(r, 60));
+          if (exp !== rev) throw new DshConflictError(exp, rev);
+          go = [...dg]; zen = [...dz]; rev += 1;
+          return { revision: rev };
+        },
+      };
+      return { client, calls: () => mutateCalls };
+    };
+    const a = mkSameTarget();
+    const b = mkSameTarget();
+    const [s1, s2] = await Promise.all([
+      reconcileDshCatalog(reg, a.client, opts),
+      reconcileDshCatalog(reg, b.client, opts),
+    ]);
+    expect(a.calls() + b.calls()).toBe(1);
+    expect(s1).toEqual(s2);
+    expect(s1.outcome).toBe("current");
+  });
+
+  test("same-identity memory clients coalesce; distinct identities fly separately", async () => {
+    const reg = authoritativeReg(["a", "new"], ["b"]);
+    const opts = { approvalStore: initStore(["a", "new"], ["b"]) };
+    const mk = (id: string) =>
+      createMemoryDshClient({ go: [makeModel("a")], zen: [makeModel("b")], ...RAW_BINDINGS }, id) as unknown as DshClient & { mutations: number };
+    const c1 = mk("shared");
+    const c2 = mk("shared");
+    const [s1, s2] = await Promise.all([
+      reconcileDshCatalog(reg, c1 as unknown as DshClient, opts),
+      reconcileDshCatalog(reg, c2 as unknown as DshClient, opts),
+    ]);
+    expect(c1.mutations + c2.mutations).toBe(1);
+    expect(s1).toEqual(s2);
+    clearDshSyncSingleFlightForTests();
+    const d1 = mk("t1");
+    const d2 = mk("t2");
+    const [r1, r2] = await Promise.all([
+      reconcileDshCatalog(reg, d1 as unknown as DshClient, opts),
+      reconcileDshCatalog(reg, d2 as unknown as DshClient, opts),
+    ]);
+    expect(d1.mutations + d2.mutations).toBe(2);
+    expect(r1.outcome).toBe("current");
+    expect(r2.outcome).toBe("current");
+  });
+
+  test("FileDshClient/HttpDshClient identity is the stable target, not object identity", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gorouter-f17-"));
+    dirs.push(dir);
+    const p1 = join(dir, "settings.yaml");
+    const p2 = join(dir, "other.yaml");
+    const { FileDshClient, HttpDshClient } = await import("../src/models/dsh-client.ts");
+    expect(new FileDshClient(p1).identity()).toBe(new FileDshClient(p1).identity());
+    expect(new FileDshClient(p1).identity()).not.toBe(new FileDshClient(p2).identity());
+    expect(new HttpDshClient("http://127.0.0.1:9999").identity()).toBe(
+      new HttpDshClient("http://127.0.0.1:9999").identity(),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10c. F-07: approval authority reloaded on conflict retry
+// ---------------------------------------------------------------------------
+// deriveFor closes over the entry approval view; a revocation landing
+// between the initial read and a conflict retry must be honored by the
+// retried mutate — never restored.
+
+describe("F-07: approval reload on conflict retry", () => {
+  test("revocation between conflict and retry is honored (no restore)", async () => {
+    const reg = authoritativeReg(["a", "new"], ["b"]);
+    let liveApprovals = initStore(["a", "new"], ["b"]);
+    const opts = {
+      approvalStore: liveApprovals,
+      reloadApprovalStore: () => liveApprovals,
+    };
+    let rev = 0;
+    let go: ModelEntry[] = [makeModel("a")];
+    let zen: ModelEntry[] = [makeModel("b")];
+    let firstMutate = true;
+    const client: DshClient = {
+      async read() { return { revision: rev, go: [...go], zen: [...zen], ...RAW_BINDINGS }; },
+      async mutate(dg, dz, exp) {
+        if (firstMutate) {
+          firstMutate = false;
+          // External writer commits; operator revokes "new" before our retry.
+          go = [makeModel("a"), makeModel("x")]; zen = [makeModel("b")]; rev += 1;
+          liveApprovals = initStore(["a"], ["b"]);
+          throw new DshConflictError(exp, rev);
+        }
+        if (exp !== rev) throw new DshConflictError(exp, rev);
+        go = [...dg]; zen = [...dz]; rev += 1;
+        return { revision: rev };
+      },
+    };
+    const st = await reconcileDshCatalog(reg, client, opts);
+    expect(st.outcome).toBe("current");
+    expect(go.map((m) => m.id).sort()).toEqual(["a"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 11. Restart mid-sync (persistence)
 // ---------------------------------------------------------------------------
 
@@ -934,6 +1056,28 @@ describe("restart mid-sync: persisted dsh-sync-state survives", () => {
     const { resolvePaths } = await import("../src/paths.ts");
     const paths = { ...resolvePaths(dir), dshSyncStateJson: dir };
     expect(() => storeDshSyncStatus(paths, emptyDshSyncStatus())).toThrow();
+  });
+
+  test("F-23: write path validates before persist (shape-invalid never lands on disk)", async () => {
+    const { paths } = freshPaths();
+    const p = dshSyncStatePathFor(paths);
+    // Same offenders the read path quarantines: the write path must refuse
+    // them instead of persisting garbage over good state.
+    const badShapes: unknown[] = [
+      { ...emptyDshSyncStatus(), outcome: "nonsense" },
+      { ...emptyDshSyncStatus(), activeGoCount: NaN },
+      { ...emptyDshSyncStatus(), activeGoCount: "many" },
+      { ...emptyDshSyncStatus(), reachable: "yes" },
+      { ...emptyDshSyncStatus(), mutationPerformed: 1 },
+    ];
+    for (const bad of badShapes) {
+      expect(() => storeDshSyncStatus(paths, bad as never)).toThrow(/invalid dsh sync status/);
+      expect(existsSync(p)).toBe(false); // refused, never persisted
+    }
+    // A valid status still round-trips.
+    const good = { ...emptyDshSyncStatus(), outcome: "current" as const, activeGoCount: 3 };
+    storeDshSyncStatus(paths, good);
+    expect(loadDshSyncStatus(paths)?.outcome).toBe("current");
   });
 });
 

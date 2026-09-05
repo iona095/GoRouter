@@ -79,7 +79,18 @@ export function loadDshSyncStatus(paths: Paths): DshSyncStatus | null {
  * best-effort observability and already catch — the throw only makes the
  * contract honest for callers that need to know.
  */
+export function isValidDshSyncStatusForStore(status: DshSyncStatus): boolean {
+  if (!status || typeof status !== "object") return false;
+  return isValidDshSyncStatus(status as unknown as Record<string, unknown>);
+}
+
 export function storeDshSyncStatus(paths: Paths, status: DshSyncStatus): void {
+  // F-23: the read path quarantines shape-invalid files, so the write path
+  // must validate BEFORE persist — never write garbage over good state
+  // (a later read would quarantine our own write as "evidence").
+  if (!isValidDshSyncStatusForStore(status)) {
+    throw new Error(`invalid dsh sync status: refusing to persist (outcome=${(status as unknown as Record<string, unknown>)?.outcome})`);
+  }
   atomicWriteJson(dshSyncStatePathFor(paths), status as unknown as Record<string, unknown>);
 }
 

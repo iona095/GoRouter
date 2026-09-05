@@ -32,6 +32,13 @@ export interface DshSyncOptions {
   expectedPort?: number;
   /** Injected approval store view (callers load it from the real store). */
   approvalStore?: ApprovalStoreLoad;
+  /**
+   * F-07: re-loader for the approval authority, invoked on conflict retry
+   * before re-deriving. Without this the retry re-applies a stale view and
+   * can restore a model revoked mid-flight. Absent => entry view is reused
+   * (legacy behavior); a throwing loader fails the retry closed.
+   */
+  reloadApprovalStore?: () => ApprovalStoreLoad;
 }
 
 // CURRENT-002 — single-flight keyed by the semantic inputs (registry
@@ -40,15 +47,29 @@ export interface DshSyncOptions {
 // separately, so caller B can never receive caller A's committed result.
 const inFlight = new Map<string, Promise<DshSyncStatus>>();
 
-let nextClientId = 1;
-const clientIds = new WeakMap<object, number>();
-function clientIdFor(client: DshClient): number {
-  let id = clientIds.get(client);
-  if (id === undefined) {
-    id = nextClientId++;
-    clientIds.set(client, id);
+// F-17 (CURRENT-002 reopened): single-flight keys on the stable semantic
+// target identity, NOT object identity. Production builds a fresh client per
+// call, so a WeakMap per-object key never coalesced in production. Clients
+// that declare no target identity (legacy test doubles) fall back to a
+// per-object key and therefore never coalesce — fail-closed: unknown target
+// means no proven sameness, so no shared result.
+let nextUnknownClientId = 1;
+const unknownClientIds = new WeakMap<object, number>();
+function clientIdentityFor(client: DshClient): string {
+  if (typeof client.identity === "function") {
+    try {
+      const claimed = client.identity();
+      if (typeof claimed === "string" && claimed.length > 0) return `id:${claimed}`;
+    } catch {
+      /* fall through to unknown-target keying */
+    }
   }
-  return id;
+  let id = unknownClientIds.get(client);
+  if (id === undefined) {
+    id = nextUnknownClientId++;
+    unknownClientIds.set(client, id);
+  }
+  return `obj:${id}`;
 }
 
 function registryKey(registry: RegistryFile): string {
@@ -63,7 +84,7 @@ function approvalStoreKey(store: ApprovalStoreLoad | undefined): string {
 }
 
 function flightKey(registry: RegistryFile, client: DshClient, opts: DshSyncOptions): string {
-  return [registryKey(registry), `port:${opts.expectedPort ?? 8787}`, `client:${clientIdFor(client)}`, approvalStoreKey(opts.approvalStore)].join("\n");
+  return [registryKey(registry), `port:${opts.expectedPort ?? 8787}`, `client:${clientIdentityFor(client)}`, approvalStoreKey(opts.approvalStore)].join("\n");
 }
 
 export function clearDshSyncSingleFlightForTests(): void {
@@ -207,8 +228,10 @@ async function doReconcile(
 
   const regGoIds = (registry.go!.models ?? []).map((m) => m.id);
   const regZenIds = (registry.zen!.models ?? []).map((m) => m.id);
-  const approvedGo = approvedIdsFor("go", approvals);
-  const approvedZen = approvedIdsFor("zen", approvals);
+  // F-07: mutable so the conflict-retry path can re-derive from a reloaded
+  // approval view instead of the possibly-revoked entry view.
+  let approvedGo = approvedIdsFor("go", approvals);
+  let approvedZen = approvedIdsFor("zen", approvals);
 
   // Read latest DSH snapshot + revision
   let snapshot: DshSnapshot | null;
@@ -487,6 +510,41 @@ async function doReconcile(
               migrationRequired: false,
               bindingValid: null,
               bindingError: null,
+            };
+            if (persist) try { persist(status); } catch {}
+            return status;
+          }
+          // F-07: reload the approval authority before re-deriving — a
+          // revocation that landed mid-flight must be honored, never restored.
+          // A throwing loader fails the retry closed (no mutate on stale view).
+          try {
+            const reloaded = opts.reloadApprovalStore?.();
+            if (reloaded && reloaded.state === "initialized") {
+              approvedGo = approvedIdsFor("go", reloaded);
+              approvedZen = approvedIdsFor("zen", reloaded);
+            }
+          } catch (e) {
+            const sanitized = sanitizeError(e);
+            log.warn(`dsh sync conflict retry: approval reload failed, failing closed: ${sanitized}`);
+            const status: DshSyncStatus = {
+              ...emptyDshSyncStatus(),
+              reachable: true,
+              lastAttemptAt: attemptAt,
+              outcome: "error",
+              mutationPerformed: false,
+              observedRevision,
+              committedRevision: null,
+              activeGoCount: fresh.go.length,
+              activeZenCount: fresh.zen.length,
+              withheldGoCount: derived.withheldGo.length,
+              withheldZenCount: derived.withheldZen.length,
+              lastError: `conflict retry: approval reload failed — fail closed: ${sanitized}`,
+              approvalsInitialized: true,
+              migrationRequired: false,
+              bindingValid: null,
+              bindingError: null,
+              approvedAbsentGoCount: derived.approvedAbsentGo.length,
+              approvedAbsentZenCount: derived.approvedAbsentZen.length,
             };
             if (persist) try { persist(status); } catch {}
             return status;

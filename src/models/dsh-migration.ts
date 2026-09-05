@@ -13,6 +13,7 @@
  * material drift rejects the apply with zero writes.
  */
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { OWNED_DSH_PROVIDERS, initializeApprovalStore, loadApprovalStore, approvalStorePathFor } from "./dsh-approvals.ts";
 import { withFileLockAsync, lockPathFor } from "../lock.ts";
 import { tryUnlink } from "../util.ts";
@@ -105,7 +106,7 @@ export async function applyMigration(
   readSnapshot: () => Promise<DshSnapshot | null>,
   proposalId: string,
   expectedPort: number,
-  opts: { nowIso?: string } = {},
+  opts: { nowIso?: string; unlinkFile?: (path: string) => void } = {},
 ): Promise<MigrationApplyResult> {
   if (typeof proposalId !== "string" || proposalId.length === 0) {
     return { ok: false, reason: "missing --proposal identifier" };
@@ -165,7 +166,10 @@ export async function applyMigration(
     !snap2 || !bindings2?.valid ||
     migrationProposalId(deriveCandidates(snap2), bindings2, snap2.revision) !== proposalId;
   if (!drifted) return applied;
-  const rollback = await withFileLockAsync(lockPathFor(paths.state), 30_000, (): "rolled-back" | "absent" | "kept-foreign" => {
+  // F-20: injected for tests (a real delete cannot be forced to fail
+  // deterministically on this runtime); production passes tryUnlink.
+  const unlink = opts.unlinkFile ?? tryUnlink;
+  const rollback = await withFileLockAsync(lockPathFor(paths.state), 30_000, (): "rolled-back" | "absent" | "kept-foreign" | "rollback-failed" => {
     const live = loadApprovalStore(paths);
     if (live.state !== "initialized") return "absent"; // concurrently deleted: nothing to undo
     const ours = new Set(candidates.map((t) => `${t.lane}/${t.dshProviderId}/${t.apiProtocol}/${t.modelId}`));
@@ -173,15 +177,20 @@ export async function applyMigration(
       live.store.approvals.length === ours.size &&
       live.store.approvals.every((r) => r.source === "legacy-migration" && ours.has(`${r.lane}/${r.dshProviderId}/${r.apiProtocol}/${r.modelId}`));
     if (!same) return "kept-foreign"; // someone else wrote: keep, report, never delete
-    tryUnlink(approvalStorePathFor(paths));
+    // F-20: verify the unlink actually removed the file — a silent failure
+    // must be reported truthfully, never as "rolled back".
+    unlink(approvalStorePathFor(paths));
+    if (existsSync(approvalStorePathFor(paths))) return "rollback-failed";
     return "rolled-back";
   });
   return {
     ok: false as const,
     reason: rollback === "rolled-back"
       ? "DSH settings drifted between validation and apply; the migration was rolled back — re-run migration preview and ratify the new proposal"
-      : rollback === "absent"
-        ? "DSH settings drifted between validation and apply, and the approval store was concurrently removed — re-run migration preview and ratify the new proposal"
-        : "DSH settings drifted between validation and apply and the store no longer matches this migration; refusing to roll back foreign writes — inspect the approval store manually",
+      : rollback === "rollback-failed"
+        ? "DSH settings drifted between validation and apply, and the migration store could NOT be rolled back (delete failed; stale approvals may remain) — remove the approval store manually and re-run migration preview"
+        : rollback === "absent"
+          ? "DSH settings drifted between validation and apply, and the approval store was concurrently removed — re-run migration preview and ratify the new proposal"
+          : "DSH settings drifted between validation and apply and the store no longer matches this migration; refusing to roll back foreign writes — inspect the approval store manually",
   };
 }

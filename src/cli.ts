@@ -159,8 +159,9 @@ async function main(argv: string[]): Promise<number> {
           const force = rest.includes("--force");
           const name = rest.find((x) => x !== "--force");
           if (!name) throw new Error("usage: gorouter account remove <alias> [--force]");
-          const { removed } = domain.accountRemove(name, force);
-          console.log(`account '${removed.alias}' removed (secret blob deleted)`);
+          const { removed, secretDeleted } = domain.accountRemove(name, force);
+          // F-26: never claim "secret blob deleted" when nothing was there.
+          console.log(`account '${removed.alias}' removed` + (secretDeleted ? " (secret blob deleted)" : " (no secret blob was present — nothing left behind)"));
           return 0;
         }
         case "test": {
@@ -618,8 +619,18 @@ async function main(argv: string[]): Promise<number> {
               if (!modelId || !laneValue) throw new Error("usage: gorouter models approvals revoke --lane <go|zen> <model-id> [--json]");
               if (laneValue !== "go" && laneValue !== "zen") throw new Error("--lane must be go or zen");
               const r = await domain.approvalsRevoke(laneValue, modelId);
+              // F-21: never print bare success when nothing was revoked or the
+              // change never reached DSH (the model may still be live there).
+              if (r.removed === 0) {
+                console.error(`not approved [${laneValue}] ${modelId} — nothing to revoke`);
+                return 1;
+              }
               console.log("revoked [" + laneValue + "] " + modelId + " (entries removed: " + r.removed + ")");
               if (r.dshSync) console.log("dsh sync: outcome=" + r.dshSync.outcome + " mutation=" + r.dshSync.mutationPerformed + (r.dshSync.lastError ? " lastError=" + redact(r.dshSync.lastError) : ""));
+              if (r.dshSync && (r.dshSync.outcome === "error" || r.dshSync.reachable === false)) {
+                console.error(`revoke incomplete: DSH sync ${r.dshSync.outcome} (${redact(r.dshSync.lastError ?? "DSH unreachable")}) — the model may still be active in DSH; re-run sync when DSH is reachable`);
+                return 1;
+              }
               return 0;
             }
             case "migrate": {

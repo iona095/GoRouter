@@ -383,7 +383,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
           // Downstream DSH reconciliation (failure-isolated, non-blocking, single-flight inside).
           try {
             const client = createDshClient();
-            const dshStatus = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(paths), expectedPort: s.settings.port }, (st) => {
+            const dshStatus = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(paths), reloadApprovalStore: () => loadApprovalStore(paths), expectedPort: s.settings.port }, (st) => {
               try { storeDshSyncStatus(paths, st); } catch {}
             });
             if (dshStatus.outcome === "current") log.info(`dsh live catalog reconciled (${dshStatus.activeGoCount ?? 0} go, ${dshStatus.activeZenCount ?? 0} zen, withheld go=${dshStatus.withheldGoCount ?? 0} zen=${dshStatus.withheldZenCount ?? 0})`);
@@ -894,7 +894,7 @@ export function createServer(deps: ServerDeps): { serve: () => void; stop: () =>
               if (result?.success && result.registry) {
                 try {
                   const client = createDshClient();
-                  const st = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(startupPaths), expectedPort: sForStartup.settings.port }, (d) => {
+                  const st = await reconcileDshCatalog(result.registry, client, { approvalStore: loadApprovalStore(startupPaths), reloadApprovalStore: () => loadApprovalStore(startupPaths), expectedPort: sForStartup.settings.port }, (d) => {
                     try { storeDshSyncStatus(startupPaths, d); } catch {}
                   });
                   if (st.outcome === "current") log.info(`dsh live catalog reconciled on startup (${st.activeGoCount ?? 0} go, ${st.activeZenCount ?? 0} zen)`);

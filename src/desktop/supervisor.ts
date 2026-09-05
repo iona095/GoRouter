@@ -68,7 +68,27 @@ const PROBE_TIMEOUT_MS = 1_500
 /** A managed child that never becomes healthy within this window is recycled
  * (e.g. the CLI changed settings.port underneath it — the child still serves
  * the old port while the supervisor probes the new one). */
-const CHILD_HEALTH_GRACE_MS = 10_000
+export const CHILD_HEALTH_GRACE_MS = 10_000
+
+/**
+ * F-03: pure recycle decision (test seam). A startup grace measured as
+ * age-since-birth degenerates into kill-on-first-failed-probe for any child
+ * older than the grace, so recycling requires EITHER sustained unhealthiness
+ * (never-healthy startup past the grace) OR repeated consecutive failures on
+ * a mature child — mirroring the healthyStreak >= 2 reset hysteresis.
+ */
+export function shouldRecycleChild(args: {
+  nowMs: number
+  childBornAtMs: number
+  unhealthySinceMs: number
+  consecutiveFailures: number
+}): boolean {
+  const age = args.childBornAtMs > 0 ? args.nowMs - args.childBornAtMs : 0
+  const unhealthyFor = args.unhealthySinceMs > 0 ? args.nowMs - args.unhealthySinceMs : 0
+  if (unhealthyFor > CHILD_HEALTH_GRACE_MS) return true
+  if (age > CHILD_HEALTH_GRACE_MS && args.consecutiveFailures >= 2) return true
+  return false
+}
 
 /** True when running as the packaged control binary (vs dev bun). The
  * router-spawn env override is honored in dev only (F-01). */
@@ -164,20 +184,44 @@ function decodeChunkedBody(body: Buffer): string {
 export function probeRouterHealth(port: number): Promise<{ ok: boolean; busy: boolean }> {
   return new Promise((resolve) => {
     let settled = false
+    // F-02: ABSOLUTE deadline + byte cap. net.connect({timeout}) is an
+    // INACTIVITY timer: a dribbling responder resets it with every byte, so
+    // without an absolute bound the probe (and the supervisor tick awaiting
+    // it) never settles and the parts buffer grows without bound.
+    const ABSOLUTE_DEADLINE_MS = PROBE_TIMEOUT_MS + 500
+    const MAX_PROBE_BYTES = 64 * 1024
+    let absolute: ReturnType<typeof setTimeout> | null = null
     const done = (ok: boolean, busy: boolean): void => {
       if (settled) return
       settled = true
+      if (absolute !== null) {
+        clearTimeout(absolute)
+        absolute = null
+      }
       resolve({ ok, busy })
     }
     const socket = net.connect({ host: '127.0.0.1', port, timeout: PROBE_TIMEOUT_MS })
+    absolute = setTimeout(() => {
+      socket.destroy()
+      done(false, true)
+    }, ABSOLUTE_DEADLINE_MS)
     socket.once('connect', () => {
       socket.write(`GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
       const parts: Buffer[] = []
+      let bytes = 0
       socket.on('data', (c) => {
         // accumulate RAW bytes: chunked sizes are byte counts, and multi-byte
         // UTF-8 characters may split across TCP segments, so decoding per
         // chunk and slicing strings by code units would corrupt the framing
-        parts.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+        const buf = Buffer.isBuffer(c) ? c : Buffer.from(c)
+        bytes += buf.length
+        if (bytes > MAX_PROBE_BYTES) {
+          // F-02: flooding responder — settle without unbounded growth.
+          socket.destroy()
+          done(false, true)
+          return
+        }
+        parts.push(buf)
       })
       socket.once('timeout', () => {
         socket.destroy()
@@ -234,6 +278,9 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
   let probeTimer: ReturnType<typeof setInterval> | null = null
   let respawnTimer: ReturnType<typeof setTimeout> | null = null
   let probing = false
+  // F-03: unhealthy-duration + consecutive-failure hysteresis state.
+  let unhealthySince = 0
+  let consecutiveFailures = 0
 
   function setState(next: RouterState): void {
     if (next === state) return
@@ -281,6 +328,9 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
     }
     child = proc
     childBornAt = Date.now()
+    // F-03: a fresh child starts with a clean failure slate.
+    unhealthySince = 0
+    consecutiveFailures = 0
     setState('starting')
     let handled = false
     proc.on('error', (err) => {
@@ -342,6 +392,9 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
         // probes); restartCount keeps the total so a brief alive-blip during
         // a crash loop cannot silently restart the backoff ladder
         healthyStreak++
+        // F-03: success clears the failure hysteresis.
+        consecutiveFailures = 0
+        unhealthySince = 0
         if (healthyStreak >= 2) {
           backoffIndex = 0
         }
@@ -349,13 +402,23 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
         return
       }
       healthyStreak = 0
+      // F-03: failure hysteresis — one bad probe never kills.
+      consecutiveFailures++
+      if (unhealthySince === 0) unhealthySince = Date.now()
       if (child) {
         // our child is alive but not healthy yet
-        if (childBornAt > 0 && Date.now() - childBornAt > CHILD_HEALTH_GRACE_MS) {
-          // never became healthy within the grace window (port drift from a
-          // CLI-side config change, or a wedged bind): recycle it so the
-          // backoff ladder respawns on the configured port
-          log.warn('managed router child not healthy within grace; recycling')
+        if (
+          shouldRecycleChild({
+            nowMs: Date.now(),
+            childBornAtMs: childBornAt,
+            unhealthySinceMs: unhealthySince,
+            consecutiveFailures,
+          })
+        ) {
+          // sustained failure (port drift from a CLI-side config change, a
+          // wedged bind, or repeated probe failures on a mature child):
+          // recycle it so the backoff ladder respawns on the configured port
+          log.warn('managed router child unhealthy; recycling')
           try {
             child.kill('SIGTERM')
           } catch {
@@ -394,6 +457,8 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
       backoffIndex = 0
       restartCount = 0
       healthyStreak = 0
+      unhealthySince = 0
+      consecutiveFailures = 0
     }
     if (probeTimer === null) {
       probeTimer = setInterval(() => {
@@ -406,6 +471,12 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
   function teardown(stopChild: boolean): void {
     started = false
     healthyStreak = 0
+    // F-02: a stranded probe must never brick supervision across a
+    // stop/restart cycle — the latch is always recoverable from here.
+    probing = false
+    // F-03: stop/restart clears the failure slate.
+    unhealthySince = 0
+    consecutiveFailures = 0
     if (probeTimer) {
       clearInterval(probeTimer)
       probeTimer = null

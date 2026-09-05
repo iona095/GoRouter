@@ -571,6 +571,25 @@ describe("migration", () => {
     expect(loadApprovalStore(paths).state).toBe("absent");
   });
 
+  test("F-20: failed rollback unlink is reported truthfully (never 'rolled back')", async () => {
+    const { paths } = freshPaths();
+    const snap = snapshotOf([makeModel("g1")], [makeModel("z1")], 2);
+    const preview = computeMigrationPreview(snap, 8787, BASE_ISO);
+    // A concurrent DSH writer lands between validation and the post-apply
+    // re-read; the rollback unlink itself silently fails (injected
+    // swallowing unlink — real deletes cannot be forced to fail
+    // deterministically on this runtime).
+    let calls = 0;
+    const drifting = async () => (++calls === 1 ? snap : snapshotOf([makeModel("g1"), makeModel("g2")], [makeModel("z1")], 3));
+    const res = await applyMigration(paths, drifting, preview.proposalId, 8787, { nowIso: BASE_ISO, unlinkFile: () => { /* delete silently failed */ } });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    // The unlink silently failed: the report must say so, not "rolled back".
+    expect(existsSync(approvalStorePathFor(paths))).toBe(true);
+    expect(res.reason).toMatch(/could NOT be rolled back|rollback failed/i);
+    expect(res.reason).not.toMatch(/was rolled back/);
+  });
+
   test("apply refuses when store exists in any state", async () => {
     const snap = snapshotOf([makeModel("g1")], [makeModel("z1")], 2);
     const id = computeMigrationPreview(snap, 8787, BASE_ISO).proposalId;

@@ -146,14 +146,55 @@ public sealed class ControlClient : IControlChannel
     public ShellSnapshot? Snapshot { get; private set; }
     public string? LastError { get; private set; }
     public ClientState State => _state;
+    /// <summary>F-08: isolated subscriber failures since construction.</summary>
+    public int SubscriberErrors { get; private set; }
 
     public event Action<ShellSnapshot>? SnapshotReceived;
     public event Action<ClientState>? StateChanged;
+
+    // F-08: UI context captured at construction (DesktopApp builds the
+    // client on the STA thread after ApplicationConfiguration.Initialize).
+    // Events raised on the pipe read-loop thread are Posted here so tray and
+    // form mutation happen on the UI thread. Null in headless/selftest use.
+    private readonly SynchronizationContext? _uiContext;
 
     public ControlClient(string pipeName, Func<string?> tokenProvider)
     {
         _pipeName = StripPipePrefix(pipeName);
         _tokenProvider = tokenProvider;
+        _uiContext = SynchronizationContext.Current;
+    }
+
+    /// <summary>
+    /// F-08: marshal event delivery to the UI thread and isolate subscriber
+    /// failures per delegate — one throwing subscriber must neither skip the
+    /// rest nor tear down the transport (the read loop used to die on any
+    /// subscriber exception). Failures are counted for observability.
+    /// </summary>
+    private void Emit<T>(Action<T>? evt, T arg)
+    {
+        if (evt is null) return;
+        if (_uiContext is not null && !ReferenceEquals(SynchronizationContext.Current, _uiContext))
+        {
+            _uiContext.Post(_ => InvokeIsolated(evt, arg), null);
+            return;
+        }
+        InvokeIsolated(evt, arg);
+    }
+
+    private void InvokeIsolated<T>(Action<T> evt, T arg)
+    {
+        foreach (var sub in evt.GetInvocationList())
+        {
+            try
+            {
+                ((Action<T>)sub)(arg);
+            }
+            catch (Exception)
+            {
+                SubscriberErrors++;
+            }
+        }
     }
 
     /// <summary>Resets the client for a fresh connect attempt (Retry path).</summary>
@@ -194,6 +235,16 @@ public sealed class ControlClient : IControlChannel
         catch
         {
             pipe.Dispose();
+            return false;
+        }
+
+        // F-01: the pipe name is not a capability — whoever answered must
+        // prove it is the legitimate control service BEFORE the admin token
+        // (frame 1, hello) is written. No bytes are sent before this passes.
+        if (!PipeServerIdentity.Verify(pipe.SafePipeHandle, out var identityError))
+        {
+            pipe.Dispose();
+            FailAuth("Control service identity check failed: " + identityError);
             return false;
         }
 
@@ -452,7 +503,7 @@ public sealed class ControlClient : IControlChannel
                 if (snapshot is not null)
                 {
                     Snapshot = snapshot;
-                    SnapshotReceived?.Invoke(snapshot);
+                    Emit(SnapshotReceived, snapshot);
                 }
             }
 
@@ -671,7 +722,7 @@ public sealed class ControlClient : IControlChannel
 
         if (changed)
         {
-            StateChanged?.Invoke(state);
+            Emit(StateChanged, state);
         }
     }
 

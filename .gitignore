@@ -19,6 +19,12 @@ handoffs/
 secrets/
 state.json
 desktop.json
+# Runtime lock strays (state-dir locks are dotfiles, but a crash can
+# leave one in the repo). F-14: this MUST NOT swallow the package lockfile.
 *.lock
+!bun.lock
+# npm is not a supported install path (bun is canonical): never track npm's
+# lockfile — the stale copy was deleted in R2 (it predates the yaml dep).
+package-lock.json
 .env
 .env.*

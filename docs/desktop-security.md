@@ -55,8 +55,7 @@ O:<user> G:<group> D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;<user SID>)
 i.e. SYSTEM + Administrators + the current user, full access only. Verified
 before/after SDDL readback (Everyone/Anonymous ACEs removed) and covered by
 a regression test (`test/control.test.ts` "control pipe DACL is hardened").
-The pipe name embeds the user SID, so a second local user cannot even
-address the same pipe name. Hardening failure is non-fatal and logged
+Hardening failure is non-fatal and logged
 (token auth remains the primary authorization boundary).
 
 ## §17.3 — Cross-origin/browser invocation of privileged local actions

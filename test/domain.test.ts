@@ -97,6 +97,27 @@ describe("domain mutations apply exactly once", () => {
     expect(domain.accountList()[0]!.alias).toBe("beta");
   });
 
+  test("F-26: remove reports whether the secret blob was actually deleted", () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "gorouter-domain-"));
+    dirs.push(stateDir);
+    const paths = resolvePaths(stateDir);
+    ensureStateDirs(paths);
+    const secrets = memSecrets();
+    const domain = createDomain(paths, secrets);
+    domain.setup();
+    domain.accountAdd("alpha", "sk-one");
+    domain.accountAdd("beta", "sk-two");
+    const refs = (JSON.parse(readFileSync(join(stateDir, "state.json"), "utf8")) as { accounts: { alias: string; secretRef: string }[] }).accounts;
+    // beta's blob vanishes out-of-band (operator deleted the DPAPI entry):
+    // the removal must say so instead of claiming "secret blob deleted".
+    secrets.delete(refs.find((a) => a.alias === "beta")!.secretRef);
+    const normal = domain.accountRemove("alpha", false);
+    expect(normal.secretDeleted).toBe(true);
+    const missing = domain.accountRemove("beta", false);
+    expect(missing.secretDeleted).toBe(false);
+    expect(domain.accountList().length).toBe(0);
+  });
+
   test("remove without force refuses a routed account and leaves state intact", () => {
     const { domain } = fresh();
     domain.setup();

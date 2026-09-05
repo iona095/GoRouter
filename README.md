@@ -41,7 +41,7 @@ Contract: `gorouter-v1-long-horizon-r4` (see `Notes/OpenCode_GoRouter_V1_Long_Ho
   credential strip, deferred WAL checkpoint, UI dirty-checks and
   activity-render throttling. No behavior change; gains are per-request
   µs-to-ms and per-tick connection/scan elimination.
-- **Quality gates (all passing)** — `bun test`: 475 tests across 21
+- **Quality gates (all passing)** — `bun test`: 535 tests across 30
   files, 0 failures; `bun run typecheck` clean; desktop shell Release
   build with 0 errors.
 - **Adversarial review (closed)** — hostile read-only review loops over
@@ -209,7 +209,10 @@ request ids. It **never** stores prompts, responses, Authorization values,
 keys, cookies or arbitrary headers. `model` is always `unknown` in V1 — no
 body parsing for telemetry. Retention is bounded (default 30 days / 100k
 records; `config set journalRetentionDays|journalMaxRecords`). Journal faults
-degrade observably in `/healthz` and never block routing.
+never block routing. Journal health is observable via `gorouter journal stats`
+(and `status`); `/healthz` stays a minimal static liveness probe by design
+(CURRENT-007: status + version only, so unauthenticated callers can never
+observe routes, aliases, journal content or secrets).
 
 ## Safety model
 
