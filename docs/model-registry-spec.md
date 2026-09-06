@@ -11,7 +11,7 @@ Dynamic registry of upstream model catalogs (Go + Zen) that is refreshed periodi
 - Persists under existing state dir via existing helpers (`src/paths.ts`):
   - Extend `Paths` with `modelsRegistryJson: join(state, "models-registry.json")` and `modelsDiffJson: join(state, "models-diff.json")` (or single file + inline diff). Preferred: single file `models-registry.json`; diff computed on demand from prev vs curr snapshot kept in same file as `lastDiff`. To avoid churn pick: registry file holds `go` and `zen` snapshots + `updatedAtUtc` + `lastAttempt` per lane + `lastDiff`.
   - If extending Paths is undesirable for review churn, registry module computes path as `join(paths.state, "models-registry.json")`. Either satisfies "using existing helpers" — use the join pattern that `paths.stateJson` already demonstrates.
-- All writes via `atomicWriteJson` (src/util.ts) — temp+fsync+rename — so concurrent readers (server, CLI) never see half-written JSON. Schema validation on load; corrupt file => treat as no-registry (recoverable), log via `log.warn`, do not throw.
+- All writes via `atomicWriteJson` (src/util.ts) — temp+fsync+rename — so concurrent readers (server, CLI) never see half-written JSON. Schema validation on load; corrupt file => treat as no-registry (recoverable), log via `log.warn`, do not throw. R4-C01: a well-formed file whose `schemaVersion` is a number other than ours is a *future* registry, not corruption — refresh (forced or startup) fails closed before fetch/publish and never overwrites it.
 
 ## 3. Schema
 ```ts
@@ -64,7 +64,7 @@ Upstream shape (both lanes): `GET {upstream}/models` -> `{ object:"list", data: 
 - No retry inside fetcher; caller decides cooldown.
 
 ## 6. Registry I/O (src/models/registry.ts)
-- `loadRegistry(paths) => RegistryFile | null` — existsSync check, readFileSync+JSON.parse, validate shape, fail to null on corrupt (caller treats as no-registry).
+- `loadRegistry(paths) => RegistryFile | null` — existsSync check, readFileSync+JSON.parse, validate shape, fail to null on corrupt (caller treats as no-registry). `peekRegistry` additionally reports `unsupportedVersion` for future-schema files (R4-C01) so status/refresh can distinguish them from corruption.
 - `storeRegistry(paths, file) => void` — atomicWriteJson(registryPath, file).
 - `registryAgeMs(file, nowMs) => number` — now - Date.parse(updatedAtUtc) (or max of lane fetchedAt).
 - `isFresh(file, nowMs) => boolean` — age < TTL.

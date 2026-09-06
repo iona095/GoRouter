@@ -48,7 +48,12 @@ accounts are supported; the immediate scenario uses two.
     120 s absolute upload deadline — and never reach upstream dispatch.
     Every application-level pre-dispatch reject that reaches GoRouter's
     request callback (admission, framing, over-budget) mints a journal row
-    and echoes its id as `X-Gorouter-Request-Id`. Parser-level Bun
+    and echoes its id as `X-Gorouter-Request-Id`. R4-C03 extends the same
+    contract past admission: post-admission application-level local rejects
+    (empty lane suffix, malformed path, post-admission credential race)
+    each mint exactly one `local_error` row with its request id, still with
+    zero upstream dispatch; paths that already journal (dispatch auth/route
+    errors, authority/namespace rejects) are unchanged. Parser-level Bun
     rejections (malformed request line, TE+Content-Length conflicts)
     occur before the application and cannot be journaled. Each reject answers
     with `Connection: close` and destroys the socket after flush, severing
@@ -73,7 +78,9 @@ accounts are supported; the immediate scenario uses two.
    the raw query is byte-preserved (GR-008: no parse-and-reserialize, so
    `%20` vs `+`, bare keys, duplicate order and malformed escapes survive)
    — only a pair carrying the local credential is dropped, and only that
-   pair; local/hop-by-hop headers stripped; the selected account key is
+   pair. Detection (never forwarding) tolerantly decodes valid `%HH` runs
+   (R4-002), so a malformed escape elsewhere in a pair can never mask an
+   encoded credential; local/hop-by-hop headers stripped; the selected account key is
    injected into the **endpoint-family-appropriate header** (validated
    against the current OpenCode gateway surface: `authorization: Bearer`
    for chat/completions and responses, `x-api-key` for /messages,
