@@ -62,17 +62,18 @@ describe("corrupt state quarantine (F-19)", () => {
     expect(store.health()).toEqual({ corrupt: false, unsupportedSchemaVersion: null });
   });
 
-  test("same-process delete+setup repairs: missing file heals the flag (B0)", () => {
+  test("same-process delete+setup repairs: explicit repair heals the latch (B0/R4-003)", () => {
     const { dir, stateJson } = freshStateDir();
     writeFileSync(stateJson, "{corrupt");
     const paths = resolvePaths(dir);
     const store = createStateStore(paths, memSecrets());
     store.read(); // quarantine moves the only copy away; file now absent
     expect(existsSync(stateJson)).toBe(false);
-    // The operator follows the refusal message (nothing left to delete — the
-    // quarantine already moved it): the next read finds no file, clears the
-    // flag, and setup-grade mutations work WITHOUT a process restart.
+    // R4-003: reads alone must NOT self-clear the latch — explicit repair
+    // (domain.setup path) heals WITHOUT a process restart.
     store.read();
+    expect(store.health()).toEqual({ corrupt: true, unsupportedSchemaVersion: null });
+    store.acknowledgeCorruptRepair();
     expect(store.health()).toEqual({ corrupt: false, unsupportedSchemaVersion: null });
     store.mutate((s) => { s.settings.port = 9999; });
     expect(existsSync(stateJson)).toBe(true);

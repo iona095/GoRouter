@@ -8,7 +8,7 @@ import { isLockHolderAlive } from "../lock.ts";
 import type { Paths } from "../paths.ts";
 import type { Lane } from "../state.ts";
 import { MODELS_SCHEMA_VERSION, MODELS_TTL_MS, MODELS_COOLDOWN_MS, type RegistryFile, type AttemptInfo } from "./types.ts";
-import { loadRegistry, storeRegistry, isFresh, isCooldown, registryAgeMs, emptyRegistryFile } from "./registry.ts";
+import { loadRegistry, peekRegistry, storeRegistry, isFresh, isCooldown, registryAgeMs, emptyRegistryFile } from "./registry.ts";
 import { fetchLane, type FetchFn } from "./fetcher.ts";
 import { computeDiff } from "./diff.ts";
 
@@ -48,7 +48,12 @@ const REFRESH_CLAIM_STALE_MS = 120_000;
 const REFRESH_WAIT_MS = 45_000;
 const REFRESH_WAIT_POLL_MS = 250;
 
-function tryClaimRefreshLock(lockPath: string): string | null {
+/**
+ * R4-C02 test seam: `onStaleDecision` runs between the stale-claim decision
+ * and the reclaim unlink, so a deterministic test can replace the lock with
+ * a successor claim and prove whether it survives. Production passes none.
+ */
+export function tryClaimRefreshLock(lockPath: string, hooks?: { onStaleDecision?: () => void }): string | null {
   const claim = JSON.stringify({ pid: process.pid, ts: Date.now(), nonce: randomUUID() });
   try {
     const fd = openSync(lockPath, "wx");
@@ -68,8 +73,25 @@ function tryClaimRefreshLock(lockPath: string): string | null {
   // wedge the catalog forever. Double-fetch is the bounded, safe fallout.
   try {
     const st = statSync(lockPath);
+    // R4-C02: capture the observed claim identity BEFORE the stale decision
+    // so the reclaim below can refuse to delete a successor that replaced
+    // it in between (TOCTOU). Bytes catch nonce changes even when the
+    // replacement lands in the same mtime tick/size; the stat sig covers
+    // malformed/unreadable claims per the prompt (stable file identity).
+    let observedBytes: string | null = null;
+    try { observedBytes = readFileSync(lockPath, "utf8"); } catch { observedBytes = null; }
+    const observedSig = `${st.ino}:${st.mtimeMs}:${st.size}`;
     const ageMs = Date.now() - st.mtimeMs;
     if ((!isLockHolderAlive(lockPath) && ageMs > 10_000) || ageMs > REFRESH_CLAIM_STALE_MS) {
+      hooks?.onStaleDecision?.();
+      // Re-verify the path still represents the SAME observed stale claim;
+      // a changed nonce/identity means a successor owns it now — do not
+      // unlink, retry acquisition normally (return held this round).
+      try {
+        const st2 = statSync(lockPath);
+        if (`${st2.ino}:${st2.mtimeMs}:${st2.size}` !== observedSig) return null;
+        if (observedBytes !== null && readFileSync(lockPath, "utf8") !== observedBytes) return null;
+      } catch { return null; }
       try { unlinkSync(lockPath); } catch { /* raced */ }
       return tryClaimRefreshLock(lockPath);
     }
@@ -144,6 +166,15 @@ export async function refreshRegistry(paths: Paths, opts: RefreshOptions): Promi
   const existing = inFlight.get(key);
   if (existing) return existing;
   const p = (async (): Promise<RefreshResult> => {
+    // R4-C01 compatibility gate: a future-schema registry is neither corrupt
+    // nor absent. Fail closed BEFORE provider fetch/publish so an old binary
+    // can never overwrite it — forced refresh does not override the gate.
+    const gate = peekRegistry(paths);
+    if (gate.unsupportedVersion !== null) {
+      const msg = `models registry has unsupported schema version ${gate.unsupportedVersion} (this binary supports version ${MODELS_SCHEMA_VERSION}); upgrade GoRouter — refusing to refresh or overwrite`;
+      log.warn(msg);
+      return { success: false, registry: null, error: msg, fromCache: false, diff: [] };
+    }
     const lockPath = refreshLockPath(paths);
     let nonce: string | null = null;
     // R3-008: a non-EEXIST claim throw (EACCES/ENOSPC/EROFS/...) is a local

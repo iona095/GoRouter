@@ -358,7 +358,12 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
   let healthyStreak = 0
   let probeTimer: ReturnType<typeof setInterval> | null = null
   let respawnTimer: ReturnType<typeof setTimeout> | null = null
-  let probing = false
+  // R4-004 lifecycle generation: every start/teardown invalidates prior
+  // probes. tick() captures its generation and discards stale results;
+  // probingGeneration is the active probe latch (null = idle) so an old
+  // finally can never clear the new generation latch.
+  let generation = 0
+  let probingGeneration: number | null = null
   // F-03: unhealthy-duration + consecutive-failure hysteresis state.
   let unhealthySince = 0
   let consecutiveFailures = 0
@@ -457,11 +462,15 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
   }
 
   async function tick(): Promise<void> {
-    if (probing || !started) return
-    probing = true
+    if (probingGeneration !== null || !started) return
+    const myGeneration = generation
+    probingGeneration = myGeneration
     try {
       const port = opts.port()
       const probe = await probeRouterHealth(port, { localCredential: opts.localCredential })
+      // R4-004: a pre-restart probe resolving after restart must not mutate
+      // the new generation. Check BEFORE any shared-state mutation.
+      if (myGeneration !== generation) return
       if (!started) return
       if (probe.ok) {
         // healthy router on the port: ours (managed) or external (attached)
@@ -524,7 +533,9 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
       }
       spawnChild()
     } finally {
-      probing = false
+      // R4-004: only the owning generation clears the latch — an old
+      // finally resolving after restart preserves the new probe latch.
+      if (probingGeneration === myGeneration) probingGeneration = null
     }
   }
 
@@ -533,6 +544,8 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
     // a manual start from that state is a fresh attempt, so resume.
     const fromFailed = started && state === 'failed'
     if (started && !fromFailed) return
+    // R4-004: entering a new lifecycle invalidates in-flight probes.
+    generation++
     started = true
     if (fromFailed || backoffIndex >= backoff.length) {
       backoffIndex = 0
@@ -550,11 +563,15 @@ export function createRouterSupervisor(opts: RouterSupervisorOptions): RouterSup
   }
 
   async function teardown(stopChild: boolean): Promise<void> {
+    // R4-004: leaving the lifecycle invalidates in-flight probes.
+    generation++
     started = false
     healthyStreak = 0
     // F-02: a stranded probe must never brick supervision across a
     // stop/restart cycle — the latch is always recoverable from here.
-    probing = false
+    // Nulling is safe: any in-flight old tick holds myGeneration != the new
+    // generation, so its finally cannot clear a new latch (guarded above).
+    probingGeneration = null
     // F-03: stop/restart clears the failure slate.
     unhealthySince = 0
     consecutiveFailures = 0

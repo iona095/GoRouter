@@ -498,7 +498,17 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   function start(): void {
     if (started) return
     started = true
+    // R4-003: observe the corrupt latch before any auto-setup. A quarantined
+    // (now-absent) state must NOT be silently re-created here — explicit
+    // `setup` is the repair path. Fresh (never-corrupt) missing files still
+    // auto-setup as before.
+    const corruptAtStart = domain.status().stateCorrupt
     if (!existsSync(paths.stateJson)) {
+      if (corruptAtStart) {
+        // Adopted corrupt state quarantined away: hold the latch, preserve
+        // evidence, and leave auto-start suppressed below.
+        freshInit = false
+      } else {
       // genuinely fresh state: create it (local credential printed once)
       const { created, credential } = domain.setup()
       freshInit = created
@@ -514,6 +524,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
             log.warn(`fresh-state marker not recorded: ${e instanceof Error ? e.message : String(e)}`)
           }
         }
+      }
       }
     } else {
       // adopted state: never silently rotate a missing/corrupt local
@@ -562,7 +573,11 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     // state in the snapshot instead.
     // domain.status() re-reads the store; the gate intentionally observes the
     // on-disk version at start rather than a cached view.
-    if (!firstRunNow() && !desktop.corrupt() && domain.status().stateUnsupportedVersion === null && desktop.unsupportedVersion() === null) supervisor.start()
+    // R4-003: stateCorrupt suppresses auto-start like the schema gates — a
+    // supervised child would serve defaults with no credential ref and climb
+    // the backoff ladder. Manual router.start is unchanged.
+    const gate = domain.status()
+    if (!firstRunNow() && !desktop.corrupt() && gate.stateUnsupportedVersion === null && desktop.unsupportedVersion() === null && gate.stateCorrupt !== true) supervisor.start()
     if (pollTimer === null) {
       pollTimer = setInterval(poll, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS)
     }

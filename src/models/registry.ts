@@ -73,6 +73,18 @@ export function emptyRegistryFile(nowIso: string = new Date().toISOString()): Re
   };
 }
 
+export interface RegistryPeek {
+  exists: boolean;
+  corrupt: boolean;
+  file: RegistryFile | null;
+  /**
+   * R4-C01: on-disk schema version when it is a number but not ours.
+   * A future registry is NOT corrupt/absent — refresh must fail closed
+   * without fetching or overwriting, and status must not report corrupt.
+   */
+  unsupportedVersion: number | null;
+}
+
 export function loadRegistry(paths: Paths): RegistryFile | null {
   const r = peekRegistry(paths);
   return r.file;
@@ -83,13 +95,13 @@ export function loadRegistry(paths: Paths): RegistryFile | null {
 // dirs); absent files are never cached so creation is observed immediately.
 // CURRENT-010: identity includes ino (atomic registry replaces mint a new
 // file identity — same-size/same-tick replacements never false-hit).
-let peekCache: { path: string; mtimeMs: number; size: number; ino: number; result: { exists: boolean; corrupt: boolean; file: RegistryFile | null } } | null = null;
+let peekCache: { path: string; mtimeMs: number; size: number; ino: number; result: RegistryPeek } | null = null;
 
-export function peekRegistry(paths: Paths): { exists: boolean; corrupt: boolean; file: RegistryFile | null } {
+export function peekRegistry(paths: Paths): RegistryPeek {
   const p = registryPathFor(paths);
   if (!existsSync(p)) {
     if (peekCache?.path === p) peekCache = null;
-    return { exists: false, corrupt: false, file: null };
+    return { exists: false, corrupt: false, file: null, unsupportedVersion: null };
   }
   let sig: { mtimeMs: number; size: number; ino: number };
   try {
@@ -97,7 +109,7 @@ export function peekRegistry(paths: Paths): { exists: boolean; corrupt: boolean;
     sig = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino };
   } catch {
     if (peekCache?.path === p) peekCache = null;
-    return { exists: false, corrupt: false, file: null };
+    return { exists: false, corrupt: false, file: null, unsupportedVersion: null };
   }
   if (peekCache && peekCache.path === p && peekCache.mtimeMs === sig.mtimeMs && peekCache.size === sig.size && peekCache.ino === sig.ino) {
     return peekCache.result;
@@ -107,27 +119,34 @@ export function peekRegistry(paths: Paths): { exists: boolean; corrupt: boolean;
   return result;
 }
 
-function peekRegistryUncached(p: string): { exists: boolean; corrupt: boolean; file: RegistryFile | null } {
+function peekRegistryUncached(p: string): RegistryPeek {
   let raw: string;
   try {
     raw = readFileSync(p, "utf8");
   } catch (e) {
     log.warn(`models registry read failed: ${e instanceof Error ? e.message : String(e)}`);
-    return { exists: true, corrupt: true, file: null };
+    return { exists: true, corrupt: true, file: null, unsupportedVersion: null };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     log.warn("models registry JSON corrupt; treating as absent");
-    return { exists: true, corrupt: true, file: null };
+    return { exists: true, corrupt: true, file: null, unsupportedVersion: null };
+  }
+  // R4-C01: distinguish a future schema version from ordinary corruption.
+  // An old binary must never treat it as corrupt/absent and overwrite it.
+  const onDiskVersion = (parsed as { schemaVersion?: unknown }).schemaVersion;
+  if (typeof onDiskVersion === "number" && onDiskVersion !== MODELS_SCHEMA_VERSION) {
+    log.warn(`models registry has unsupported schema version ${onDiskVersion} (this binary supports v${MODELS_SCHEMA_VERSION}); treating as future, never overwriting`);
+    return { exists: true, corrupt: false, file: null, unsupportedVersion: onDiskVersion };
   }
   const v = validateRegistryFile(parsed);
   if (!v) {
     log.warn("models registry schema invalid; treating as absent");
-    return { exists: true, corrupt: true, file: null };
+    return { exists: true, corrupt: true, file: null, unsupportedVersion: null };
   }
-  return { exists: true, corrupt: false, file: v };
+  return { exists: true, corrupt: false, file: v, unsupportedVersion: null };
 }
 
 export function storeRegistry(paths: Paths, file: RegistryFile): void {

@@ -172,7 +172,7 @@ describe("lane path namespace enforcement (F-01)", () => {
     upstream.stop();
   });
 
-  test("literal double-slash suffix is rejected before dispatch (no journal, no upstream)", async () => {
+  test("literal double-slash suffix is rejected before dispatch (journaled R4-C03, no upstream)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({
       upstreamBase: upstream.baseUrl,
@@ -184,7 +184,12 @@ describe("lane path namespace enforcement (F-01)", () => {
     const res = await rawGet(router.server.port(), "/go/v1//x");
     expect(res.status).toBe(400);
     expect(upstream.requests.length).toBe(0);
-    expect(readJournalRows(router.paths.journalDb).length).toBe(0);
+    // R4-C03: post-admission local rejects carry the journal/request-id
+    // contract (exactly one local_error row), still with zero upstream.
+    const rows = readJournalRows(router.paths.journalDb);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.terminal_outcome).toBe("local_error");
+    expect(rows[0]!.http_status).toBe(400);
     upstream.stop();
   });
 

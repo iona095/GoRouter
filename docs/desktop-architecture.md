@@ -216,9 +216,13 @@ not ours.
   message explains the desktop never stops a router it did not start.
 - No per-request notification spam: the tray shows aggregate router state
   only; per-request completion notifications are prohibited as default UX.
-- A corrupt `state.json` fails closed to V1 defaults (port 8787, loopback,
-  OpenCode upstreams); `snapshot.stateCorrupt` surfaces the condition and
-  the supervisor re-binds the default port after a state reset/repair.
+- A corrupt `state.json` is quarantined to `state.json.corrupt-*` evidence and
+  fails closed to V1 defaults (port 8787, loopback, OpenCode upstreams);
+  `snapshot.stateCorrupt` stays latched until explicit repair (R4-003) and
+  suppresses supervisor auto-start while latched. Explicit `gorouter setup`
+  (absent file) or a restored valid supported file clears the latch without
+  a process restart; the supervisor re-binds the default port only after
+  that explicit repair.
   Schema compatibility is gated the same way (GR-004): a `state.json` or
   `desktop.json` with an unrecognized `schemaVersion`, or a `journal.db`
   stamped with a non-v1 user version, refuses writes and serves safe

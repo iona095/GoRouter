@@ -260,13 +260,37 @@ export function stripCredentialFromQuery(search: string, secret: string): { sear
   return { search: kept.length > 0 ? `?${kept.join("&")}` : "", stripped };
 }
 
-/** True when the raw pair decodes (query "+" = space) to a secret carrier. */
+/**
+ * R4-002: tolerant detection. True when the raw pair carries the secret
+ * after decoding valid %HH runs (query "+" = space), leaving malformed
+ * escapes opaque/literal for detection. Forwarding stays byte-preserving —
+ * this decodes for DETECTION ONLY. A malformed "%zz" must never prove the
+ * pair safe: an ordinary upstream URL parser still decodes the valid runs
+ * and reconstructs the credential.
+ */
 function decodeIncludes(pair: string, secret: string): boolean {
+  if (!secret) return false;
+  if (pair.includes(secret)) return true;
+  const plus = pair.replace(/\+/g, " ");
+  if (plus.includes(secret)) return true;
+  return tolerantDecodeIncludes(plus, secret);
+}
+
+function tolerantDecodeIncludes(s: string, secret: string): boolean {
+  // Shield malformed "%" (not followed by 2 hex) so valid runs still decode.
+  const PH = "\u0000";
+  const shielded = s.replace(/%(?![0-9a-f]{2})/gi, PH);
   try {
-    return decodeURIComponent(pair.replace(/\+/g, " ")).includes(secret);
+    if (decodeURIComponent(shielded).replaceAll(PH, "%").includes(secret)) return true;
   } catch {
-    return false; // malformed escapes are opaque — kept verbatim, never matched
+    // Invalid UTF-8 byte runs (e.g. lone %FF) throw — fall through to the
+    // byte-wise scan below, which never throws and covers ASCII secrets.
   }
+  // Byte-wise fallback: decode each valid %HH to its byte char, keep
+  // malformed escapes literal. Covers ASCII credentials (base64url local
+  // keys) even inside non-UTF8 byte runs.
+  const bytewise = s.replace(/%([0-9a-f]{2})/gi, (_, hh: string) => String.fromCharCode(parseInt(hh, 16)));
+  return bytewise.includes(secret);
 }
 
 export function isPathWithinLaneBase(finalPathname: string, basePathname: string): boolean {
@@ -374,6 +398,41 @@ export function wrapBodyWithFinalize(
 export function createServer(deps: ServerDeps): { serve: () => Promise<number>; stop: () => void; port: () => number } {
   let server: Server | null = null;
 
+  /**
+   * R4-C03: one narrow helper for application-level local rejects that occur
+   * AFTER inbound admission (so inbound journalReject never saw them). Mints
+   * exactly one journal row (terminalOutcome local_error), attaches the
+   * request id, never logs secrets, never dispatches upstream. Callers must
+   * use it only for paths that do not already journal (dispatch 401, route
+   * errors, authority/namespace rejects and inbound journalReject stay as-is
+   * to avoid double-journaling).
+   */
+  function rejectAppLocal(
+    req: Request,
+    lane: Lane | "unknown",
+    endpointFamily: string,
+    status: number,
+    type: string,
+    message: string,
+  ): Response {
+    const entry = deps.journal.begin({
+      lane,
+      selectedAccountId: null,
+      selectedAccountAliasSnapshot: null,
+      method: req.method,
+      endpointFamily,
+      terminalOutcome: "local_error",
+      httpStatus: status,
+      upstreamRequestIds: [],
+      model: null,
+      clientCorrelationId: validateCorrelationId(req.headers.get("x-gorouter-correlation-id")) ?? null,
+    });
+    deps.journal.complete(entry, { completedAtUtc: utcNow(), durationMs: 0, terminalOutcome: "local_error", httpStatus: status, upstreamRequestIds: [] });
+    const res = localError(status, type, message);
+    res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+    return res;
+  }
+
   function serveModelsCache(lane: Lane, reg: import("./models/types.ts").RegistryFile, fromCache: "hit" | "stale"): Response {
     const snap = lane === "go" ? reg.go! : reg.zen!;
     // CURRENT-004: cycle-safe (byte-identical for plain registry data).
@@ -397,7 +456,9 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       localCred = deps.state.localCredential();
     } catch (e) {
       log.error(`local credential unavailable: ${e instanceof Error ? e.message : e}`);
-      return localError(503, "GoRouterCredentialError", "local router credential is not configured; run `gorouter setup`");
+      // R4-C03: post-admission credential race — journaled like every other
+      // local failure (admission already passed, so journalReject never ran).
+      return rejectAppLocal(req, lane, "models", 503, "GoRouterCredentialError", "local router credential is not configured; run `gorouter setup`");
     }
     if (!validateLocalAuth(req, localCred)) {
       const entry = deps.journal.begin({
@@ -547,7 +608,9 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       localCred = deps.state.localCredential();
     } catch (e) {
       log.error(`local credential unavailable: ${e instanceof Error ? e.message : e}`);
-      return localError(503, "GoRouterCredentialError", "local router credential is not configured; run `gorouter setup`");
+      // R4-C03: post-admission credential race — mint the row here (admission
+      // already passed, so journalReject never ran); zero upstream dispatch.
+      return rejectAppLocal(req, lane, classifyEndpointFamily(suffix), 503, "GoRouterCredentialError", "local router credential is not configured; run `gorouter setup`");
     }
     if (!validateLocalAuth(req, localCred)) {
       // Auth failures get the same traceable journal row + request id as every
@@ -891,16 +954,22 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       }
     }
     if (!lane) {
-      return localError(404, "GoRouterRouteError", "unsupported local path; use /go/v1/* or /zen/v1/*");
+      // R4-C03: normally unreachable via HTTP (admission 404s with its own
+      // journal row first), but journaled here for direct-handler parity —
+      // exactly one row either way, never double (admission never calls us).
+      return rejectAppLocal(req, "unknown", "unknown", 404, "GoRouterRouteError", "unsupported local path; use /go/v1/* or /zen/v1/*");
     }
     if (suffix === "/models") {
       return handleModels(lane, suffix, req);
     }
     if (suffix.length === 0) {
-      return localError(404, "GoRouterRouteError", "unsupported local path; expected /go/v1/<path> or /zen/v1/<path>");
+      // R4-C03: reachable post-admission (admission passes bare /go/v1 with
+      // valid auth) — must carry the request-id/journal contract.
+      return rejectAppLocal(req, lane, "unknown", 404, "GoRouterRouteError", "unsupported local path; expected /go/v1/<path> or /zen/v1/<path>");
     }
     if (suffix.includes("//") || suffix.includes("\\")) {
-      return localError(400, "GoRouterRouteError", "malformed local path");
+      // R4-C03: reachable post-admission — journaled, zero upstream dispatch.
+      return rejectAppLocal(req, lane, classifyEndpointFamily(suffix), 400, "GoRouterRouteError", "malformed local path");
     }
     // fail closed on malformed percent-escapes (e.g. %zz) before dispatch;
     // encoded traversal content itself is rejected at dispatch with a journal row
@@ -912,7 +981,10 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       try {
         decodedSuffix = decodeURIComponent(decodedSuffix);
       } catch {
-        return localError(400, "GoRouterRouteError", "malformed local path");
+        // R4-C03: journaled for parity (inbound raw-target validation
+        // normally intercepts %zz first with its own row; this covers any
+        // admission/handler skew with exactly one row).
+        return rejectAppLocal(req, lane, "unknown", 400, "GoRouterRouteError", "malformed local path");
       }
     }
     return dispatch(lane, suffix, url.search, req);

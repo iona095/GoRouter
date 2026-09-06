@@ -231,6 +231,14 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       try {
         credential = state.localCredential();
       } catch {
+        // R4-003 option B: an explicit setup invocation is the documented
+        // repair. When the corrupt source is gone (quarantined away or
+        // deleted), acknowledge the latch so re-setup can proceed
+        // without a process restart. A still-present corrupt file stays
+        // fail-closed (acknowledge re-evaluates it via load()).
+        if (!existsSync(paths.stateJson) && state.health().corrupt) {
+          state.acknowledgeCorruptRepair();
+        }
         const cred = generateLocalCredential();
         credential = cred;
         const ref = newRef();
@@ -552,6 +560,9 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
       const reg = peek.file;
       const dshSync = loadDshSyncStatus(paths);
       if (!reg) {
+        // R4-C01: a future registry is neither corrupt nor retry-eligible —
+        // refresh fails closed with an upgrade message (no fetch/overwrite).
+        const future = peek.unsupportedVersion !== null && peek.unsupportedVersion !== undefined ? peek.unsupportedVersion : null;
         return {
           exists: peek.exists,
           corrupt: peek.corrupt,
@@ -563,7 +574,7 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
           isFresh: null,
           isCooldown: false,
           cooldownRemainingMs: 0,
-          retryEligible: true,
+          retryEligible: future === null,
           counts: { go: 0, zen: 0 },
           diffSummary: { added: 0, removed: 0, changed: 0, total: 0, lastDiffAtUtc: null },
           lastAttempt: null,

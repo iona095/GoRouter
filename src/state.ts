@@ -196,6 +196,14 @@ export interface StateStore {
   /** Resolve the local client credential (for auth), or throw. */
   localCredential(): string;
   /**
+   * R4-003 explicit repair: clear the corrupt latch without a process
+   * restart. Only valid when the operator explicitly invoked recovery
+   * (e.g. `gorouter setup`) and state.json is absent (quarantined away or
+   * deliberately deleted) or a valid supported file is present (load()
+   * re-evaluates it). Never called implicitly by reads or auto-start.
+   */
+  acknowledgeCorruptRepair(): void;
+  /**
    * Store health. `unsupportedSchemaVersion` is the on-disk schema version
    * when it is not ours (GR-004): the file is served as defaults and every
    * write is refused until the operator restores a supported version.
@@ -203,11 +211,15 @@ export interface StateStore {
   health(): { corrupt: boolean; unsupportedSchemaVersion: number | null };
 }
 
-export function createStateStore(paths: Paths, secrets: SecretStore, opts: { quarantine?: typeof quarantineCorruptFile } = {}): StateStore {
+export function createStateStore(paths: Paths, secrets: SecretStore, opts: { quarantine?: typeof quarantineCorruptFile; writeJson?: typeof atomicWriteJson } = {}): StateStore {
   // Test seam (precedent: setInboundBodyIdleTimeoutForTests): inject a
   // failing quarantine to pin the refuse-while-unpreserved path, which real
   // filesystems trigger only on rare rename failures.
   const quarantineFile = opts.quarantine ?? quarantineCorruptFile;
+  // R4-001 seam: deterministic write-failure injection. Production default
+  // is the atomic writer; tests pass a throwing stub. Narrowly scoped to
+  // the state writer only.
+  const writeJson = opts.writeJson ?? atomicWriteJson;
   // CURRENT-010: identity includes ino (file index). All writers are atomic
   // renames, which mint a new file identity — so a same-size replacement in
   // the same mtime tick can never false-hit (the digest-equivalent without
@@ -262,14 +274,21 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
   function load(): StateFile {
     const p = paths.stateJson;
     if (!existsSync(p)) {
-      // Missing file heals the corrupt flag in-process: no good copy remains
-      // on disk (we quarantined it away, or the operator deleted it per the
-      // refusal message), so serving defaults and allowing re-setup is the
-      // documented repair — the same-process delete+setup path must not wedge.
-      if (corrupt) {
-        log.warn(`state.json absent; clearing corrupt flag (evidence${lastQuarantine ? ` preserved at ${lastQuarantine}` : " was never quarantined — operator reset"}); repair via setup allowed`);
-        corrupt = false;
-        lastQuarantine = null;
+      // R4-003: a missing file does NOT implicitly heal the corrupt latch
+      // when this process quarantined the only copy (lastQuarantine set) —
+      // the health signal must stay latched until explicit repair, or
+      // desktop auto-start would proceed on defaults after quarantine.
+      // Explicit recovery is domain.setup() -> acknowledgeCorruptRepair(),
+      // or an externally restored valid file observed below (option A).
+      if (corrupt && lastQuarantine !== null) {
+        log.warn(`state.json absent after quarantine (evidence preserved at ${lastQuarantine}); corrupt latch held — explicit setup required`);
+        cache = null;
+      } else if (corrupt) {
+        // No quarantine evidence from this process (failed quarantine, or
+        // operator reset): still require explicit repair instead of
+        // silently serving re-setup. Failed-quarantine files that still
+        // exist never reach here (existsSync true) and stay fail-closed.
+        log.warn(`state.json absent while corrupt latch held; explicit setup required`);
         cache = null;
       }
       // GR-004: deleting the unsupported file (per the refusal message) is
@@ -328,7 +347,7 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
   function write(state: StateFile): void {
     refuseIfUnsupported();
     refuseIfCorrupt();
-    atomicWriteJson(paths.stateJson, state);
+    writeJson(paths.stateJson, state);
     cache = null; // force a fresh read next time
   }
 
@@ -336,12 +355,17 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
     read: load,
     write,
     mutate(fn) {
-      const state = load();
+      // R4-001 (SS-01): clone-on-mutate. The cached object must never be
+      // the mutation target: if the write throws, the live cache still
+      // holds the old state and a later write cannot persist the phantom.
+      // StateFile is JSON-shaped so structuredClone preserves semantics.
+      const current = load();
       refuseIfUnsupported();
       refuseIfCorrupt();
-      fn(state);
-      write(state);
-      return state;
+      const candidate = structuredClone(current);
+      fn(candidate);
+      write(candidate);
+      return candidate;
     },
     resolveSnapshot(lane) {
       const state = load();
@@ -376,6 +400,21 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       const state = load();
       if (!state.localCredentialRef) throw new Error("local client credential not configured; run `gorouter setup`");
       return secrets.get(state.localCredentialRef);
+    },
+    acknowledgeCorruptRepair() {
+      // Explicit operator recovery (R4-003 option B). Absent file: the
+      // quarantined/deleted copy is gone, so clear the latch and allow
+      // re-setup in-process. Present file: re-evaluate it — a valid
+      // supported file heals via load() (option A); a still-corrupt file
+      // stays fail-closed (failed quarantine must never clear here).
+      if (!existsSync(paths.stateJson)) {
+        if (corrupt) log.warn(`explicit corrupt repair acknowledged (evidence${lastQuarantine ? ` was at ${lastQuarantine}` : " was never quarantined"}); latch cleared`);
+        corrupt = false;
+        lastQuarantine = null;
+        cache = null;
+        return;
+      }
+      load();
     },
     health() {
       return { corrupt, unsupportedSchemaVersion: unsupportedSchema };
