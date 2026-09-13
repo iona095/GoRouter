@@ -89,6 +89,7 @@ internal sealed class DesktopApp : IDisposable
         MainForm.MinimizeToTrayChanged += OnMinimizeToTrayChanged;
 
         _tray.OpenControlCenterRequested += MainForm.ShowFromTray;
+        _tray.OpenWebControlRequested += OnWebControlRequested;
         _tray.StartRouterRequested += OnTrayStartRouter;
         _tray.StopRouterRequested += OnTrayStopRouter;
         _tray.LaneSelectRequested += OnTrayLaneSelect;
@@ -456,6 +457,30 @@ internal sealed class DesktopApp : IDisposable
         }
     }
 
+    /// <summary>
+    /// W1 warm user-facing launch: the authenticated shell asks the control
+    /// service to open Web Control. The service opens the OS default browser
+    /// itself; this handler never sees, logs, or persists the bootstrap URL.
+    /// A pre-W1 service reports web.open as unknown-op and surfaces here as
+    /// unsupported (the running service is never restarted or replaced).
+    /// </summary>
+    private async void OnWebControlRequested()
+    {
+        var webResponse = await CallAsyncSafe("web.open");
+        if (webResponse.Ok)
+        {
+            _tray.ShowBalloon("Web Control opened in your browser.", isError: false);
+        }
+        else if (string.Equals(webResponse.ErrorCode, "unsupported", StringComparison.OrdinalIgnoreCase))
+        {
+            _tray.ShowBalloon("Web Control is not supported by the running service.", isError: true);
+        }
+        else
+        {
+            _tray.ShowBalloon(webResponse.ErrorMessage ?? "Web Control could not be opened.", isError: true);
+        }
+    }
+
     private async void OnTrayStartRouter()
     {
         var response = await CallAsyncSafe("router.start");
@@ -481,9 +506,17 @@ internal sealed class DesktopApp : IDisposable
             ? null
             : _client.Snapshot?.Accounts.FirstOrDefault(a => a.Id == accountId)?.Alias ?? accountId;
 
+        // W0: reviewed snapshot values; a concurrent change surfaces as a
+        // conflict balloon and the tray never auto-retries.
+        var snap = _client.Snapshot;
+        var trayRoute = lane == "go" ? snap?.Routes.Go : snap?.Routes.Zen;
+        var trayTargetVersion = snap?.Accounts.FirstOrDefault(a => a.Id == accountId)?.Version ?? 1;
+        var trayGeneration = snap?.StateGeneration ?? "";
         var response = await CallAsyncSafe(
             accountId is null ? "route.clear" : "route.set",
-            accountId is null ? new { lane } : new { lane, accountId });
+            accountId is null
+                ? new { lane, expectedStateGeneration = trayGeneration, expectedRouteVersion = trayRoute?.Version ?? 1 }
+                : new { lane, accountId, expectedStateGeneration = trayGeneration, expectedRouteVersion = trayRoute?.Version ?? 1, expectedTargetAccountVersion = trayTargetVersion });
 
         if (response.Ok)
         {

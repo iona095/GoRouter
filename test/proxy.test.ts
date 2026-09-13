@@ -66,7 +66,7 @@ describe("local auth boundary", () => {
   test("local credential never forwarded upstream; account key injected", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(200);
     expect(upstream.requests.length).toBe(1);
     expect(upstream.requests[0]!.headers.get("authorization")).toBe("Bearer key-a1");
@@ -80,7 +80,7 @@ describe("local path routing", () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     for (const p of ["/foo/v1/models", "/go/v2/models", "/go/v1", "/"]) {
-      const res = await fetch(`${router.baseUrl}${p}`, { headers: authHeaders() });
+      const res = await fetch(`${router.baseUrl}${p}`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
       expect(res.status, p).toBe(404);
     }
     expect(upstream.requests.length).toBe(0);
@@ -90,7 +90,7 @@ describe("local path routing", () => {
   test("malformed suffix -> 400 local", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1//double`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1//double`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(400);
     upstream.stop();
   });
@@ -116,7 +116,7 @@ describe("route resolution failures fail closed", () => {
   test("no route selected -> 503, no upstream", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }] });
-    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders(), body: "{}" });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders({ "x-opencode-session": "conv-h0-1" }), body: "{}" });
     expect(res.status).toBe(503);
     expect(upstream.requests.length).toBe(0);
     upstream.stop();
@@ -129,7 +129,7 @@ describe("route resolution failures fail closed", () => {
     router.state.mutate((s) => {
       s.accounts = [];
     });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(503);
     expect(upstream.requests.length).toBe(0);
     upstream.stop();
@@ -140,7 +140,7 @@ describe("route resolution failures fail closed", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     // CURRENT-001: refs are canonical newRef values; resolve the live one from state.
     router.secrets.delete(router.state.read().accounts[0]!.secretRef);
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(500);
     expect(upstream.requests.length).toBe(0);
     upstream.stop();
@@ -154,7 +154,7 @@ describe("protocol transparency", () => {
     const body = JSON.stringify({ model: "m1", messages: [{ role: "user", content: "hello" }] });
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions?stream=true&x=1`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json", "x-custom": "abc" }),
+      headers: authHeaders({ "x-opencode-session": "conv-h0-1", "content-type": "application/json", "x-custom": "abc" }),
       body,
     });
     expect(res.status).toBe(200);
@@ -174,7 +174,7 @@ describe("protocol transparency", () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     const { rawGet } = await import("./harness.ts");
-    const res = await rawGet(router.server.port(), "/go/v1/models?x=%zz");
+    const res = await rawGet(router.server.port(), "/go/v1/models?x=%zz", { "x-opencode-session": "conv-h0-1" });
     // path-only validation: a malformed percent-escape in the QUERY is not
     // rejected (narrowing #6) — the request dispatches normally
     expect(res.status).toBe(200);
@@ -189,7 +189,7 @@ describe("protocol transparency", () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     await fetch(`${router.baseUrl}/go/v1/models`, {
-      headers: authHeaders({ connection: "keep-alive", "x-gorouter-correlation-id": "corr-1" }),
+      headers: authHeaders({ "x-opencode-session": "conv-h0-1", connection: "keep-alive", "x-gorouter-correlation-id": "corr-1" }),
     });
     const req = upstream.requests[0]!;
     expect(req.headers.get("x-gorouter-correlation-id")).toBeNull();
@@ -207,14 +207,14 @@ describe("protocol transparency", () => {
       return new Response("nope", { status: 418, headers: { "x-teapot": "1" } });
     });
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const ok = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const ok = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(ok.status).toBe(200);
     expect(ok.headers.get("x-upstream-mark")).toBe("yes");
     expect((await ok.json()) as { data: Array<{ id: string }> }).toEqual({ data: [{ id: "m" }] });
     const rid = ok.headers.get("x-gorouter-request-id");
     expect(rid).toBeTruthy();
 
-    const teapot = await fetch(`${router.baseUrl}/go/v1/teapot`, { headers: authHeaders() });
+    const teapot = await fetch(`${router.baseUrl}/go/v1/teapot`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(teapot.status).toBe(418);
     expect(teapot.headers.get("x-teapot")).toBe("1");
     expect(await teapot.text()).toBe("nope");
@@ -228,7 +228,7 @@ describe("protocol transparency", () => {
       return Response.json({ error: { type: "AuthError", message: "Invalid API key." } }, { status: 401 });
     });
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders(), body: "{}" });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders({ "x-opencode-session": "conv-h0-1" }), body: "{}" });
     expect(res.status).toBe(401);
     expect(calls).toBe(1);
     const body = (await res.json()) as { error: { type: string } };
@@ -241,7 +241,7 @@ describe("protocol transparency", () => {
     const port = upstream.port;
     upstream.stop();
     const router = await newRouter({ upstreamBase: `http://127.0.0.1:${port}`, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(502);
     const rows = readJournalRows(router.paths.journalDb);
     expect(rows.length).toBe(1);
@@ -252,7 +252,7 @@ describe("protocol transparency", () => {
   test("redirects are not followed (3xx passed through)", async () => {
     const upstream = await startMockUpstream(() => new Response(null, { status: 302, headers: { location: "https://evil.example.com/steal" } }));
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/redirect-me`, { headers: authHeaders(), redirect: "manual" });
+    const res = await fetch(`${router.baseUrl}/go/v1/redirect-me`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }), redirect: "manual" });
     expect(res.status).toBe(302);
     expect(res.headers.get("location")).toBe("https://evil.example.com/steal");
     upstream.stop();
@@ -262,7 +262,7 @@ describe("protocol transparency", () => {
     const upstream = await startMockUpstream(() => Response.json({ ok: true }));
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     for (const suffix of ["/..%2f..%2f..", "/%2f%2fevil.example.com%2fx", "/..%5cevil.example.com", "/x/../../../../etc/passwd", "/%2e%2e/%2e%2e/"]) {
-      const res = await fetch(`${router.baseUrl}/go/v1${suffix}`, { headers: authHeaders() });
+      const res = await fetch(`${router.baseUrl}/go/v1${suffix}`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
       // locally rejected (404/400) or proxied (200) are both acceptable;
       // the invariant is that nothing can leave the fixed authority
       expect([200, 400, 404].includes(res.status), `${suffix} -> ${res.status}`).toBe(true);
@@ -283,7 +283,7 @@ describe("streaming", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: authHeaders({ "x-opencode-session": "conv-h0-1", "content-type": "application/json" }),
       body: "{}",
     });
     expect(res.status).toBe(200);
@@ -310,7 +310,7 @@ describe("streaming", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: authHeaders({ "x-opencode-session": "conv-h0-1", "content-type": "application/json" }),
       body: "{}",
     });
     expect(res.status).toBe(200);
@@ -401,7 +401,7 @@ describe("streaming", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     const { connect } = await import("node:net");
     const sock = connect(router.server.port(), "127.0.0.1");
-    sock.write(`GET /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${LOCAL_KEY}\r\n\r\n`);
+    sock.write(`GET /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nx-opencode-session: conv-h0-1\r\n\r\n`);
     let received = 0;
     await new Promise<void>((resolve) => {
       sock.on("data", (d) => {
@@ -428,7 +428,7 @@ describe("endpoint-family authentication (current OpenCode gateway surfaces)", (
     const body = JSON.stringify({ model: "qwen3.7-max", messages: [{ role: "user", content: "hi" }], max_tokens: 8 });
     const res = await fetch(`${router.baseUrl}/go/v1/messages`, {
       method: "POST",
-      headers: { "x-api-key": LOCAL_KEY, "content-type": "application/json", "anthropic-version": "2023-06-01" },
+      headers: { "x-api-key": LOCAL_KEY, "content-type": "application/json", "anthropic-version": "2023-06-01", "x-opencode-session": "conv-h0-1" },
       body,
     });
     expect(res.status).toBe(200);
@@ -446,7 +446,7 @@ describe("endpoint-family authentication (current OpenCode gateway surfaces)", (
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { zen: "a1" } });
     const res = await fetch(`${router.baseUrl}/zen/v1/models/gemini-3.6-flash:generateContent`, {
       method: "POST",
-      headers: { "x-goog-api-key": LOCAL_KEY, "content-type": "application/json" },
+      headers: { "x-goog-api-key": LOCAL_KEY, "content-type": "application/json", "x-opencode-session": "conv-h0-1" },
       body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi" }] }] }),
     });
     expect(res.status).toBe(200);
@@ -480,7 +480,7 @@ describe("endpoint-family authentication (current OpenCode gateway surfaces)", (
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     await fetch(`${router.baseUrl}/go/v1/messages`, {
       method: "POST",
-      headers: { "x-api-key": LOCAL_KEY, authorization: `Bearer ${LOCAL_KEY}`, "x-goog-api-key": LOCAL_KEY },
+      headers: { "x-api-key": LOCAL_KEY, authorization: `Bearer ${LOCAL_KEY}`, "x-goog-api-key": LOCAL_KEY, "x-opencode-session": "conv-h0-1" },
       body: "{}",
     });
     const req = upstream.requests[0]!;
@@ -513,13 +513,15 @@ describe("credential containment (F-09/F-10/F-11)", () => {
     try {
       const upstream = await startMockUpstream();
       const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: ACCOUNT_CANARY }], routes: { go: "a1" } });
-      // Canary in every inbound carrier at once.
+      // Canary in every inbound carrier at once. The contaminated session
+      // carrier is refused locally (H0 5.5): nothing reaches any sink.
       const res = await fetch(`${router.baseUrl}/go/v1/models?api_key=${LOCAL_KEY}&x=1`, {
         headers: authHeaders({ "x-custom-echo": ACCOUNT_CANARY, "x-opencode-session": `conv-${LOCAL_KEY}` }),
       });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(400);
+      expect(upstream.requests.length).toBe(0);
       // Error surfaces must not echo the carriers either.
-      const bad = await fetch(`${router.baseUrl}/go/v1//${LOCAL_KEY}?k=${ACCOUNT_CANARY}`, { headers: authHeaders() });
+      const bad = await fetch(`${router.baseUrl}/go/v1//${LOCAL_KEY}?k=${ACCOUNT_CANARY}`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
       expect(bad.status).toBe(400);
       const badBody = await bad.text();
       expect(badBody).not.toContain(LOCAL_KEY);
@@ -543,7 +545,7 @@ describe("credential containment (F-09/F-10/F-11)", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     // Exact value, substring value, and encoded value in three positions.
     for (const q of [`api_key=${LOCAL_KEY}`, `x=1&tok=Bearer-${LOCAL_KEY}-tail&y=2`, `q=${encodeURIComponent(LOCAL_KEY)}`]) {
-      const res = await fetch(`${router.baseUrl}/go/v1/models?${q}`, { headers: authHeaders() });
+      const res = await fetch(`${router.baseUrl}/go/v1/models?${q}`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
       expect(res.status, q).toBe(200);
     }
     expect(upstream.requests.length).toBe(3);
@@ -552,18 +554,21 @@ describe("credential containment (F-09/F-10/F-11)", () => {
       expect(new URL(req.url).search).not.toContain(LOCAL_KEY);
     }
     // Empty-query control still proxies (the framing fast path is unaffected).
-    const plain = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const plain = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(plain.status).toBe(200);
     upstream.stop();
   });
 
-  test("F-09: cached-path injection uses the live secret across rotation (real store)", async () => {
+  // Windows-DPAPI-backed by construction (createSecretStore spawns powershell.exe):
+  // skipped outside Windows; the documented Linux-contained subset excludes it.
+  const testF09 = process.platform === "win32" ? test : test.skip;
+  testF09("F-09: cached-path injection uses the live secret across rotation (real store)", async () => {
     const upstream = await startMockUpstream();
     const secretsDir = mkdtempSync(join(tmpdir(), "gorouter-f09-"));
     scratchDirs.push(secretsDir);
     const secrets = createSecretStore(secretsDir);
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-one" }], routes: { go: "a1" }, secrets });
-    const get = () => fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const get = () => fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     // Cold (DPAPI decrypt) then warm (stat-cache hit): same live secret.
     expect((await get()).status).toBe(200);
     expect((await get()).status).toBe(200);
@@ -584,7 +589,7 @@ describe("bodyless responses and journal terminalization", () => {
   test("204 bodyless response terminalizes the journal and exposes the request id", async () => {
     const upstream = await startMockUpstream(() => new Response(null, { status: 204 }));
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/noop`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/noop`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(204);
     expect(res.headers.get("x-gorouter-request-id")).toBeTruthy();
     const rows = readJournalRows(router.paths.journalDb);
@@ -599,7 +604,7 @@ describe("bodyless responses and journal terminalization", () => {
   test("302 bodyless redirect terminalizes the journal (no permanent in_flight)", async () => {
     const upstream = await startMockUpstream(() => new Response(null, { status: 302, headers: { location: "https://elsewhere.example.com" } }));
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/redirect-me`, { headers: authHeaders(), redirect: "manual" });
+    const res = await fetch(`${router.baseUrl}/go/v1/redirect-me`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }), redirect: "manual" });
     expect(res.status).toBe(302);
     const rows = readJournalRows(router.paths.journalDb);
     expect(rows.length).toBe(1);
@@ -614,7 +619,7 @@ describe("bodyless responses and journal terminalization", () => {
     const port = upstream.port;
     upstream.stop();
     const router = await newRouter({ upstreamBase: `http://127.0.0.1:${port}`, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(res.status).toBe(502);
     expect(res.headers.get("x-gorouter-request-id")).toBeTruthy();
     const rows = readJournalRows(router.paths.journalDb);
@@ -626,7 +631,7 @@ describe("bodyless responses and journal terminalization", () => {
   test("pre-begin local failures (no-route) get a journal row and request id", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }] }); // no routes
-    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders(), body: "{}" });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders({ "x-opencode-session": "conv-h0-1" }), body: "{}" });
     expect(res.status).toBe(503);
     const rid = res.headers.get("x-gorouter-request-id");
     expect(rid).toBeTruthy();
@@ -648,16 +653,16 @@ describe("bodyless responses and journal terminalization", () => {
     // CURRENT-001: canonical ref captured before the dangling wipe.
     const originalRef = router.state.read().accounts[0]!.secretRef;
     router.state.mutate((s) => { s.accounts = []; });
-    const dangling = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const dangling = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(dangling.status).toBe(503);
     expect(dangling.headers.get("x-gorouter-request-id")).toBeTruthy();
     // restore the account under its original id, then delete its secret -> missing-secret 500
     router.state.mutate((s) => {
       router.secrets.put(originalRef, "k");
-      s.accounts = [{ id: originalId, alias: "a1", secretRef: originalRef, createdAtUtc: new Date().toISOString(), updatedAtUtc: new Date().toISOString() }];
+      s.accounts = [{ id: originalId, alias: "a1", secretRef: originalRef, createdAtUtc: new Date().toISOString(), updatedAtUtc: new Date().toISOString(), version: 1 }];
     });
     router.secrets.delete(originalRef);
-    const missing = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const missing = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     expect(missing.status).toBe(500);
     expect(missing.headers.get("x-gorouter-request-id")).toBeTruthy();
     const rows = readJournalRows(router.paths.journalDb);
@@ -681,7 +686,7 @@ describe("route switching and snapshot coherence", () => {
       routes: { go: "go1", zen: "zen1" },
     });
     const go = async (path: string) => {
-      await fetch(`${router.baseUrl}${path}`, { headers: authHeaders() });
+      await fetch(`${router.baseUrl}${path}`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     };
     await go("/go/v1/models");
     expect(upstream.requests[0]!.headers.get("authorization")).toBe("Bearer key-go1");
@@ -714,7 +719,7 @@ describe("route switching and snapshot coherence", () => {
       ],
       routes: { go: "a1" },
     });
-    const inflight = fetch(`${router.baseUrl}/go/v1/held`, { headers: authHeaders() });
+    const inflight = fetch(`${router.baseUrl}/go/v1/held`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
     await new Promise((r) => setTimeout(r, 150)); // let the request reach upstream
     expect(upstream.requests.length).toBe(1);
     expect(upstream.requests[0]!.headers.get("authorization")).toBe("Bearer key-a1");
@@ -746,10 +751,10 @@ describe("route switching and snapshot coherence", () => {
       routes: { go: "ga", zen: "za" },
     });
     await Promise.all([
-      fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() }),
-      fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders() }),
-      fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() }),
-      fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders() }),
+      fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) }),
+      fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) }),
+      fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) }),
+      fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) }),
     ]);
     expect(upstream.requests.length).toBe(4);
     const auths = upstream.requests.map((r) => r.headers.get("authorization"));
@@ -770,63 +775,64 @@ describe("opencode session header", () => {
     upstream.stop();
   });
 
-  test("missing header is generated, never absent upstream", async () => {
+  test("missing header is refused locally with zero upstream dispatch (H0 5.4)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
-    expect(res.status).toBe(200);
-    const v = upstream.requests[0]!.headers.get("x-opencode-session");
-    expect(v).toBeTruthy();
-    expect(v!.length).toBeLessThanOrEqual(256);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: { type: string; message: string } };
+    expect(body.error.type).toBe("GoRouterSessionError");
+    expect(upstream.requests.length).toBe(0);
+    expect(res.headers.get("x-gorouter-request-id")).toBeTruthy();
     upstream.stop();
   });
 
-  test("router correlation id reused as session when no inbound session", async () => {
+  test("correlation id is never mapped to session; missing explicit is refused (H0 5.3)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-gorouter-correlation-id": "myconv-1" }) });
-    expect(res.status).toBe(200);
-    expect(upstream.requests[0]!.headers.get("x-opencode-session")).toBe("myconv-1");
+    expect(res.status).toBe(400);
+    expect(upstream.requests.length).toBe(0);
     upstream.stop();
   });
 
-  test("oversized inbound session replaced, not forwarded", async () => {
+  test("oversized inbound session refused locally, zero dispatch (H0 5.2)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     const bad = "x".repeat(300);
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": bad }) });
-    expect(res.status).toBe(200);
-    const v = upstream.requests[0]!.headers.get("x-opencode-session");
-    expect(v).toBeTruthy();
-    expect(v).not.toBe(bad);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: { type: string } };
+    expect(body.error.type).toBe("GoRouterSessionError");
+    expect(upstream.requests.length).toBe(0);
     upstream.stop();
   });
 
-  test("credential-bearing inbound session replaced, never forwarded", async () => {
+  test("credential-bearing inbound session refused locally, never forwarded or echoed (H0 5.5)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     const bad = "conv-" + LOCAL_KEY;
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": bad }) });
-    expect(res.status).toBe(200);
-    expect(upstream.requests.length).toBe(1);
-    const v = upstream.requests[0]!.headers.get("x-opencode-session");
-    expect(v).toBeTruthy();
-    expect(v).not.toContain(LOCAL_KEY);
+    expect(res.status).toBe(400);
+    expect(upstream.requests.length).toBe(0);
+    const text = await res.text();
+    expect(text).not.toContain(LOCAL_KEY);
+    expect(text).not.toContain(bad);
     upstream.stop();
   });
 
-  test("multi-value / off-grammar inbound session falls back, never forwards garbage", async () => {
+  test("multi-value / off-grammar inbound session refused, never forwards garbage (H0 5.2)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     // ByteString-safe offenders go through fetch (duplicate headers arrive
     // comma-joined; spaces/semicolons are outside the shared id grammar).
     for (const bad of ["a, b", "has space", "semi;colon"]) {
       const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": bad }) });
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(400);
     }
     // Non-ByteString values (control chars, emoji) cannot be sent via fetch
-    // at all — raw socket. Either layer (parser reject or grammar fallback)
-    // must hold: nothing off-grammar may reach upstream.
+    // at all — raw socket. Framing/parser layer may close without dispatch;
+    // the H0 property is: nothing off-grammar reaches upstream.
     const { connect } = await import("node:net");
     const port = router.server.port();
     for (const raw of ["tab\there", "emoji-\u{1F600}"]) {
@@ -843,18 +849,15 @@ describe("opencode session header", () => {
         setTimeout(() => { sock.destroy(); resolve(); }, 5000);
       });
     }
-    for (const req of upstream.requests) {
-      const v = req.headers.get("x-opencode-session")!;
-      expect(v).toMatch(/^[A-Za-z0-9._~-]+$/);
-    }
+    expect(upstream.requests.length).toBe(0);
     upstream.stop();
   });
 
-  test("reused correlation id is byte-identical upstream across requests", async () => {
+  test("same explicit conversation is byte-identical upstream across turns", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     for (let i = 0; i < 3; i++) {
-      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-gorouter-correlation-id": "stable-conv-9" }) });
+      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "stable-conv-9" }) });
       expect(res.status).toBe(200);
     }
     const seen = upstream.requests.map((r) => r.headers.get("x-opencode-session"));
@@ -862,37 +865,171 @@ describe("opencode session header", () => {
     upstream.stop();
   });
 
+  test("distinct conversations stay distinct upstream", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    for (const conv of ["conv-alpha-1", "conv-beta-2"]) {
+      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": conv }) });
+      expect(res.status).toBe(200);
+    }
+    const seen = upstream.requests.map((r) => r.headers.get("x-opencode-session"));
+    expect(seen).toEqual(["conv-alpha-1", "conv-beta-2"]);
+    upstream.stop();
+  });
+
+  test("explicit session wins over coexisting correlation id (H0 precedence)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, {
+      headers: authHeaders({ "x-opencode-session": "conv-explicit-7", "x-gorouter-correlation-id": "other-corr" }),
+    });
+    expect(res.status).toBe(200);
+    expect(upstream.requests[0]!.headers.get("x-opencode-session")).toBe("conv-explicit-7");
+    upstream.stop();
+  });
+
   test("short credential strips on exact match only (F3 floor fallback)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, localKey: "short", accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     const auth = (extra?: Record<string, string>) => new Headers({ authorization: "Bearer short", ...extra });
-    // Exact match on the session id: replaced, never forwarded.
+    // Exact match on the session id: refused locally, never forwarded (H0 5.5).
     const r1 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-opencode-session": "short" }) });
-    expect(r1.status).toBe(200);
-    const v1 = upstream.requests[0]!.headers.get("x-opencode-session");
-    expect(v1).toBeTruthy();
-    expect(v1).not.toBe("short");
+    expect(r1.status).toBe(400);
+    expect(upstream.requests.length).toBe(0);
     // Exact match on a generic forwarded header: stripped.
-    const r2 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-custom-echo": "short" }) });
+    const r2 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-opencode-session": "conv-h0-1", "x-custom-echo": "short" }) });
     expect(r2.status).toBe(200);
-    expect(upstream.requests[1]!.headers.get("x-custom-echo")).toBeNull();
+    expect(upstream.requests[0]!.headers.get("x-custom-echo")).toBeNull();
     // Substring below the floor still forwards (documented tradeoff: a
     // short secret would otherwise rotate innocent ids per request).
     const r3 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: auth({ "x-opencode-session": "conv-short-suffix" }) });
     expect(r3.status).toBe(200);
-    expect(upstream.requests[2]!.headers.get("x-opencode-session")).toBe("conv-short-suffix");
+    expect(upstream.requests[1]!.headers.get("x-opencode-session")).toBe("conv-short-suffix");
     upstream.stop();
   });
 
-  test("credential-bearing correlation id not reused as session", async () => {
+  test("valid explicit session wins with contaminated correlation present (correlation never mapped)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, {
+      headers: authHeaders({ "x-opencode-session": "conv-clean-3", "x-gorouter-correlation-id": LOCAL_KEY }),
+    });
+    expect(res.status).toBe(200);
+    expect(upstream.requests.length).toBe(1);
+    expect(upstream.requests[0]!.headers.get("x-opencode-session")).toBe("conv-clean-3");
+    upstream.stop();
+  });
+
+  test("missing explicit with contaminated correlation is refused as missing (H0 5.4)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
     const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-gorouter-correlation-id": LOCAL_KEY }) });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
+    expect(upstream.requests.length).toBe(0);
+    upstream.stop();
+  });
+});
+
+describe("h0 request-contract matrix (GO/ZEN parity, families, streaming, switch, UA)", () => {
+  test("ZEN valid session forwarded; ZEN missing refused with zero dispatch", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { zen: "a1" } });
+    const ok = await fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders({ "x-opencode-session": "zen-conv-1" }) });
+    expect(ok.status).toBe(200);
+    expect(upstream.requests[0]!.headers.get("x-opencode-session")).toBe("zen-conv-1");
+    const bad = await fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders() });
+    expect(bad.status).toBe(400);
     expect(upstream.requests.length).toBe(1);
-    const v = upstream.requests[0]!.headers.get("x-opencode-session");
-    expect(v).toBeTruthy();
-    expect(v).not.toContain(LOCAL_KEY);
+    upstream.stop();
+  });
+
+  test("endpoint families carry the same explicit session (chat/responses/messages)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const paths = ["/go/v1/chat/completions", "/go/v1/responses", "/go/v1/messages"];
+    for (const p of paths) {
+      const res = await fetch(`${router.baseUrl}${p}`, {
+        method: "POST",
+        headers: authHeaders({ "x-opencode-session": "fam-conv-5", "content-type": "application/json" }),
+        body: JSON.stringify({ model: "m" }),
+      });
+      expect(res.status).toBe(200);
+    }
+    expect(upstream.requests.map((r) => r.headers.get("x-opencode-session"))).toEqual(["fam-conv-5", "fam-conv-5", "fam-conv-5"]);
+    upstream.stop();
+  });
+
+  test("streaming request forms preserve the explicit session", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    for (const p of ["/go/v1/chat/completions", "/go/v1/responses"]) {
+      const res = await fetch(`${router.baseUrl}${p}`, {
+        method: "POST",
+        headers: authHeaders({ "x-opencode-session": "stream-conv-2", "content-type": "application/json" }),
+        body: JSON.stringify({ model: "m", stream: true }),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+    expect(upstream.requests.map((r) => r.headers.get("x-opencode-session"))).toEqual(["stream-conv-2", "stream-conv-2"]);
+    upstream.stop();
+  });
+
+  test("route/account switch does not rewrite a valid session id", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({
+      upstreamBase: upstream.baseUrl,
+      accounts: [{ alias: "a1", key: "key-a1" }, { alias: "a2", key: "key-a2" }],
+      routes: { go: "a1" },
+    });
+    const r1 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "switch-conv-4" }) });
+    expect(r1.status).toBe(200);
+    router.state.mutate((s) => {
+      const next = s.accounts.find((a) => a.alias === "a2")!;
+      s.routes.go.accountId = next.id;
+    });
+    const r2 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "switch-conv-4" }) });
+    expect(r2.status).toBe(200);
+    expect(upstream.requests.map((r) => r.headers.get("x-opencode-session"))).toEqual(["switch-conv-4", "switch-conv-4"]);
+    expect(upstream.requests.map((r) => r.headers.get("authorization"))).toEqual(["Bearer key-a1", "Bearer key-a2"]);
+    upstream.stop();
+  });
+
+  test("truthful caller User-Agent preserved; generic UA never relabeled (H0 section 6)", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const r1 = await fetch(`${router.baseUrl}/go/v1/models`, {
+      headers: authHeaders({ "x-opencode-session": "ua-conv-6", "user-agent": "TestHarness/9.9" }),
+    });
+    expect(r1.status).toBe(200);
+    expect(upstream.requests[0]!.headers.get("user-agent")).toBe("TestHarness/9.9");
+    const r2 = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "ua-conv-7" }) });
+    expect(r2.status).toBe(200);
+    const generic = upstream.requests[1]!.headers.get("user-agent") ?? "";
+    expect(generic.length).toBeGreaterThan(0);
+    expect(generic).not.toContain("GoRouter");
+    upstream.stop();
+  });
+
+  test("refusal carries deterministic local error + request id + journal row, zero dispatch", async () => {
+    const upstream = await startMockUpstream();
+    const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "key-a1" }], routes: { go: "a1" } });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
+      method: "POST",
+      headers: authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ model: "m" }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: { type: string; message: string } };
+    expect(body.error.type).toBe("GoRouterSessionError");
+    expect(upstream.requests.length).toBe(0);
+    const requestId = res.headers.get("x-gorouter-request-id");
+    expect(requestId).toBeTruthy();
+    const rows = readJournalRows(router.paths.journalDb);
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.terminal_outcome).toBe("local_error");
+    expect(rows[0]!.http_status).toBe(400);
+    expect(rows[0]!.router_request_id).toBe(requestId);
     upstream.stop();
   });
 });
@@ -905,7 +1042,7 @@ describe("CURRENT-008 pre-header (TTFB) deadline", () => {
     setUpstreamHeaderTimeoutMsForTests(300);
     try {
       const t0 = Date.now();
-      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+      const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
       expect(Date.now() - t0).toBeLessThan(30_000); // fails fast, never hangs
       expect(res.status).toBe(504);
       expect(res.headers.get("x-gorouter-request-id")).toBeTruthy();
@@ -941,7 +1078,7 @@ describe("CURRENT-008 pre-header (TTFB) deadline", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     setUpstreamHeaderTimeoutMsForTests(300);
     try {
-      const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { headers: authHeaders() });
+      const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { headers: authHeaders({ "x-opencode-session": "conv-h0-1" }) });
       expect(res.status).toBe(200);
       expect(await res.text()).toBe("abc"); // 800ms of gaps sailed through
     } finally {

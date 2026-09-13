@@ -10,6 +10,7 @@ import {
   startMockUpstream,
   startTestRouter,
   authHeaders,
+  sessionHeaders,
   readJournalRows,
   LOCAL_KEY,
   type TestRouter,
@@ -82,7 +83,7 @@ describe("long inter-chunk gap (isolated)", () => {
     });
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: sessionHeaders({ "content-type": "application/json" }),
       body: "{}",
     });
     expect(res.status).toBe(200);
@@ -106,7 +107,7 @@ describe("pre-TTFT delay (isolated)", () => {
       accounts: [{ alias: "a1", key: "key-a1" }],
       routes: { go: "a1" },
     });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     const rows = await waitForRows(router.paths.journalDb, 1);
@@ -142,7 +143,7 @@ describe("chunked request body (isolated)", () => {
     });
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: sessionHeaders({ "content-type": "application/json" }),
       body,
       duplex: "half",
     });
@@ -345,7 +346,7 @@ describe("control and client abort (isolated)", () => {
     });
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: sessionHeaders({ "content-type": "application/json" }),
       body: "{}",
     });
     expect(res.status).toBe(200);
@@ -431,7 +432,8 @@ describe("keep-alive idle (isolated)", () => {
       });
     const send = (p: string) => {
       sock.write(
-        `GET ${p} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nConnection: keep-alive\r\n\r\n`,
+        // W0 (Amendment A5/A7): keep-alive requests are success-path dispatches.
+        `GET ${p} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nX-OpenCode-Session: conv-w0-test-01\r\nConnection: keep-alive\r\n\r\n`,
       );
     };
     send("/go/v1/models");

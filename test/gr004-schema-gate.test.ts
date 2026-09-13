@@ -32,7 +32,9 @@ function freshDir(prefix: string) {
 }
 
 describe("GR-004 state.json version gate", () => {
-  for (const v of [0, 2, 99]) {
+  // W0 (Amendment A4): v2 is the current schema; the unsupported loop covers
+  // non-current numerics. v2 acceptance is proven by the W0 migration suite.
+  for (const v of [0, 3, 99]) {
     test("schema v" + v + " is refused and the file stays byte-identical", () => {
       const f = freshDir("gorouter-gr004-");
       const seed = defaultState();
@@ -53,23 +55,30 @@ describe("GR-004 state.json version gate", () => {
     });
   }
 
-  test("restoring v1 heals the gate and mutations work again", () => {
+  test("restoring v2 heals the gate and mutations work again", () => {
     const f = freshDir("gorouter-gr004-");
     const seed = defaultState();
-    (seed as unknown as Record<string, unknown>).schemaVersion = 2;
+    (seed as unknown as Record<string, unknown>).schemaVersion = 3;
     writeFileSync(f.paths.stateJson, JSON.stringify(seed));
     const store = createStateStore(f.paths, memSecrets());
     store.read();
-    expect(store.health().unsupportedSchemaVersion).toBe(2);
-    writeFileSync(f.paths.stateJson, JSON.stringify(defaultState()));
+    expect(store.health().unsupportedSchemaVersion).toBe(3);
+    // W0: restoration means an established v2 lineage, not a default husk.
+    // Documented repair for the gate is deleting the unsupported file.
+    const { rmSync } = require("node:fs") as typeof import("node:fs");
+    rmSync(f.paths.stateJson, { force: true });
+    const { lockPathFor, withFileLock } = require("../src/lock.ts") as typeof import("../src/lock.ts");
+    withFileLock(lockPathFor(f.paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => { s.settings.port = 1111; });
     expect(store.health().unsupportedSchemaVersion).toBeNull();
     expect(store.read().settings.port).toBe(1111);
   });
 
-  test("supported v1 mutates normally", () => {
+  test("supported v2 mutates normally", () => {
     const f = freshDir("gorouter-gr004-");
     const store = createStateStore(f.paths, memSecrets());
+    const { lockPathFor, withFileLock } = require("../src/lock.ts") as typeof import("../src/lock.ts");
+    withFileLock(lockPathFor(f.paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => { s.settings.port = 1111; });
     expect(store.health().unsupportedSchemaVersion).toBeNull();
     expect(store.read().settings.port).toBe(1111);

@@ -158,6 +158,11 @@ internal static class Selftest
                 // Handled after form creation
                 continue;
             }
+            if (args[i] == "--geometry-test")
+            {
+                // Handled after form creation
+                continue;
+            }
             // --tab takes a value and is honored after form creation (it
             // selects the visible page for capture). --theme is consumed by
             // its own block above.
@@ -306,6 +311,11 @@ internal static class Selftest
             if (args.Contains("--transition-test") && form is ControlCenterForm ccf)
             {
                 return RunTransitionTest(outDir, ccf);
+            }
+
+            if (args.Contains("--geometry-test") && form is ControlCenterForm geoCcf)
+            {
+                return RunGeometryTest(outDir, geoCcf, dpiScale is not null);
             }
 
             using var bitmap = CaptureWindow(form);
@@ -592,10 +602,12 @@ internal static class Selftest
         void Log(string msg) => results.Add("  " + msg);
 
         var form = ccfForm.FindForm() ?? throw new InvalidOperationException("Form not found");
+        form.StartPosition = FormStartPosition.Manual;
+        form.Location = new Point(40, 40);
 
-        // Wide/narrow/wide/narrow/wide alternation plus the exact 899/900/901
+        // Wide/narrow/wide/narrow/wide alternation plus the exact 1049/1050/1051
         // boundary — all in client pixels (the width the reflow reads).
-        var sequence = new[] { 920, 880, 920, 880, 920, 899, 900, 901, 920 };
+        var sequence = new[] { 1200, 1000, 1200, 1000, 1200, 1049, 1050, 1051, 1200 };
 
         results.Add("=== TRANSITION TEST ===");
         results.Add("");
@@ -603,7 +615,7 @@ internal static class Selftest
         for (var step = 0; step < sequence.Length; step++)
         {
             var clientWidth = sequence[step];
-            var expectNarrow = clientWidth < 900;
+            var expectNarrow = clientWidth < 1050;
             var mode = expectNarrow ? "narrow" : "wide";
 
             results.Add($"--- Step {step + 1}: client={clientWidth}px expect={mode} ---");
@@ -613,14 +625,14 @@ internal static class Selftest
             Pump();
 
             // Status band: present, visible, non-collapsed, and the mode must
-            // actually have switched (band.Height 72 narrow / 52 wide).
+            // actually have switched (band.Height 96 narrow / 76 wide).
             var band = FindAllControls(ccfForm, "Status bar").FirstOrDefault();
             Check(band != null, "Status bar found");
             if (band != null)
             {
                 Check(band.Visible, "Status bar visible");
                 Check(band.Height > 0, $"Status bar height={band.Height} (non-zero)");
-                Check(band.Height == (expectNarrow ? 72 : 52), $"Status bar height={band.Height} matches {mode} mode");
+                Check(band.Height == (expectNarrow ? 96 : 76), $"Status bar height={band.Height} matches {mode} mode");
             }
 
             // Required identity/status/lifecycle controls: exactly one each,
@@ -630,7 +642,6 @@ internal static class Selftest
                 "GoRouter Desktop",
                 "Router state indicator",
                 "Router state",
-                "Router port",
                 "Desktop version",
                 "Stop router",
                 "Start router",
@@ -690,20 +701,8 @@ internal static class Selftest
             }
             Check(overlaps == 0, $"overlapping status controls={overlaps}");
 
-            // No clipping: port label fully inside the band (screen space).
-            if (band != null)
-            {
-                var port = FindAllControls(ccfForm, "Router port").FirstOrDefault();
-                if (port != null)
-                {
-                    var portRect = port.RectangleToScreen(port.ClientRectangle);
-                    var bandRect = band.RectangleToScreen(band.ClientRectangle);
-                    Check(portRect.Width > 0 && portRect.Height > 0, "port label has non-zero size");
-                    Check(portRect.Left >= bandRect.Left && portRect.Right <= bandRect.Right + 1
-                        && portRect.Top >= bandRect.Top && portRect.Bottom <= bandRect.Bottom + 1,
-                        $"port label inside band (port={portRect} band={bandRect})");
-                }
-            }
+            // Port label retired from the band to the footer endpoint plus
+            // settings field; no band containment applies anymore.
 
             Log("");
         }
@@ -754,6 +753,127 @@ internal static class Selftest
     /// (dashboard-before / journal-view / dashboard-after-back /
     /// journal-narrow; under --dpi-scale, journal-dpi150 instead).
     /// </summary>
+    private static int RunGeometryTest(string outDir, ControlCenterForm ccfForm, bool dpiScaled)
+    {
+        var results = new List<string>();
+        var failures = new List<string>();
+        void Check(bool condition, string message)
+        {
+            if (condition) { results.Add(message); }
+            else { failures.Add(message); results.Add(message); }
+        }
+        void Log(string message) { results.Add(message); }
+        void Settle()
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                Application.DoEvents();
+                Thread.Sleep(40);
+                Application.DoEvents();
+            }
+        }
+        results.Add("=== GEOMETRY TEST ===");
+        if (dpiScaled) { Log("dpi scaled harness mode; real OS 150 percent remains NOT VERIFIED"); }
+        ccfForm.StartPosition = FormStartPosition.Manual;
+        ccfForm.Location = new Point(40, 40);
+        Settle();
+        Log("forced primary monitor position");
+        Log(string.Concat("aslaunched Size=", ccfForm.Size.ToString(), " Client=", ccfForm.ClientSize.ToString()));
+        GeometryDiagnostics.CheckPhase(ccfForm, "as-launched", outDir, results, failures);
+        Log("phase large start");
+        ccfForm.ClientSize = new Size(1320, 880);
+        Settle();
+        ccfForm.Refresh();
+        Settle();
+        Log(string.Concat("large Size=", ccfForm.Size.ToString(), " Client=", ccfForm.ClientSize.ToString(), " Dpi=", ccfForm.DeviceDpi.ToString()));
+        GeometryDiagnostics.CheckPhase(ccfForm, "large", outDir, results, failures);
+        Log("phase small start");
+        ccfForm.Size = new Size(970, 616);
+        Settle();
+        ccfForm.Refresh();
+        Settle();
+        Log(string.Concat("small Size=", ccfForm.Size.ToString(), " Client=", ccfForm.ClientSize.ToString(), " Dpi=", ccfForm.DeviceDpi.ToString()));
+        GeometryDiagnostics.CheckPhase(ccfForm, "small970x616", outDir, results, failures);
+        try
+        {
+            using var bmp = CaptureWindow(ccfForm);
+            bmp.Save(Path.Combine(outDir, "geometry-small.png"), ImageFormat.Png);
+            Log("saved geometry-small.png");
+        }
+        catch (Exception ex) { Check(false, string.Concat("small shot failed: ", ex.Message)); }
+        Log("phase wideshort start");
+        ccfForm.ClientSize = new Size(1200, 560);
+        Settle();
+        ccfForm.Refresh();
+        Settle();
+        Log(string.Concat("wideshort Size=", ccfForm.Size.ToString(), " Client=", ccfForm.ClientSize.ToString()));
+        GeometryDiagnostics.CheckPhase(ccfForm, "wide-short", outDir, results, failures);
+        Log("phase narrowtall start");
+        ccfForm.ClientSize = new Size(800, 850);
+        Settle();
+        ccfForm.Refresh();
+        Settle();
+        Log(string.Concat("narrowtall Size=", ccfForm.Size.ToString(), " Client=", ccfForm.ClientSize.ToString()));
+        GeometryDiagnostics.CheckPhase(ccfForm, "narrow-tall", outDir, results, failures);
+        Log("phase backlarge start");
+        ccfForm.ClientSize = new Size(1320, 880);
+        Settle();
+        ccfForm.Refresh();
+        Settle();
+        Log(string.Concat("backlarge Size=", ccfForm.Size.ToString(), " Client=", ccfForm.ClientSize.ToString()));
+        GeometryDiagnostics.CheckPhase(ccfForm, "back-large", outDir, results, failures);
+        Log("scroll reachability start");
+        ccfForm.Size = new Size(970, 616);
+        Settle();
+        ccfForm.Refresh();
+        Settle();
+        List<Control> grids = GeometryDiagnostics.FindAll(ccfForm, "Routing and recent activity");
+        if (grids.Count == 1)
+        {
+            if (grids[0] is ScrollableControl sc)
+            {
+                if (sc.AutoScroll)
+                {
+                    sc.AutoScrollPosition = new Point(0, 100000);
+                    Settle();
+                    ccfForm.Refresh();
+                    Settle();
+                    Log(string.Concat("bottom pos=", sc.AutoScrollPosition.ToString()));
+                    List<Control> recents = GeometryDiagnostics.FindAll(ccfForm, "Recent activity");
+                    if (recents.Count >= 1)
+                    {
+                        Rectangle re = GeometryDiagnostics.EffectiveRect(recents[0]);
+                        Check(re.Height > 0, string.Concat("scrollbottom recent reachable eff=", re.ToString()));
+                    }
+                    else { Check(false, "scrollbottom recent present"); }
+                    List<Control> fids = GeometryDiagnostics.FindAll(ccfForm, "Footer product identity");
+                    if (fids.Count == 1)
+                    {
+                        Rectangle fe = GeometryDiagnostics.EffectiveRect(fids[0]);
+                        Check(fe.Height > 0, string.Concat("scrollbottom footer reachable eff=", fe.ToString()));
+                    }
+                    else { Check(false, "scrollbottom footer present"); }
+                    sc.AutoScrollPosition = new Point(0, 0);
+                    Settle();
+                    Log("scroll restored top");
+                }
+                else { Log("grid not autoscroll"); }
+            }
+            else { Log("grid not scrollable control"); }
+        }
+        else { Log("lanes grid not unique"); }
+        results.Add("");
+        if (failures.Count == 0) { results.Add("=== ALL GEOMETRY CHECKS PASSED ==="); }
+        else
+        {
+            results.Add(string.Concat("=== ", failures.Count.ToString(), " GEOMETRY FAILURES ==="));
+            foreach (string f in failures) { results.Add(f); }
+        }
+        File.WriteAllText(Path.Combine(outDir, "geometry-summary.txt"), string.Join(Environment.NewLine, results));
+        Console.WriteLine(string.Join(Environment.NewLine, results));
+        return failures.Count == 0 ? 0 : 1;
+    }
+
     private static int RunNavigationTest(string outDir, ControlCenterForm ccfForm, StubChannel channel, bool dpiOnly)
     {
         var results = new List<string>();

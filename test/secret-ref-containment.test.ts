@@ -120,6 +120,10 @@ describe("CURRENT-001 state-load containment", () => {
     const base = defaultState();
     const crafted = {
       ...base,
+      // W0: explicit legacy-v1 class (missing version + malformed ref is
+      // legacy-invalid and fails closed; proven by the W0 migration suite).
+      schemaVersion: 1,
+      stateGeneration: undefined,
       accounts: [
         { id: "acct_evil", alias: "evil", secretRef: "../canary", createdAtUtc: "2026-01-01T00:00:00.000Z", updatedAtUtc: "2026-01-01T00:00:00.000Z" },
         { id: "acct_ok", alias: "ok", secretRef: okRef, createdAtUtc: "2026-01-01T00:00:00.000Z", updatedAtUtc: "2026-01-01T00:00:00.000Z" },
@@ -142,9 +146,12 @@ describe("CURRENT-001 state-load containment", () => {
     const state = createStateStore(paths, secrets);
     const ref = newRef();
     secrets.put(ref, "k");
+    // W0: establish first so the round-trip exercises a durable lineage.
+    const { lockPathFor, withFileLock } = require("../src/lock.ts") as typeof import("../src/lock.ts");
+    withFileLock(lockPathFor(paths.state), 10_000, () => state.ensureV2());
     state.mutate((s) => {
       s.localCredentialRef = ref;
-      s.accounts.push({ id: "acct_1", alias: "a1", secretRef: ref, createdAtUtc: "2026-01-01T00:00:00.000Z", updatedAtUtc: "2026-01-01T00:00:00.000Z" });
+      s.accounts.push({ id: "acct_1", alias: "a1", secretRef: ref, createdAtUtc: "2026-01-01T00:00:00.000Z", updatedAtUtc: "2026-01-01T00:00:00.000Z", version: 1 });
     });
     const reloaded = createStateStore(paths, memSecrets()).read();
     expect(reloaded.accounts.length).toBe(1);

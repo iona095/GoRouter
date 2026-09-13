@@ -12,8 +12,21 @@
 import net from 'node:net'
 
 export const SERVICE_VERSION = '1.5.0'
-export const PROTOCOL_VERSION = 1
+/** W0: version-gated control protocol (contract 6.4). Clients send the expected
+ * protocol number in hello; the service rejects missing/mismatched protocol. */
+export const PROTOCOL_VERSION = 2
 export const MAX_LINE_BYTES = 1024 * 1024
+/** W1: explicit browser API version (path namespace; NOT a control-protocol bump). */
+export const WEB_API_VERSION = 1
+/** W1: cold-launch capability identity. A launcher proves web-safe support by
+ * importing this module and observing WEB_BRIDGE_CAPABLE === true BEFORE starting
+ * any provider-capable service process; a pre-W1 binary has no such export, so a
+ * cold launch against it fails closed instead of trusting an ignored flag. */
+export const WEB_BRIDGE_CAPABLE = true
+/** W1: machine-readable result of the trusted native web.open action. */
+export interface WebOpenResult {
+  url: string
+}
 
 export type ErrorCode =
   | 'validation'
@@ -25,18 +38,22 @@ export type ErrorCode =
   | 'unavailable'
   | 'internal'
 
-/** Error carrying a wire error.code (never contains secrets). */
+/** Error carrying a wire error.code (never contains secrets). The optional
+ * reason carries a stable machine-readable discriminator beneath a broad code
+ * (W0: conflict reasons such as state_generation_mismatch). */
 export class ControlError extends Error {
   code: ErrorCode
-  constructor(code: ErrorCode, message: string) {
+  reason?: string
+  constructor(code: ErrorCode, message: string, reason?: string) {
     super(message)
     this.name = 'ControlError'
     this.code = code
+    if (reason !== undefined) this.reason = reason
   }
 }
 
-export function controlError(code: ErrorCode, message: string): ControlError {
-  return new ControlError(code, message)
+export function controlError(code: ErrorCode, message: string, reason?: string): ControlError {
+  return new ControlError(code, message, reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -53,6 +70,8 @@ export interface WireRequest {
 export interface WireError {
   code: ErrorCode
   message: string
+  /** Stable machine-readable discriminator (W0 conflict reasons). Absent for legacy errors. */
+  reason?: string
 }
 
 export interface WireResponse {
@@ -80,6 +99,8 @@ export interface SnapshotSettings {
 export interface SnapshotRoute {
   accountId: string | null
   alias: string | null
+  /** W0 lane version. */
+  version: number
 }
 
 export interface SnapshotAccount {
@@ -89,6 +110,8 @@ export interface SnapshotAccount {
   usedBy: string[]
   createdAtUtc: string
   updatedAtUtc: string
+  /** W0 account version. */
+  version: number
 }
 
 export type RouterSnapshotState =
@@ -127,8 +150,17 @@ export interface SnapshotDesktop {
   firstRunDoneAtUtc: string | null
 }
 
+/** hello params (W0: protocol is required and version-gated). */
+export interface HelloParams {
+  protocol?: unknown
+  app?: unknown
+  version?: unknown
+}
+
 export interface Snapshot {
   serviceVersion: string
+  /** W0 persisted lineage generation ("" when unestablished). */
+  stateGeneration: string
   initialized: boolean
   firstRun: boolean
   stateCorrupt: boolean

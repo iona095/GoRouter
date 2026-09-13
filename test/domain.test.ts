@@ -167,6 +167,10 @@ describe("domain mutations apply exactly once", () => {
     const { memSecrets } = await import("./harness.ts");
     const paths = resolvePaths(stateDir);
     const store = createStateStore(paths, memSecrets());
+    // W0: establish first so the crafted fractional port (not lineage) is
+    // the only invalidity under test.
+    const { lockPathFor, withFileLock } = await import("../src/lock.ts");
+    withFileLock(lockPathFor(paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => { (s.settings as unknown as Record<string, unknown>).port = 45999.5; });
     expect(createStateStore(paths, memSecrets()).read().settings.port).toBe(8787);
     store.mutate((s) => { s.settings.port = 0; }); // explicit ephemeral marker survives
@@ -226,7 +230,10 @@ describe("domain mutations apply exactly once", () => {
     expect(results.length).toBe(2);
   });
 
-  test("cross-process lock serializes two CLI writers (spawned processes)", async () => {
+  // Spawns src/cli.ts against the real DPAPI store (powershell.exe): Windows-only.
+  // Skipped outside Windows; documented Linux-contained-subset exclusion.
+  const testCliSpawn = process.platform === "win32" ? test : test.skip;
+  testCliSpawn("cross-process lock serializes two CLI writers (spawned processes)", async () => {
     const { stateDir } = fresh();
     const BUN = process.execPath;
     const cli = (args: string[], input?: string): Promise<{ status: number; stdout: string }> =>

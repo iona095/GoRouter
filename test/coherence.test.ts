@@ -326,9 +326,17 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
     expect(snap.data.routes.go.alias).toBe("alpha")
     expect(client.events.length).toBeGreaterThan(eventsBefore)
 
-    // GUI mutation -> CLI visibility
-    const alphaId = client.latest!.accounts.find((a) => a.alias === "alpha")!.id
-    const set = await client.request("route.set", { lane: "zen", accountId: alphaId })
+    // GUI mutation -> CLI visibility (W0: reviewed snapshot values)
+    const snapA = client.latest!;
+    const alphaId = snapA.accounts.find((a) => a.alias === "alpha")!.id
+    const alphaVer = (snapA.accounts.find((a) => a.alias === "alpha")! as unknown as { version: number }).version
+    const set = await client.request("route.set", {
+      lane: "zen",
+      accountId: alphaId,
+      expectedStateGeneration: (snapA as unknown as { stateGeneration: string }).stateGeneration,
+      expectedRouteVersion: (snapA.routes.zen as unknown as { version: number }).version,
+      expectedTargetAccountVersion: alphaVer,
+    })
     expect(set.ok, JSON.stringify(set.error)).toBe(true)
     await client.waitSnapshot((s) => s.routes.zen.alias === "alpha", 5_000)
     const status = await runCli(dir, ["status"])
@@ -412,6 +420,8 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
         authorization: `Bearer ${localCredential}`,
         "content-type": "application/json",
         "x-gorouter-correlation-id": "int-e2e-correlation-1",
+        // W0 (Amendment A5/A7): proxied inference carries a session.
+        "x-opencode-session": "conv-coherence-c-01",
       },
       body,
     })
@@ -621,12 +631,25 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
     const a = await connectClient(h)
     const b = new ControlClient(pipePath, readAdminToken(dir))
     await b.connect(10_000)
-    const alphaId = a.latest!.accounts.find((x) => x.alias === "alpha")!.id
+    // W0: all three writers freeze disjoint versions from one snapshot, so all
+    // three commit (adds check generation only; the two route.sets touch
+    // different lanes). Any serialization still converges without lost update.
+    const snapG = a.latest!;
+    const genG = (snapG as unknown as { stateGeneration: string }).stateGeneration;
+    const alphaId = snapG.accounts.find((x) => x.alias === "alpha")!.id
+    const alphaVerG = (snapG.accounts.find((x) => x.alias === "alpha")! as unknown as { version: number }).version
+    const goVerG = (snapG.routes.go as unknown as { version: number }).version
 
     // three independent writers race: two pipe clients + one CLI subprocess
     const [ra, rb, cliRes] = await Promise.all([
-      a.request("route.set", { lane: "go", accountId: alphaId }),
-      b.request("account.add", { alias: "beta", secret: "sk-race-beta-0123456789" }),
+      a.request("route.set", {
+        lane: "go",
+        accountId: alphaId,
+        expectedStateGeneration: genG,
+        expectedRouteVersion: goVerG,
+        expectedTargetAccountVersion: alphaVerG,
+      }),
+      b.request("account.add", { alias: "beta", secret: "sk-race-beta-0123456789", expectedStateGeneration: genG }),
       runCli(dir, ["route", "zen", "alpha"]),
     ])
     expect(ra.ok, JSON.stringify(ra.error)).toBe(true)
@@ -693,6 +716,8 @@ describe("GoRouter V1.5 desktop coherence (real control service)", () => {
       headers: {
         authorization: `Bearer ${localCredential}`,
         "content-type": "application/json",
+        // W0 (Amendment A5/A7): proxied inference carries a session.
+        "x-opencode-session": "conv-coherence-h-01",
       },
       body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "still-routing" }] }),
     })

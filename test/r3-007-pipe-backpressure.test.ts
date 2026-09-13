@@ -24,6 +24,10 @@ function pipeFor(tag: string): string {
 }
 const NL = String.fromCharCode(10);
 
+// Windows named-pipe paths cannot bind on Linux: like the established
+// domain.test.ts / proxy.test.ts DPAPI-gated tests, these run on Windows.
+const testWin = process.platform === "win32" ? test : test.skip;
+
 async function connectPipe(pipe: string): Promise<net.Socket> {
   const sock = net.connect({ path: pipe });
   await new Promise<void>((resolve, reject) => {
@@ -67,7 +71,7 @@ function handler(op: string): Promise<unknown> {
 }
 
 describe("R3-007 pipe output backpressure", () => {
-  test("over-cap reply to a stalled requester is refused and counted", async () => {
+  testWin("over-cap reply to a stalled requester is refused and counted", async () => {
     const pipe = pipeFor("reply");
     let drops = 0;
     const transport = serveControlPipe(pipe, TOKEN, handler, undefined, undefined, () => { drops++; });
@@ -86,7 +90,7 @@ describe("R3-007 pipe output backpressure", () => {
     await transport.close();
   }, 30000);
 
-  test("stalled push subscriber is dropped; healthy clients continue", async () => {
+  testWin("stalled push subscriber is dropped; healthy clients continue", async () => {
     const pipe = pipeFor("push");
     let drops = 0;
     const transport = serveControlPipe(pipe, TOKEN, handler, undefined, undefined, () => { drops++; });

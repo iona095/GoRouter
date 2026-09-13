@@ -350,8 +350,11 @@ describe('in-process control core', () => {
       'settings',
       'stateCorrupt',
       'stateDir',
+      'stateGeneration',
       'stateUnsupportedVersion',
     ])
+    expect(typeof snap.stateGeneration).toBe('string')
+    expect(snap.stateGeneration.length).toBeGreaterThan(0)
     expect(snap.serviceVersion).toBe('1.5.0')
     expect(snap.initialized).toBe(true)
     expect(snap.firstRun).toBe(true) // state freshly created by this service start
@@ -360,7 +363,7 @@ describe('in-process control core', () => {
     expect(snap.desktopUnsupportedVersion).toBe(null)
     expect(snap.secretStore).toBe('ok')
     expect(snap.settings).toEqual({ port: 8787, journalRetentionDays: 30, journalMaxRecords: 100000 })
-    expect(snap.routes).toEqual({ go: { accountId: null, alias: null }, zen: { accountId: null, alias: null } })
+    expect(snap.routes).toEqual({ go: { accountId: null, alias: null, version: 1 }, zen: { accountId: null, alias: null, version: 1 } })
     expect(snap.accounts).toEqual([])
     expect(snap.router).toEqual({ state: 'stopped', mode: 'none', pid: null, port: 8787, restartCount: 0 })
     expect(snap.journal).toMatchObject({
@@ -382,17 +385,39 @@ describe('in-process control core', () => {
   test('route.set/route.clear via op handlers reflect in the snapshot', async () => {
     const { core, handlers } = freshCore()
     core.start()
-    await handlers('account.add', { alias: 'alpha', secret: 'sk-alpha' })
-    const r = (await handlers('route.set', { lane: 'go', accountId: 'alpha' })) as { lane: string; alias: string }
+    const gen = core.snapshot().stateGeneration
+    await handlers('account.add', { alias: 'alpha', secret: 'sk-alpha', expectedStateGeneration: gen })
+    const snap1 = core.snapshot()
+    const alpha = snap1.accounts.find((a) => a.alias === 'alpha')!
+    const r = (await handlers('route.set', {
+      lane: 'go',
+      accountId: alpha.id,
+      expectedStateGeneration: gen,
+      expectedRouteVersion: snap1.routes.go.version,
+      expectedTargetAccountVersion: alpha.version,
+    })) as { lane: string; accountId: string }
     expect(r.lane).toBe('go')
-    expect(r.alias).toBe('alpha')
+    expect(r.accountId).toBe(alpha.id)
     expect(core.snapshot().routes.go.alias).toBe('alpha')
-    await handlers('route.clear', { lane: 'go' })
-    expect(core.snapshot().routes.go).toEqual({ accountId: null, alias: null })
-    await expect(handlers('route.set', { lane: 'go', accountId: 'missing' })).rejects.toMatchObject({
+    const snap2 = core.snapshot()
+    await handlers('route.clear', {
+      lane: 'go',
+      expectedStateGeneration: gen,
+      expectedRouteVersion: snap2.routes.go.version,
+    })
+    expect(core.snapshot().routes.go).toEqual({ accountId: null, alias: null, version: 3 })
+    await expect(
+      handlers('route.set', {
+        lane: 'go',
+        accountId: 'missing',
+        expectedStateGeneration: gen,
+        expectedRouteVersion: 3,
+        expectedTargetAccountVersion: 1,
+      }),
+    ).rejects.toMatchObject({
       code: 'not_found',
     })
-    await expect(handlers('route.set', { lane: 'gopher', accountId: 'alpha' })).rejects.toMatchObject({
+    await expect(handlers('route.set', { lane: 'gopher', accountId: alpha.id })).rejects.toMatchObject({
       code: 'validation',
     })
     await core.stop()
@@ -785,7 +810,7 @@ async function connectPipe(pipeName: string, token: string, timeoutMs = 10_000):
     const c = createPipeClient(pipeName, token)
     try {
       await Promise.race([
-        c.request('hello', { app: 'test', version: '1.5.0' }),
+        c.request('hello', { app: 'test', version: '1.5.0', protocol: 2 }),
         new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 500)),
       ])
       return c
@@ -824,7 +849,7 @@ describe('transport hello-gate (F-29)', () => {
     // Authenticated but pre-hello: ping is rejected AND no pushes arrive.
     raw.write(JSON.stringify({ id: 1, token, op: 'ping' }) + '\n')
     await waitFor(() => blob().includes('"id":1'), 5_000)
-    expect(blob()).toContain('hello must be the first message')
+    expect(blob()).toContain('hello must complete before other operations')
     transport.push('snap', { n: 1 })
     await sleep(300)
     expect(blob()).not.toContain('"event":"snap"')
@@ -909,7 +934,7 @@ describe('real pipe integration', () => {
         }
       })
       // hello must be the first frame on a raw connection (listener already attached)
-      raw.write(JSON.stringify({ id: 99, token, op: 'hello', params: { app: 'test', version: '1.5.0' } }) + '\n')
+      raw.write(JSON.stringify({ id: 99, token, op: 'hello', params: { app: 'test', version: '1.5.0', protocol: 2 } }) + '\n')
       await waitFor(() => got.includes(99), 8_000)
       // three ~400KB ping frames written as ONE coalesced chunk (>1MiB total):
       // the per-line cap must NOT reject them (each frame is < 1MiB)
@@ -995,11 +1020,11 @@ describe('real pipe integration', () => {
       const token = await waitForAdminToken(stateDir)
       const client = await connectPipe(pipeName, token)
 
-      const hello = (await client.request('hello', { app: 'test', version: '1.5.0' })) as {
+      const hello = (await client.request('hello', { app: 'test', version: '1.5.0', protocol: 2 })) as {
         serviceVersion: string
         protocol: number
       }
-      expect(hello).toEqual({ serviceVersion: '1.5.0', protocol: 1 })
+      expect(hello).toEqual({ serviceVersion: '1.5.0', protocol: 2 })
 
       const snap = (await client.request('snapshot')) as Snapshot
       expect(snap.initialized).toBe(true)
@@ -1016,10 +1041,26 @@ describe('real pipe integration', () => {
       expect(rs.router.mode).toBe('managed')
       expect(rs.router.pid).toBeTruthy()
 
-      const add = (await client.request('account.add', { alias: 'gamma', secret: 'sk-gamma' })) as { alias: string }
+      const snap0 = (await client.request('snapshot')) as Snapshot
+      const gen0 = (snap0 as unknown as { stateGeneration: string }).stateGeneration
+      const add = (await client.request('account.add', { alias: 'gamma', secret: 'sk-gamma', expectedStateGeneration: gen0 })) as { alias: string }
       expect(add.alias).toBe('gamma')
-      await client.request('account.rename', { alias: 'gamma', newAlias: 'delta' })
-      await client.request('route.set', { lane: 'go', accountId: 'alpha' })
+      const snapA = (await client.request('snapshot')) as Snapshot
+      const gamma = snapA.accounts.find((a) => a.alias === 'gamma')!
+      const alpha0 = snapA.accounts.find((a) => a.alias === 'alpha')!
+      await client.request('account.rename', {
+        accountId: gamma.id,
+        newAlias: 'delta',
+        expectedStateGeneration: gen0,
+        expectedAccountVersion: (gamma as unknown as { version: number }).version,
+      })
+      await client.request('route.set', {
+        lane: 'go',
+        accountId: alpha0.id,
+        expectedStateGeneration: gen0,
+        expectedRouteVersion: (snapA.routes.go as unknown as { version: number }).version,
+        expectedTargetAccountVersion: (alpha0 as unknown as { version: number }).version,
+      })
       const snap2 = (await client.request('snapshot')) as Snapshot
       expect(snap2.routes.go.alias).toBe('alpha')
       expect(snap2.accounts.some((a) => a.alias === 'delta')).toBe(true)
@@ -1056,13 +1097,39 @@ describe('real pipe integration', () => {
       const a = await connectPipe(pipeName, token)
       const b = await connectPipe(pipeName, token)
       const ops: Promise<unknown>[] = []
+      const snapC = (await a.request('snapshot')) as Snapshot
+      const genC = (snapC as unknown as { stateGeneration: string }).stateGeneration
+      const verOf = (s: Snapshot, alias: string): { id: string; version: number } => {
+        const a = s.accounts.find((x) => x.alias === alias)!
+        return { id: a.id, version: (a as unknown as { version: number }).version }
+      }
+      const laneVer = (s: Snapshot, lane: 'go' | 'zen'): number =>
+        (s.routes[lane] as unknown as { version: number }).version
       for (let i = 1; i <= 5; i++) {
         const n = i
-        ops.push(a.request('account.add', { alias: `c${n}`, secret: `sk-c${n}` }))
-        ops.push(b.request('route.set', { lane: n % 2 === 0 ? 'zen' : 'go', accountId: n % 2 === 0 ? 'beta' : 'alpha' }))
+        ops.push(a.request('account.add', { alias: `c${n}`, secret: `sk-c${n}`, expectedStateGeneration: genC }))
+        const lane = n % 2 === 0 ? 'zen' : ('go' as const)
+        const t = verOf(snapC, n % 2 === 0 ? 'beta' : 'alpha')
+        ops.push(
+          b.request('route.set', {
+            lane,
+            accountId: t.id,
+            expectedStateGeneration: genC,
+            expectedRouteVersion: laneVer(snapC, lane),
+            expectedTargetAccountVersion: t.version,
+          }),
+        )
       }
-      const results = await Promise.all(ops)
+      // W0: same-lane route.set racers share one frozen lane version, so all
+      // but one per lane MUST conflict; every account.add is independent and
+      // must commit. Serialization means no lost update and no crash.
+      const results = await Promise.allSettled(ops)
       expect(results.length).toBe(10)
+      const rejected = results.filter((r) => r.status === 'rejected')
+      for (const r of rejected) {
+        const reason = (r as PromiseRejectedResult).reason as { code?: string; reason?: string }
+        expect(reason.code).toBe('conflict')
+      }
       const snap = (await a.request('snapshot')) as Snapshot
       const aliases = snap.accounts.map((x) => x.alias)
       for (let i = 1; i <= 5; i++) expect(aliases).toContain(`c${i}`) // no lost update

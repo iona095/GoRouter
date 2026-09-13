@@ -25,6 +25,7 @@ export interface SnapshotAccount {
   usedBy: string[]
   createdAtUtc: string
   updatedAtUtc: string
+  version: number
 }
 
 export interface SnapshotJournal {
@@ -41,10 +42,12 @@ export interface SnapshotJournal {
 export interface LaneSelection {
   accountId: string | null
   alias: string | null
+  version: number
 }
 
 export interface SnapshotData {
   serviceVersion: string
+  stateGeneration: string
   initialized: boolean
   firstRun: boolean
   stateCorrupt: boolean
@@ -64,6 +67,7 @@ export interface SnapshotData {
 export interface ControlError {
   code: string
   message: string
+  reason?: string
 }
 
 export interface ControlResponse {
@@ -179,7 +183,7 @@ export class ControlClient {
    * starting (it creates the admin token blob before listening), so the
    * connect is retried until `timeoutMs` — a single ENOENT is not a failure.
    */
-  async connect(timeoutMs = 10_000): Promise<SnapshotData> {
+  async connect(timeoutMs = 10_000, helloParams?: Record<string, unknown>): Promise<SnapshotData> {
     const deadline = Date.now() + timeoutMs
     for (;;) {
       const socket = this.makeSocket()
@@ -198,7 +202,7 @@ export class ControlClient {
         await Bun.sleep(100)
       }
     }
-    const ack = await this.request("hello", { app: "GoRouterDesktop", version: "1.5.0" }, timeoutMs)
+    const ack = await this.request("hello", helloParams ?? { app: "GoRouterDesktop", version: "1.5.0", protocol: 2 }, timeoutMs)
     if (!ack.ok) throw new Error(`hello failed: ${ack.error?.code} ${ack.error?.message}`)
     const initial = await this.waitSnapshot(() => true, timeoutMs)
     return initial

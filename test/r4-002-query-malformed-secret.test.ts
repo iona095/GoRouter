@@ -64,7 +64,8 @@ describe("R4-002 end-to-end containment", () => {
       const rawQ = "?x=" + enc(SECRET) + "%zz&safe=1";
       const res = await fetch(router.baseUrl + "/go/v1/chat/completions" + rawQ, {
         method: "POST",
-        headers: { authorization: auth, "content-type": "application/json" },
+        // W0 (Amendment A5/A7): success-path dispatch carries a session.
+        headers: { authorization: auth, "content-type": "application/json", "x-opencode-session": "conv-w0-test-01" },
         body: JSON.stringify({ model: "m", messages: [] }),
       });
       expect(res.status).toBe(200);

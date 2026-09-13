@@ -92,8 +92,13 @@ describe("GR-007 persisted state validates identically", () => {
     const paths = resolvePaths(stateDir);
     ensureStateDirs(paths);
     const store = createStateStore(paths, memSecrets());
-    const seed = defaultState();
-    seed.settings.journalMaxRecords = 1.5;
+    // W0: establish a valid lineage first so the ONLY invalidity under test
+    // is the fractional maxRecords (a generation-less husk would fail closed
+    // before settings validation by design).
+    const { lockPathFor, withFileLock } = require("../src/lock.ts") as typeof import("../src/lock.ts");
+    withFileLock(lockPathFor(paths.state), 10_000, () => store.ensureV2());
+    const seed = store.read();
+    (seed as unknown as Record<string, unknown>).settings = { ...seed.settings, journalMaxRecords: 1.5 };
     writeFileSync(paths.stateJson, JSON.stringify(seed));
     const loaded = store.read();
     expect(loaded.settings.journalMaxRecords).toBe(100000);

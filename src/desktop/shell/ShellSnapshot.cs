@@ -14,6 +14,9 @@ public sealed class ShellSnapshot
     [JsonPropertyName("serviceVersion")]
     public string ServiceVersion { get; init; } = "";
 
+    [JsonPropertyName("stateGeneration")]
+    public string StateGeneration { get; init; } = "";
+
     [JsonPropertyName("initialized")]
     public bool Initialized { get; init; }
 
@@ -109,6 +112,9 @@ public sealed class SnapshotRoute
 
     [JsonPropertyName("alias")]
     public string? Alias { get; init; }
+
+    [JsonPropertyName("version")]
+    public long Version { get; init; }
 }
 
 public sealed class SnapshotAccount
@@ -130,6 +136,9 @@ public sealed class SnapshotAccount
 
     [JsonPropertyName("updatedAtUtc")]
     public string UpdatedAtUtc { get; init; } = "";
+
+    [JsonPropertyName("version")]
+    public long Version { get; init; }
 }
 
 public sealed class SnapshotRouter
@@ -248,14 +257,27 @@ public sealed class RecentJournalData
     public string? Error { get; init; }
 }
 
-/// <summary>account.remove response data.</summary>
+/// <summary>Cleared lane with its committed version (W0 commit data).</summary>
+public sealed class ClearedLane
+{
+    [JsonPropertyName("lane")]
+    public string Lane { get; init; } = "";
+
+    [JsonPropertyName("routeVersion")]
+    public long RouteVersion { get; init; }
+}
+
+/// <summary>account.remove response data (W0 commit identity).</summary>
 public sealed class RemoveResult
 {
-    [JsonPropertyName("removed")]
-    public SnapshotAccount? Removed { get; init; }
+    [JsonPropertyName("removedAccountId")]
+    public string RemovedAccountId { get; init; } = "";
+
+    [JsonPropertyName("removedAccountVersion")]
+    public long RemovedAccountVersion { get; init; }
 
     [JsonPropertyName("clearedLanes")]
-    public IReadOnlyList<string> ClearedLanes { get; init; } = Array.Empty<string>();
+    public IReadOnlyList<ClearedLane> ClearedLanes { get; init; } = Array.Empty<ClearedLane>();
 
     // F-26: null = unknown (older service); only an explicit false is reported.
     [JsonPropertyName("secretDeleted")]

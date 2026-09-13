@@ -7,8 +7,12 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startMockUpstream, startTestRouter, authHeaders, LOCAL_KEY, type TestRouter } from "./harness.ts";
+import { startMockUpstream, startTestRouter, authHeaders, sessionHeaders, LOCAL_KEY, type TestRouter } from "./harness.ts";
 import { sanitizeForwardHeaders } from "../src/util.ts";
+
+// This file's DPAPI blob test needs the OS credential store (Windows-only),
+// like the established domain/proxy DPAPI-gated tests.
+const testWin = process.platform === "win32" ? test : test.skip;
 
 const routers: TestRouter[] = [];
 afterEach(() => {
@@ -51,7 +55,7 @@ describe("secret-at-rest protections", () => {
     upstream.stop();
   });
 
-  test("DPAPI blob file does not contain the plaintext key", async () => {
+  testWin("DPAPI blob file does not contain the plaintext key", async () => {
     const dir = mkdtempSync(join(tmpdir(), "gorouter-dpapi-"));
     try {
       const { createSecretStore, newRef } = await import("../src/secret-store.ts");
@@ -99,7 +103,7 @@ describe("secret-at-rest protections", () => {
     const originalLog = console.log;
     console.log = (...args: unknown[]) => { lines.push(args.join(" ")); };
     try {
-      await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+      await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
       const health = await fetch(`${router.baseUrl}/healthz`);
       await health.text();
       await fetch(`${router.baseUrl}/go/v1/models`, { headers: { authorization: "Bearer nope" } });
@@ -242,7 +246,7 @@ describe("loopback and upstream safety", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     // absolute-form URL or host header tricks must still hit the fixed authority
     const res = await fetch(`${router.baseUrl}/go/v1/models`, {
-      headers: authHeaders({ host: "evil.example.com" }),
+      headers: sessionHeaders({ host: "evil.example.com" }),
     });
     expect(res.status).toBe(200);
     expect(upstream.requests.length).toBe(1);
@@ -257,7 +261,7 @@ describe("loopback and upstream safety", () => {
       return Response.json({ type: "error", error: { type: "AuthError", message: "Invalid API key." } }, { status: 401 });
     });
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "sk-bogus" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders(), body: "{}" });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: sessionHeaders(), body: "{}" });
     expect(res.status).toBe(401);
     expect(calls).toBe(1);
     const body = (await res.json()) as { error: { type: string } };

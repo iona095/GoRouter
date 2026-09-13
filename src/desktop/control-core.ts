@@ -37,6 +37,12 @@ export interface ControlServiceOptions {
   secrets: SecretStore
   domain: Domain
   pipeName: string
+  /** W1 cold-Web-Control suppression: when true, startup caused solely by Web
+   * Control never auto-starts the router/model/provider work. Process-lifetime
+   * latch: no browser HTTP request can clear it; explicit authenticated native
+   * router.start remains available. Normal non-web startup omits this flag and
+   * keeps the exact pre-W1 auto-start policy. */
+  webSafe?: boolean
   routerCmd?: RouterCommand
   /** Test-only overrides (defaults match the contract). */
   probeIntervalMs?: number
@@ -109,6 +115,8 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
   const listeners = new Set<(snap: Snapshot) => void>()
 
   let started = false
+  // W1 web-safe latch: captured once at creation, never cleared afterwards.
+  const webSafeLatch = opts.webSafe === true
   let freshInit = false
   let armedCredential: string | null = null
   let onceConsumed = false
@@ -370,6 +378,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     const desk = desktop.read()
     return {
       serviceVersion: SERVICE_VERSION,
+      stateGeneration: st.stateGeneration,
       initialized: st.initialized,
       firstRun: firstRunNow(),
       stateCorrupt: st.stateCorrupt,
@@ -384,8 +393,8 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
         journalMaxRecords: st.settings.journalMaxRecords,
       },
       routes: Object.fromEntries(
-        st.routes.map((r) => [r.lane, { accountId: r.accountId, alias: r.alias }]),
-      ) as Record<string, { accountId: string | null; alias: string | null }>,
+        st.routes.map((r) => [r.lane, { accountId: r.accountId, alias: r.alias, version: r.version }]),
+      ) as Record<string, { accountId: string | null; alias: string | null; version: number }>,
       accounts: st.accounts.map((a) => ({
         id: a.id,
         alias: a.alias,
@@ -393,6 +402,7 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
         usedBy: a.usedBy,
         createdAtUtc: a.createdAtUtc,
         updatedAtUtc: a.updatedAtUtc,
+        version: a.version,
       })),
       router: routerView(),
       journal: journalStats(),
@@ -577,7 +587,10 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     // supervised child would serve defaults with no credential ref and climb
     // the backoff ladder. Manual router.start is unchanged.
     const gate = domain.status()
-    if (!firstRunNow() && !desktop.corrupt() && gate.stateUnsupportedVersion === null && desktop.unsupportedVersion() === null && gate.stateCorrupt !== true) supervisor.start()
+    // W1: a control service born through the cold Web Control path stays
+    // auto-start-suppressed for its process lifetime (explicit native
+    // router.start is unaffected).
+    if (!webSafeLatch && !firstRunNow() && !desktop.corrupt() && gate.stateUnsupportedVersion === null && desktop.unsupportedVersion() === null && gate.stateCorrupt !== true) supervisor.start()
     if (pollTimer === null) {
       pollTimer = setInterval(poll, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS)
     }
@@ -634,8 +647,10 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     if (partial.firstRunDone === true) {
       armedCredential = null // permanently unavailable for this state
       onceConsumed = true
-      // onboarding completed: apply the auto-start policy now
-      if (supervisor && supervisor.snapshot().state === 'stopped') supervisor.start()
+      // onboarding completed: apply the auto-start policy now (still gated by
+      // the W1 web-safe latch — a browser-reachable settings write cannot
+      // clear cold-Web-Control suppression).
+      if (!webSafeLatch && supervisor && supervisor.snapshot().state === 'stopped') supervisor.start()
     }
     noteChange()
     return next

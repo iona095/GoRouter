@@ -75,6 +75,7 @@ import {
   startMockUpstream,
   startTestRouter,
   authHeaders,
+  sessionHeaders,
   readJournalRows,
   LOCAL_KEY,
   type TestRouter,
@@ -141,7 +142,7 @@ describe("socket failure classification (§11)", () => {
       accounts: [{ alias: "a1", key: "k" }],
       routes: { go: "a1" },
     });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: { type: string } };
     expect(body.error.type).toBe("GoRouterUpstreamError");
@@ -161,7 +162,7 @@ describe("socket failure classification (§11)", () => {
       accounts: [{ alias: "a1", key: "k" }],
       routes: { go: "a1" },
     });
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     const t0 = Date.now();
     try {
@@ -187,7 +188,7 @@ describe("socket failure classification (§11)", () => {
       accounts: [{ alias: "a1", key: "k" }],
       routes: { go: "a1" },
     });
-    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
@@ -240,7 +241,7 @@ describe("socket failure classification (§11)", () => {
     const ac = new AbortController();
     const res = await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: sessionHeaders({ "content-type": "application/json" }),
       body: "{}",
       signal: ac.signal,
     });
@@ -273,7 +274,7 @@ describe("socket failure classification (§11)", () => {
     const port = router.server.port();
     const sock = net.connect(port, "127.0.0.1", () => {
       sock.end(
-        `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`,
+        `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nX-OpenCode-Session: conv-w0-test-01\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`,
       );
     });
     sock.setEncoding("utf8");
@@ -300,7 +301,7 @@ describe("socket failure classification (§11)", () => {
     const port = router.server.port();
     const sock = net.connect(port, "127.0.0.1", () => {
       sock.end(
-        `GET /go/v1/models HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nConnection: close\r\n\r\n`,
+        `GET /go/v1/models HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nX-OpenCode-Session: conv-w0-test-01\r\nConnection: close\r\n\r\n`,
       );
     });
     sock.setEncoding("utf8");
@@ -327,7 +328,7 @@ describe("socket failure classification (§11)", () => {
       routes: { go: "a1" },
     });
     const ac = new AbortController();
-    const fetchPromise = fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders(), signal: ac.signal });
+    const fetchPromise = fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders(), signal: ac.signal });
     await new Promise((r) => setTimeout(r, 300));
     ac.abort();
     let fetchRejected = false;
@@ -358,7 +359,7 @@ describe("socket failure classification (§11)", () => {
       accounts: [{ alias: "a1", key: "k" }],
       routes: { go: "a1" },
     });
-    const fetchPromise = fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() }).catch(() => null);
+    const fetchPromise = fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() }).catch(() => null);
     await new Promise((r) => setTimeout(r, 300));
     // stop() aborts the active controllers FIRST and the abort listeners fire
     // SYNCHRONOUSLY: the journal row must already be finalized the moment
@@ -387,7 +388,7 @@ describe("socket failure classification (§11)", () => {
       // declared length 100, only 2 bytes sent, then the client disconnects:
       // the body never completed and dispatch never began
       sock.write(
-        `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Length: 100\r\n\r\n{}`,
+        `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nX-OpenCode-Session: conv-w0-test-01\r\nContent-Length: 100\r\n\r\n{}`,
       );
     });
     sock.setEncoding("utf8");
@@ -630,7 +631,7 @@ describe("inbound body limits (F-13)", () => {
         // Phase 1: exact declared body. The server must resolve at the
         // declaration and dispatch — response arrives before any flood.
         sock.write(
-          `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n` + "x".repeat(100),
+          `POST /go/v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nX-OpenCode-Session: conv-w0-test-01\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n` + "x".repeat(100),
         );
       });
       let acc = "";

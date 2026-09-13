@@ -26,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore } from "../src/state.ts";
+import { lockPathFor, withFileLock } from "../src/lock.ts";
 import { peekRegistry, storeRegistry, emptyRegistryFile, registryPathFor } from "../src/models/registry.ts";
 import { createSecretStore, newRef } from "../src/secret-store.ts";
 import { memSecrets } from "./harness.ts";
@@ -53,6 +54,8 @@ describe("CURRENT-010 cache identity", () => {
     const paths = resolvePaths(dir);
     ensureStateDirs(paths);
     const store = createStateStore(paths, memSecrets());
+    // W0: establish the lineage before raw writes (unestablished husks fail closed).
+    withFileLock(lockPathFor(paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => { s.settings.upstreamGo = "http://127.0.0.1:1111/a"; });
     const ino1 = statSync(paths.stateJson).ino;
     expect(store.read().settings.upstreamGo).toBe("http://127.0.0.1:1111/a");
@@ -106,6 +109,8 @@ describe("CURRENT-010 cache identity", () => {
     const paths = resolvePaths(dir);
     ensureStateDirs(paths);
     const store = createStateStore(paths, memSecrets());
+    // W0: establish the lineage before raw writes (unestablished husks fail closed).
+    withFileLock(lockPathFor(paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => { s.settings.upstreamGo = "http://127.0.0.1:1111/a"; });
     expect(store.read().settings.upstreamGo).toBe("http://127.0.0.1:1111/a");
     // External actor using the same mechanism product writes use (atomic

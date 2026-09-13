@@ -25,7 +25,7 @@ import {
   sanitizeForwardHeaders,
   validateCorrelationId,
   OPENCODE_SESSION_HEADER,
-  resolveUpstreamSessionIdSafe,
+  resolveUpstreamSessionIdStrict,
   MIN_SUBSTRING_SECRET_LENGTH,
   extractUpstreamRequestIds,
   classifyEndpointFamily,
@@ -785,21 +785,26 @@ export function createServer(deps: ServerDeps): { serve: () => Promise<number>; 
       }
       return false;
     });
-    // OpenCode requires x-opencode-session (one stable id per conversation):
-    // resolve first, then apply the same credential-containment rule as every
-    // other forwarded header — the raw inbound value must not be re-introduced
-    // after stripping. Replaced (never deleted) on match, so upstream never
-    // sees a missing header.
-    const { sessionId, replaced } = resolveUpstreamSessionIdSafe(
-      req.headers.get(OPENCODE_SESSION_HEADER),
-      correlationId,
+    // H0 strict explicit-first session contract (section 5.2): the ONLY
+    // forward case is a valid credential-clean explicit x-opencode-session,
+    // forwarded byte-for-byte. Anything else is refused locally BEFORE any
+    // upstream dispatch (zero upstream bytes); correlation ids stay
+    // journal-only and are never mapped to session identity. A route/account
+    // switch cannot rewrite the id: session takes no part in selection.
+    const sessionDecision = resolveUpstreamSessionIdStrict(req.headers.get(OPENCODE_SESSION_HEADER), {
       localCred,
-      [snapshot.secret],
-    );
-    if (replaced) {
-      log.warn(`local credential stripped from forwarded header ${OPENCODE_SESSION_HEADER} (lane=${lane})`);
+      extraSecrets: [snapshot.secret],
+    });
+    if (sessionDecision.kind === "refuse") {
+      completeEntry("local_error", 400, [], monotonicMs() - started);
+      // Sanitized fixed diagnostics only — the raw rejected value is never
+      // echoed in the body or the log (section 5.5).
+      log.warn(`local session refused (${sessionDecision.error.reason}, lane=${lane})`);
+      const res = localError(400, sessionDecision.error.type, sessionDecision.error.message);
+      res.headers.set("x-gorouter-request-id", entry.routerRequestId);
+      return res;
     }
-    forwardHeaders.set(OPENCODE_SESSION_HEADER, sessionId);
+    forwardHeaders.set(OPENCODE_SESSION_HEADER, sessionDecision.sessionId);
     forwardHeaders.set(
       authHeaderForFamily(authFamily),
       authFamily === "bearer" ? `Bearer ${snapshot.secret}` : snapshot.secret,

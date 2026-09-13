@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore } from "../src/state.ts";
+import { lockPathFor, withFileLock } from "../src/lock.ts";
 import { atomicWriteJson } from "../src/util.ts";
 import { memSecrets } from "./harness.ts";
 
@@ -25,6 +26,9 @@ describe("R4-001 failed write cache poison", () => {
     const secrets = memSecrets();
     // Seed via production writer so on-disk bytes are canonical.
     const seed = createStateStore(paths, secrets);
+    // W0: establish the v2 lineage before raw seeding (unestablished husks
+    // fail closed on next load by design).
+    withFileLock(lockPathFor(paths.state), 10_000, () => seed.ensureV2());
     seed.mutate((s) => { s.settings.port = 8787; });
     const beforeBytes = readFileSync(paths.stateJson, "utf8");
     const beforePort = seed.read().settings.port;

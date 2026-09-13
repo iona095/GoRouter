@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { newRef, type SecretStore } from "../src/secret-store.ts";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore, makeAccount, type StateStore, type Lane } from "../src/state.ts";
+import { lockPathFor, withFileLock } from "../src/lock.ts";
 import { createJournal, type Journal } from "../src/journal.ts";
 import { createServer } from "../src/server.ts";
 
@@ -119,11 +120,15 @@ export async function startTestRouter(opts: {
   const paths = resolvePaths(stateDir);
   ensureStateDirs(paths);
   const secrets = opts.secrets ?? memSecrets();
+  const state = createStateStore(paths, secrets);
+  // W0 (Amendment A1): establish exactly one v2 lineage under the mutation
+  // lock before seeding, mirroring production setup. makeAccount stamps
+  // version 1; seeded lane selections keep the initial route version 1.
+  withFileLock(lockPathFor(paths.state), 10_000, () => state.ensureV2());
   // CURRENT-001: the harness mints canonical refs exactly like production
   // (newRef), so state-load containment filtering exercises the real path.
   const localRef = newRef();
   secrets.put(localRef, opts.localKey ?? LOCAL_KEY);
-  const state = createStateStore(paths, secrets);
   state.mutate((s) => {
     s.localCredentialRef = localRef;
     s.settings.port = 0;
@@ -183,6 +188,17 @@ export function authHeaders(extra?: Record<string, string>): Headers {
   return h;
 }
 
+/**
+ * W0 (Amendment A5): auth headers PLUS an explicit synthetic session for
+ * success-path dispatches under the retained H0 session contract. Additive
+ * only — authHeaders() behavior is unchanged for admission-negative tests.
+ */
+export function sessionHeaders(extra?: Record<string, string>, session = "conv-w0-test-01"): Headers {
+  const h = authHeaders(extra);
+  h.set("x-opencode-session", session);
+  return h;
+}
+
 /** Read journal rows directly from the journal sqlite db. */
 export function readJournalRows(dbPath: string): Array<Record<string, unknown>> {
   const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
@@ -239,7 +255,7 @@ function parseRawResponse(data: string, elapsedMs: number): RawGetResult {
  * bytes preserved (fetch/undici would normalize dot segments and escapes).
  * Reads until the connection closes, then parses the status line + body.
  */
-export async function rawGet(port: number, rawPath: string): Promise<RawGetResult> {
+export async function rawGet(port: number, rawPath: string, extraHeaders?: Record<string, string>): Promise<RawGetResult> {
   const { connect } = await import("node:net");
   const started = Date.now();
   return new Promise((resolve) => {
@@ -247,8 +263,9 @@ export async function rawGet(port: number, rawPath: string): Promise<RawGetResul
     let data = "";
     sock.setEncoding("utf8");
     sock.on("connect", () => {
+      const extra = Object.entries(extraHeaders ?? {}).map(([k, v]) => `${k}: ${v}\r\n`).join("");
       sock.write(
-        `GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\nConnection: close\r\n\r\n`,
+        `GET ${rawPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: Bearer ${LOCAL_KEY}\r\n${extra}Connection: close\r\n\r\n`,
       );
     });
     sock.on("data", (d) => { data += d; });

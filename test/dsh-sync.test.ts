@@ -24,7 +24,7 @@ import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore, makeAccount } from "../src/state.ts";
 import { createJournal } from "../src/journal.ts";
 import { createServer } from "../src/server.ts";
-import { memSecrets, LOCAL_KEY, authHeaders, startMockUpstream, startTestRouter as _unused, readYamlFile } from "./harness.ts";
+import { memSecrets, LOCAL_KEY, authHeaders, sessionHeaders, startMockUpstream, startTestRouter as _unused, readYamlFile } from "./harness.ts";
 import { newRef } from "../src/secret-store.ts";
 import { createDomain } from "../src/domain.ts";
 import {
@@ -1329,7 +1329,7 @@ describe("Slice A regression (deterministic, no live network)", () => {
     const baseUrl = "http://127.0.0.1:" + server.port();
     const noAuth = await fetch(baseUrl+"/go/v1/models");
     expect(noAuth.status).toBe(401);
-    const ok = await fetch(baseUrl+"/go/v1/models", { headers: authHeaders() });
+    const ok = await fetch(baseUrl+"/go/v1/models", { headers: sessionHeaders() });
     expect(ok.status).toBe(200);
     const j = await ok.json() as any;
     expect(j.data.map((m:any)=>m.id)).toEqual(["cached"]);
@@ -1356,7 +1356,8 @@ describe("Slice A regression (deterministic, no live network)", () => {
     const server = createServer({ state, journal, paths, startupRefresh:false });
     await server.serve(); servers.push({ stop: ()=>server.stop(), journal });
     const baseUrl = "http://127.0.0.1:" + server.port();
-    const res = await fetch(baseUrl+"/go/v1/chat/completions", { method:"POST", headers: new Headers({ authorization: `Bearer ${LOCAL_KEY}`, "content-type":"application/json" }), body: JSON.stringify({ model:"cached", messages:[] }) });
+    // W0 (Amendment A5/A7): inference dispatch carries a session.
+    const res = await fetch(baseUrl+"/go/v1/chat/completions", { method:"POST", headers: sessionHeaders({ "content-type":"application/json" }), body: JSON.stringify({ model:"cached", messages:[] }) });
     expect(res.status).toBe(200);
     const upstreamHit = upstream.requests.find(r=>r.path.includes("chat/completions"));
     expect(upstreamHit).toBeDefined();

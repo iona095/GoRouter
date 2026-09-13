@@ -468,7 +468,8 @@ public sealed partial class FirstRunFlow : Form
             status.Text = "Adding account…";
             try
             {
-                var response = await _channel.CallAsync("account.add", new { alias, secret }, 15_000);
+                var generation = _channel.Snapshot?.StateGeneration ?? "";
+                var response = await _channel.CallAsync("account.add", new { alias, secret, expectedStateGeneration = generation }, 15_000);
                 if (response.Ok)
                 {
                     _accountsAdded++;
@@ -589,9 +590,13 @@ public sealed partial class FirstRunFlow : Form
 
         try
         {
+            // W0: reviewed snapshot values; conflicts surface as text, never auto-retried.
+            var snap = _channel.Snapshot;
+            var watchedRoute = lane == "go" ? snap?.Routes.Go : snap?.Routes.Zen;
+            var watchedTargetVersion = snap?.Accounts.FirstOrDefault(a => a.Id == accountId)?.Version ?? 1;
             var response = accountId is null
-                ? await _channel.CallAsync("route.clear", new { lane })
-                : await _channel.CallAsync("route.set", new { lane, accountId });
+                ? await _channel.CallAsync("route.clear", new { lane, expectedStateGeneration = snap?.StateGeneration ?? "", expectedRouteVersion = watchedRoute?.Version ?? 1 })
+                : await _channel.CallAsync("route.set", new { lane, accountId, expectedStateGeneration = snap?.StateGeneration ?? "", expectedRouteVersion = watchedRoute?.Version ?? 1, expectedTargetAccountVersion = watchedTargetVersion });
             // Returned to a status label upstream: cap before crossing.
             return response.Ok ? null : UiText.Truncate(response.ErrorMessage ?? "Route change failed.");
         }

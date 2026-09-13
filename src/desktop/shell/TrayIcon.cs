@@ -18,6 +18,7 @@ public sealed class TrayIcon : IDisposable
     private readonly ToolStripMenuItem _miStart;
     private readonly ToolStripMenuItem _miStop;
     private readonly ToolStripMenuItem _miOpen;
+    private readonly ToolStripMenuItem _miWebControl;
     private readonly ToolStripMenuItem _miGo;
     private readonly ToolStripMenuItem _miZen;
     private readonly ToolStripMenuItem _miStartAtLogin;
@@ -29,6 +30,7 @@ public sealed class TrayIcon : IDisposable
     private Icon? _icon;
 
     public event Action? OpenControlCenterRequested;
+    public event Action? OpenWebControlRequested;
     public event Action? StartRouterRequested;
     public event Action? StopRouterRequested;
 
@@ -45,6 +47,7 @@ public sealed class TrayIcon : IDisposable
         _miStart = new ToolStripMenuItem("Start router") { AccessibleName = "Start router" };
         _miStop = new ToolStripMenuItem("Stop router") { AccessibleName = "Stop router" };
         _miOpen = new ToolStripMenuItem("Open control center") { AccessibleName = "Open control center" };
+        _miWebControl = new ToolStripMenuItem("Open web control") { AccessibleName = "Open web control in the browser" };
         _miGo = new ToolStripMenuItem("Go ▸") { AccessibleName = "Go lane account selection" };
         _miZen = new ToolStripMenuItem("Zen ▸") { AccessibleName = "Zen lane account selection" };
         _miStartAtLogin = new ToolStripMenuItem("Start at login") { AccessibleName = "Start at login" };
@@ -58,6 +61,7 @@ public sealed class TrayIcon : IDisposable
             _miStop,
             new ToolStripSeparator(),
             _miOpen,
+            _miWebControl,
             new ToolStripSeparator(),
             _miGo,
             _miZen,
@@ -70,6 +74,7 @@ public sealed class TrayIcon : IDisposable
         _miStart.Click += (_, _) => StartRouterRequested?.Invoke();
         _miStop.Click += (_, _) => StopRouterRequested?.Invoke();
         _miOpen.Click += (_, _) => OpenControlCenterRequested?.Invoke();
+        _miWebControl.Click += (_, _) => OpenWebControlRequested?.Invoke();
         _miStartAtLogin.CheckOnClick = true;
         _miStartAtLogin.CheckedChanged += (_, _) =>
         {

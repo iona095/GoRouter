@@ -236,8 +236,13 @@ not ours.
 
 Transport: newline-delimited UTF-8 JSON (one object per line, `\n` only,
 max line 1 MiB — larger is closed by the server). `hello` must be the first
-message (`{"app":"GoRouterDesktop","version":"1.5.0"}`); the server replies
-with `{"serviceVersion":"1.5.0","protocol":1}` and pushes an initial
+message and must COMPLETE before any other op is dispatched: capability
+depends on successful hello, not on merely seeing a hello frame. `hello`
+carries the expected protocol number (`{"app":"GoRouterDesktop",
+"version":"1.5.0","protocol":2}`); a missing/mismatched protocol is
+rejected `unsupported` with no snapshot, mutation, or subscription granted
+(the socket stays usable for a hello retry). The server replies
+with `{"serviceVersion":"1.5.0","protocol":2}` and pushes an initial
 `snapshot` event.
 
 Client ops: `snapshot`, `route.set` / `route.clear`, `account.add` /
@@ -252,15 +257,32 @@ Client ops: `snapshot`, `route.set` / `route.clear`, `account.add` /
 
 Error codes: `validation | not_found | conflict | auth | unsupported |
 external | unavailable | internal`. Messages never contain secrets.
+Stale account/route mutations fail `conflict` (or `not_found` for vanished
+identity) with a stable machine-readable `reason` beneath the code
+(`state_generation_mismatch | route_version_mismatch |
+account_version_mismatch | account_in_use | alias_conflict | not_found |
+target_not_selectable`); every mutating op requires the reviewed
+`expectedStateGeneration` plus the relevant expected versions and the
+immutable account ID (aliases are UI/CLI ergonomics only, never commit
+identity). Successful mutations return commit-captured `changed`,
+generation, IDs, and versions — never a post-lock re-read.
 
-The single `snapshot` shape carries: `serviceVersion`, `initialized`,
+Concurrency lineage boundary: the generation identifies one active persisted
+state lineage. Explicit reset/reinitialization mints a new generation, so
+pre-reset requests fail. Manually restoring a backup (or otherwise replacing
+`state.json` outside the product) is an operational lineage replacement:
+concurrent-editor guarantees do not span it — every client and service must
+restart/re-read before mutating after such a replacement.
+
+The single `snapshot` shape carries: `serviceVersion`, `stateGeneration`
+(persisted lineage token; `""` when unestablished), `initialized`,
 `firstRun`, `stateCorrupt`, `stateUnsupportedVersion` /
-`desktopUnsupportedVersion` (on-disk schema version when it is not v1 —
+`desktopUnsupportedVersion` (on-disk schema version when it is not v2 —
 the shell renders the compatibility banner and auto-start stays
 suppressed), `secretStore` (`"ok"|"unavailable"` — probed by
 DPAPI-unprotecting the admin token blob, never logging the value),
-`settings`, `routes` (per lane: `accountId` + `alias`), `accounts`
-(`secretPresent` boolean only — never a secret), `router` (state, mode,
+`settings`, `routes` (per lane: `accountId` + `alias` + `version`), `accounts`
+(`secretPresent` boolean only — never a secret — plus `version`), `router` (state, mode,
 pid, port, restartCount), `journal` (records, oldest/newest, degraded,
 retention), `desktop` (startAtLogin, minimizeToTray, firstRunDoneAtUtc),
 `stateDir` (informational) and `localCredentialConfigured`.

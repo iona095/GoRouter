@@ -16,6 +16,7 @@ import {
   startMockUpstream,
   startTestRouter,
   authHeaders,
+  sessionHeaders,
   readJournalRows,
   rawGet,
   type TestRouter,
@@ -42,9 +43,9 @@ describe("lane path namespace enforcement (F-01)", () => {
       accounts: [{ alias: "a1", key: "key-a1" }],
       routes: { go: "a1", zen: "a1" },
     });
-    const go = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const go = await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     expect(go.status).toBe(200);
-    const zen = await fetch(`${router.baseUrl}/zen/v1/models`, { headers: authHeaders() });
+    const zen = await fetch(`${router.baseUrl}/zen/v1/models`, { headers: sessionHeaders() });
     expect(zen.status).toBe(200);
     expect(upstream.requests.length).toBe(2);
     expect(upstream.requests[0]!.path).toBe("/zen/go/v1/models");
@@ -104,11 +105,13 @@ describe("lane path namespace enforcement (F-01)", () => {
       accounts: [{ alias: "a1", key: "key-a1" }],
       routes: { go: "a1", zen: "a1" },
     });
-    const dot = await rawGet(router.server.port(), "/go/v1/./x");
+    // W0 (Amendment A5/A7): success-path dispatches carry a session.
+    const sess = { "x-opencode-session": "conv-w0-test-01" };
+    const dot = await rawGet(router.server.port(), "/go/v1/./x", sess);
     expect(dot.status).toBe(200);
     expect(upstream.requests.length).toBe(1);
     expect(upstream.requests[0]!.path).toBe("/zen/go/v1/x");
-    const dotdot = await rawGet(router.server.port(), "/go/v1/x/..");
+    const dotdot = await rawGet(router.server.port(), "/go/v1/x/..", sess);
     expect(dotdot.status).toBe(200);
     expect(upstream.requests.length).toBe(2);
     expect(upstream.requests[1]!.path).toBe("/zen/go/v1/");

@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJournal, JOURNAL_SCHEMA_VERSION } from "../src/journal.ts";
-import { startMockUpstream, startTestRouter, authHeaders, readJournalRows, type TestRouter } from "./harness.ts";
+import { startMockUpstream, startTestRouter, authHeaders, sessionHeaders, readJournalRows, type TestRouter } from "./harness.ts";
 
 const routers: TestRouter[] = [];
 afterEach(() => {
@@ -29,7 +29,7 @@ describe("journal basics", () => {
     const ids = new Set<string>();
     const results = await Promise.all(
       Array.from({ length: 25 }, () =>
-        fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() }).then(async (r) => {
+        fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() }).then(async (r) => {
           const id = r.headers.get("x-gorouter-request-id")!;
           ids.add(id);
           return id;
@@ -50,7 +50,7 @@ describe("journal basics", () => {
   test("record carries lane, method, endpoint family, timing, status, outcome", async () => {
     const upstream = await startMockUpstream(() => Response.json({ ok: true }, { status: 200, headers: { "x-request-id": "up-id-42" } }));
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions?q=1`, { method: "POST", headers: authHeaders(), body: "{}" });
+    const res = await fetch(`${router.baseUrl}/go/v1/chat/completions?q=1`, { method: "POST", headers: sessionHeaders(), body: "{}" });
     expect(res.status).toBe(200);
     const rows = readJournalRows(router.paths.journalDb);
     expect(rows.length).toBe(1);
@@ -78,15 +78,15 @@ describe("journal basics", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "x-gorouter-correlation-id": "valid-correlation-1" }),
+      headers: sessionHeaders({ "x-gorouter-correlation-id": "valid-correlation-1" }),
       body: JSON.stringify({ model: "secret-model-name" }),
     });
     await fetch(`${router.baseUrl}/go/v1/chat/completions`, {
       method: "POST",
-      headers: authHeaders({ "x-gorouter-correlation-id": "bad id with spaces!!" }),
+      headers: sessionHeaders({ "x-gorouter-correlation-id": "bad id with spaces!!" }),
       body: "{}",
     });
-    await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: authHeaders(), body: "{}" });
+    await fetch(`${router.baseUrl}/go/v1/chat/completions`, { method: "POST", headers: sessionHeaders(), body: "{}" });
     const rows = readJournalRows(router.paths.journalDb);
     expect(rows[0]!.client_correlation_id).toBe("valid-correlation-1");
     expect(rows[1]!.client_correlation_id).toBeNull();
@@ -100,12 +100,12 @@ describe("journal basics", () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "alpha", key: "k" }], routes: { go: "alpha" } });
     const before = router.state.read().accounts[0]!;
-    await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     router.state.mutate((s) => {
       const a = s.accounts.find((x) => x.id === before.id)!;
       a.alias = "beta";
     });
-    await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     const rows = readJournalRows(router.paths.journalDb);
     expect(rows.length).toBe(2);
     expect(rows[0]!.selected_account_id).toBe(before.id);
@@ -120,7 +120,7 @@ describe("journal persistence and retention", () => {
   test("records survive journal reopen (router restart)", async () => {
     const upstream = await startMockUpstream();
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     expect(readJournalRows(router.paths.journalDb).length).toBe(1);
     router.journal.close();
     const reopened = createJournal(router.paths.journalDb, 30, 100_000);
@@ -174,7 +174,7 @@ describe("journal persistence and retention", () => {
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
     // simulate a storage fault: close the journal db underneath the server
     router.journal.close();
-    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/models`, { headers: sessionHeaders() });
     expect(res.status).toBe(200); // routing must not be blocked
     // CURRENT-007: degraded evidence moved off the unauthenticated surface;
     // the same journal handle reports it (control pipe journal.stats agrees).
@@ -189,7 +189,7 @@ describe("local response metadata", () => {
   test("x-gorouter-request-id header does not alter response body; not sent upstream", async () => {
     const upstream = await startMockUpstream(() => Response.json({ hello: "world" }));
     const router = await newRouter({ upstreamBase: upstream.baseUrl, accounts: [{ alias: "a1", key: "k" }], routes: { go: "a1" } });
-    const res = await fetch(`${router.baseUrl}/go/v1/echo`, { headers: authHeaders() });
+    const res = await fetch(`${router.baseUrl}/go/v1/echo`, { headers: sessionHeaders() });
     expect(await res.json()).toEqual({ hello: "world" });
     expect(upstream.requests[0]!.headers.get("x-gorouter-request-id")).toBeNull();
     upstream.stop();

@@ -73,7 +73,6 @@ export function serveControlPipe(
     // the cap applies to raw bytes BEFORE waiting for a newline, so a client
     // streaming data without '\n' cannot grow memory without limit.
     let buf = Buffer.alloc(0)
-    let helloSeen = false
     // A hello that completed keeps the subscription even if a LATER hello
     // fails (out-of-order pipelined hellos, stray retries): only a hello
     // that never succeeded leaves the socket unsubscribed.
@@ -152,11 +151,14 @@ export function serveControlPipe(
           send({ id, ok: false, error: { code: 'validation', message: 'missing op' } })
           continue
         }
-        if (!helloSeen && msg.op !== 'hello') {
-          send({ id, ok: false, error: { code: 'validation', message: 'hello must be the first message' } })
+        // W0 successful-hello gating (contract 6.4): post-hello capability
+        // depends on a COMPLETED hello (helloOk), not on merely seeing a
+        // hello frame. A failed/mismatched hello leaves the socket usable for
+        // a hello retry, but no non-hello op is dispatched until one succeeds.
+        if (msg.op !== 'hello' && !helloOk) {
+          send({ id, ok: false, error: { code: 'validation', message: 'hello must complete before other operations' } })
           continue
         }
-        if (msg.op === 'hello') helloSeen = true
         const params =
           msg.params && typeof msg.params === 'object' && !Array.isArray(msg.params)
             ? (msg.params as Record<string, unknown>)
@@ -177,11 +179,12 @@ export function serveControlPipe(
               // usable for a retry, but receives no pushes until one succeeds
               // — unless an earlier hello already completed (helloOk).
               if (msg.op === 'hello' && !helloOk) clients.delete(socket)
-              const e = err as { code?: unknown; message?: unknown }
+              const e = err as { code?: unknown; message?: unknown; reason?: unknown }
               const code =
                 typeof e.code === 'string' && ERROR_CODES[e.code as ErrorCode] ? (e.code as ErrorCode) : 'internal'
               const message = typeof e.message === 'string' && e.message.length > 0 ? e.message : 'internal error'
-              send({ id, ok: false, error: { code, message } })
+              const reason = typeof e.reason === 'string' && e.reason.length > 0 ? e.reason : undefined
+              send({ id, ok: false, error: reason === undefined ? { code, message } : { code, message, reason } })
             },
           )
       }

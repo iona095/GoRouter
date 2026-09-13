@@ -77,16 +77,18 @@ describe("GR-008 end-to-end query transparency", () => {
     });
     try {
       const auth = "Bearer " + LOCAL_KEY;
+      // W0 (Amendment A5/A7): success-path dispatches carry an explicit session.
+      const sess = { "x-opencode-session": "conv-w0-test-01" };
       const clean = await fetch(router.baseUrl + "/go/v1/chat/completions?x=a%20b&flag&b=2&b=1", {
         method: "POST",
-        headers: { authorization: auth, "content-type": "application/json" },
+        headers: { authorization: auth, "content-type": "application/json", ...sess },
         body: JSON.stringify({ model: "m", messages: [] }),
       });
       expect(clean.status).toBe(200);
       expect(new URL(upstream.requests[0]!.url).search).toBe("?x=a%20b&flag&b=2&b=1");
       const tainted = await fetch(router.baseUrl + "/go/v1/chat/completions?api_key=keep&api_key=" + encodeURIComponent(LOCAL_KEY) + "&flag", {
         method: "POST",
-        headers: { authorization: auth, "content-type": "application/json" },
+        headers: { authorization: auth, "content-type": "application/json", ...sess },
         body: JSON.stringify({ model: "m", messages: [] }),
       });
       expect(tainted.status).toBe(200);

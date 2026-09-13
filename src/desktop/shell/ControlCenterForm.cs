@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace GoRouterDesktop;
@@ -57,7 +58,7 @@ public sealed class ControlCenterForm : Form
     private Button _btnResumeOnboarding = null!;
 
     // tabs
-    private TabControl _tabs = null!;
+    private VisionTabControl _tabs = null!;
     private TabPage _tabJournal = null!;
 
     // routing tab
@@ -74,6 +75,20 @@ public sealed class ControlCenterForm : Form
     private bool _routeBusyGo;
     private bool _routeBusyZen;
     private TabPage _tabHome = null!;
+    private TableLayoutPanel _routingGrid = null!;
+    private TabPage _tabAccounts = null!;
+    private TabPage _tabSystem = null!;
+    private HeaderToolbar _toolbar = null!;
+    private HeaderNavItem[] _navItems = System.Array.Empty<HeaderNavItem>();
+    private HeaderMetricCard _metricTotal = null!;
+    private HeaderMetricCard _metricSuccess = null!;
+    private HeaderMetricCard _metricLatency = null!;
+    private MetricBlock _goReq = null!;
+    private MetricBlock _goRate = null!;
+    private MetricBlock _goLatency = null!;
+    private MetricBlock _zenReq = null!;
+    private MetricBlock _zenRate = null!;
+    private MetricBlock _zenLatency = null!;
     private ListView _lvActivity = null!;
     private Label _lblActivityDegraded = null!;
     private Control _lblActivityEmpty = null!;
@@ -130,6 +145,12 @@ public sealed class ControlCenterForm : Form
         _channel.StateChanged += OnChannelStateChanged;
         _channel.SnapshotReceived += OnChannelSnapshot;
 
+        // Framework DPI scaling (completes the PerMonitorV2 process mode):
+        // without this, layout stays in 96dpi-logical units while GDI text
+        // renders at the monitor DPI, so every label overflows its rect.
+        // Set before BuildLayout so all bounds and fonts scale together.
+        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoScaleDimensions = new SizeF(96F, 96F);
         BuildLayout();
         ApplySnapshot(_channel.Snapshot ?? ShellSnapshot.Empty);
         SetClientState(_channel.State);
@@ -196,7 +217,7 @@ public sealed class ControlCenterForm : Form
     private void BuildLayout()
     {
         Text = "GoRouter Desktop";
-        ClientSize = new Size(960, 660);
+        ClientSize = new Size(1320, 880);
         MinimumSize = new Size(800, 560);
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
@@ -211,34 +232,50 @@ public sealed class ControlCenterForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 5,
             BackColor = VisualTheme.WindowBack,
             AccessibleName = "Control center layout",
         };
+        while (root.ColumnStyles.Count < root.ColumnCount) { root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f)); }
+        root.ColumnStyles[0].SizeType = SizeType.Percent;
+        root.ColumnStyles[0].Width = 100f;
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 0 status bar
         root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 1 banner
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 2 tabs
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 3 footer
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 2 nav/stats toolbar
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 3 tabs
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // 4 footer
 
         root.Controls.Add(BuildStatusBar(), 0, 0);
         root.Controls.Add(BuildBanner(), 0, 1);
-        _tabs = new TabControl
+        _tabs = new VisionTabControl
         {
             Dock = DockStyle.Fill,
             AccessibleName = "Control center sections",
-            DrawMode = TabDrawMode.OwnerDrawFixed,
+            // Tab headers live in the shared toolbar above: the native strip
+            // is collapsed to a 1px sliver so all page semantics (selection,
+            // visibility, keyboard) stay on the TabControl itself.
             SizeMode = TabSizeMode.Fixed,
-            ItemSize = new Size(120, 30),
+            ItemSize = new Size(0, 1),
             Padding = new Point(0, 0),
             BackColor = VisualTheme.WindowBack,
+            // Tuck the collapsed 1px native strip under the toolbar so no
+            // bright seam shows between the toolbar and the tab pages.
+            Margin = new Padding(0, -2, 0, 0),
         };
-        _tabs.DrawItem += OnTabsDrawItem;
         _tabHome = BuildRoutingTab();
         _tabs.TabPages.Add(_tabHome);
-        _tabs.TabPages.Add(BuildAccountsTab());
+        _tabAccounts = BuildAccountsTab();
+        _tabs.TabPages.Add(_tabAccounts);
         _tabJournal = BuildJournalTab();
         _tabs.TabPages.Add(_tabJournal);
-        _tabs.TabPages.Add(BuildSystemTab());
+        _tabSystem = BuildSystemTab();
+        _tabs.TabPages.Add(_tabSystem);
+        _toolbar = BuildHeaderToolbar();
+        root.Controls.Add(_toolbar, 0, 2);
+        _toolbar.Resize += (_, _) => BeginSyncToolbarRow(root);
+        SyncToolbarRow(root);
+        root.RowStyles[4].SizeType = SizeType.Absolute;
+        root.RowStyles[4].Height = 48;
         // All pages share the soft-cool-gray application background; the tab
         // strip itself is painted flat by OnTabsDrawItem.
         foreach (TabPage page in _tabs.TabPages)
@@ -257,46 +294,205 @@ public sealed class ControlCenterForm : Form
             var nowJournal = _tabs.SelectedTab == _tabJournal;
             var fromJournal = ReferenceEquals(_lastSelectedTab, _tabJournal);
             _lastSelectedTab = _tabs.SelectedTab;
+            var selected = _tabs.SelectedTab;
+            _toolbar?.SetActive(selected is null ? 0 : Math.Max(0, _tabs.TabPages.IndexOf(selected)));
             if (nowJournal || (_tabs.SelectedTab == _tabHome && !fromJournal))
             {
                 _ = RefreshJournalAsync();
             }
         };
         Controls.Add(root);
-        root.Controls.Add(_tabs, 0, 2);
-        root.Controls.Add(BuildFooter(), 0, 3);
+        root.Controls.Add(_tabs, 0, 3);
+        root.Controls.Add(BuildFooter(), 0, 4);
+        Shown += (_, _) => SyncFlatSurfacesTheme();
+        // Fit pass once the live device context exists (see HeaderToolbar:
+        // construction estimates cannot know the run's DPI scaling).
+        Shown += (_, _) => _toolbar?.GrowToFitOnce();
     }
 
     /// <summary>
-    /// Flat modern tab strip: the selected tab gets a white surface with a
-    /// neutral underline; unselected tabs stay quiet on the page background.
-    /// Keyboard accessibility and tab semantics are unchanged.
+    /// The shared navigation/statistics toolbar: four borderless nav items
+    /// driving the hidden-header TabControl plus three live metric cards fed
+    /// by the same data pipeline as before (no second fetching mechanism).
     /// </summary>
-    private void OnTabsDrawItem(object? sender, DrawItemEventArgs e)
+    private void BeginSyncToolbarRow(TableLayoutPanel root)
     {
-        var tabs = (TabControl)sender!;
-        var selected = e.Index == tabs.SelectedIndex;
-        var page = tabs.TabPages[e.Index];
-        var bounds = e.Bounds;
-        bounds.Inflate(-4, -2);
-
-        using (var back = new SolidBrush(selected ? VisualTheme.SurfaceWhite : VisualTheme.WindowBack))
+        try
         {
-            e.Graphics.FillRectangle(back, e.Bounds);
+            if (_toolbar == null || _toolbar.IsDisposed || !_toolbar.IsHandleCreated) { SyncToolbarRow(root); return; }
+            _toolbar.BeginInvoke(new Action(() => SyncToolbarRow(root)));
         }
+        catch { }
+    }
 
-        TextRenderer.DrawText(
-            e.Graphics,
-            page.Text,
-            selected ? VisualTheme.FieldLabelFont : VisualTheme.BodyFont,
-            bounds,
-            selected ? VisualTheme.PrimaryText : VisualTheme.SecondaryText,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
-
-        if (selected)
+    private void SyncToolbarRow(TableLayoutPanel root)
+    {
+        try
         {
-            using var pen = new Pen(VisualTheme.PrimaryText, 2f);
-            e.Graphics.DrawLine(pen, e.Bounds.Left + 12, e.Bounds.Bottom - 2, e.Bounds.Right - 12, e.Bounds.Bottom - 2);
+            if (_toolbar == null || _toolbar.IsDisposed) { return; }
+            if (root == null || root.IsDisposed) { return; }
+            TableLayoutPanelCellPosition pos = root.GetPositionFromControl(_toolbar);
+            if (pos.Row < 0 || pos.Row >= root.RowStyles.Count) { return; }
+            root.RowStyles[pos.Row].SizeType = SizeType.Absolute;
+            if (root.RowStyles[pos.Row].Height != _toolbar.Height)
+            {
+                root.RowStyles[pos.Row].Height = _toolbar.Height;
+            }
+        }
+        catch { }
+    }
+
+    private HeaderToolbar BuildHeaderToolbar()
+    {
+        const string windowNote = "Recent window (up to 200 requests): the total is the retained journal count; success rate and latency derive from recent requests.";
+        _metricTotal = new HeaderMetricCard("Total Requests", HeaderMetricIcon.Requests, 165, windowNote);
+        _metricSuccess = new HeaderMetricCard("Success Rate", HeaderMetricIcon.Success, 163, windowNote);
+        _metricLatency = new HeaderMetricCard("Avg. Latency", HeaderMetricIcon.Latency, 155, windowNote);
+        // Widths start from the reference estimates; each item then grows
+        // to its live measured label width (the brief allows tuning to the
+        // actual font), so labels never trim or wrap on any machine/DPI.
+        var navSpecs = new (string Text, HeaderNavIcon Icon, int MinWidth, int Tab)[]
+        {
+            ("Routing", HeaderNavIcon.Routing, 184, 5),
+            ("Accounts", HeaderNavIcon.Accounts, 186, 6),
+            ("Journal", HeaderNavIcon.Journal, 188, 7),
+            ("System", HeaderNavIcon.System, 176, 8),
+        };
+        _navItems = new HeaderNavItem[navSpecs.Length];
+        for (var ni = 0; ni < navSpecs.Length; ni++)
+        {
+            var spec = navSpecs[ni];
+            var item = new HeaderNavItem(spec.Text, spec.Icon, spec.MinWidth) { TabIndex = spec.Tab };
+            // +12px safety: TextRenderer.MeasureText under-reports bold
+            // overhang, and a trimmed nav label breaks the header.
+            var need = 20 + 28 + 17 + MeasureNavLabel(spec.Text) + 14 + 12;
+            if (need > item.Width)
+            {
+                item.Width = need;
+                item.MinimumSize = new Size(need, 0);
+                item.MaximumSize = new Size(need, int.MaxValue);
+            }
+            _navItems[ni] = item;
+        }
+        var pages = new TabPage[] { _tabHome, _tabAccounts, _tabJournal, _tabSystem };
+        for (var i = 0; i < _navItems.Length; i++)
+        {
+            var page = pages[i];
+            _navItems[i].ShowSeparator = i < _navItems.Length - 1;
+            _navItems[i].Activated += (_, _) =>
+            {
+                // Same semantics as clicking a native tab header: selection
+                // flows through SelectedIndexChanged (journal refresh paths
+                // and Back-is-pure-navigation rules all live there).
+                _tabs.SelectedTab = page;
+            };
+        }
+        var toolbar = new HeaderToolbar(_navItems, new[] { _metricTotal, _metricSuccess, _metricLatency }, windowNote)
+        {
+            Dock = DockStyle.Fill,
+            Margin = new Padding(VisualTheme.PagePadding, 6, VisualTheme.PagePadding, 6),
+        };
+        var initial = _tabs.SelectedTab;
+        toolbar.SetActive(initial is null ? 0 : Math.Max(0, _tabs.TabPages.IndexOf(initial)));
+        return toolbar;
+    }
+
+    /// <summary>
+    /// Nav label width in the form's (DPI-scaled) layout units. Both sides
+    /// share the framework scaling now, so no manual conversion applies.
+    /// </summary>
+    private static int MeasureNavLabel(string text)
+    {
+        return TextRenderer.MeasureText(
+            text, HeaderFonts.NavActive,
+            new Size(int.MaxValue, int.MaxValue),
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix).Width;
+    }
+
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    private static extern int SetWindowTheme(IntPtr hWnd, string? pszSubAppName, string? pszSubIdList);
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(HandleRef hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out NativeRect rect);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeRect
+    {
+        internal int Left;
+        internal int Top;
+        internal int Right;
+        internal int Bottom;
+    }
+
+    /// <summary>
+    /// Width to reserve for the classic vertical scrollbar when the rows
+    /// need one. Computed from measured header/row heights (never from the
+    /// WS_VSCROLL bit, which lags row changes by a paint cycle and caused a
+    /// horizontal scrollbar to pop over content right after loads).
+    /// </summary>
+    private static int VScrollAllowance(ListView lv)
+    {
+        try
+        {
+            if (!lv.IsHandleCreated || lv.Items.Count == 0 || lv.ClientSize.Height <= 0)
+            {
+                return 0;
+            }
+            var rowH = lv.GetItemRect(0).Height;
+            if (rowH <= 0)
+            {
+                return 0;
+            }
+            const int LVM_GETHEADER = 0x101F;
+            var headerH = 30;
+            var header = SendMessage(new HandleRef(lv, lv.Handle), LVM_GETHEADER, IntPtr.Zero, IntPtr.Zero);
+            if (header != IntPtr.Zero && GetWindowRect(header, out var rc))
+            {
+                headerH = Math.Max(10, rc.Bottom - rc.Top);
+            }
+            return headerH + rowH * lv.Items.Count > lv.ClientSize.Height
+                ? SystemInformation.VerticalScrollBarWidth
+                : 0;
+        }
+        catch
+        {
+            // Cosmetic only; fall through to no reservation.
+        }
+        return 0;
+    }
+
+    /// <summary>
+    /// Vision UX dark strip fix: the OS visual-style theme paints the
+    /// TabControl strip and ListView header filler white regardless of
+    /// BackColor. In dark mode the theme is removed from those flat surfaces
+    /// so the navy tokens show; in light mode the OS theme stays (it already
+    /// matches). Cosmetic only — control semantics are untouched. Handle
+    /// recreation (e.g. DPI moves) re-syncs through Shown/theme-apply paths.
+    /// </summary>
+    private void SyncFlatSurfacesTheme()
+    {
+        try
+        {
+            var flat = VisualTheme.Mode == ThemeMode.Dark;
+            foreach (var surface in new Control[] { _tabs, _lvActivity, _lvJournal, _lvAccounts })
+            {
+                if (surface is null || !surface.IsHandleCreated)
+                {
+                    continue;
+                }
+                _ = SetWindowTheme(surface.Handle, flat ? "" : "Explorer", flat ? "" : null);
+                surface.Invalidate(true);
+            }
+        }
+        catch
+        {
+            // Theming is cosmetic; a failure must never break the shell.
         }
     }
 
@@ -371,6 +567,8 @@ public sealed class ControlCenterForm : Form
             AutoSize = true,
             Font = VisualTheme.MonoFont,
             Margin = new Padding(14, 1, 0, 0),
+            Padding = new Padding(8, 2, 8, 2),
+            BackColor = VisualTheme.SurfaceRaised,
             Text = "",
             ForeColor = VisualTheme.SecondaryText,
             AccessibleName = "Desktop version",
@@ -402,7 +600,7 @@ public sealed class ControlCenterForm : Form
         // Short labels (the AccessibleNames carry the full verbs) so the
         // band never overflows: state context sits right beside them in the
         // badge. Enablement stays truthful (UpdateLifecycleButtons).
-        _btnStopRouter = ActionButton.Danger("Stop");
+        _btnStopRouter = ActionButton.DangerSolid("Stop");
         _btnStopRouter.Margin = new Padding(8, 0, 0, 0);
         _btnStopRouter.TabIndex = 4;
         _btnStopRouter.AccessibleName = "Stop router";
@@ -467,7 +665,7 @@ public sealed class ControlCenterForm : Form
             var clientWidth = form.ClientSize.Width;
             if (clientWidth == _lastReflowClientWidth) return;
             _lastReflowClientWidth = clientWidth;
-            bool narrow = clientWidth < 900;
+            bool narrow = clientWidth < 1050;
             if (narrow && bar.RowCount == 1)
             {
                 // Narrow: two rows.
@@ -585,6 +783,7 @@ public sealed class ControlCenterForm : Form
         {
             BackColor = PageBackColor,
             AccessibleName = "Routing and recent activity",
+            AutoScroll = true,
         };
 
         var grid = new TableLayoutPanel
@@ -592,17 +791,20 @@ public sealed class ControlCenterForm : Form
             Dock = DockStyle.Fill,
             ColumnCount = 1,
             RowCount = 2,
-            Padding = new Padding(18, 14, 18, 14),
+            Padding = new Padding(VisualTheme.PagePadding, 14, VisualTheme.PagePadding, 14),
             BackColor = PageBackColor,
             AccessibleName = "Lane selection and recent activity",
+            MinimumSize = new Size(0, 450),
         };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        // Lane cards expand to fill the available main area; the activity
-        // card below reserves room for its header and five taller native
-        // ListView rows. With the transparent image slot, rows are ~29px: the
-        // 228px bound covers card padding, header, list header, five rows, and
-        // bottom slack without starving the lane cards above.
-        // (The rare degraded banner consumes some of that bottom slack.)
+        // Lane cards expand to fill the available main area (GO/ZEN stay
+        // balanced); the activity card below reserves room for its header
+        // and five native ListView rows. With the transparent image slot,
+        // rows are ~29px: the 228px bound covers card padding, header, list
+        // header, five rows, and bottom slack without starving the lane
+        // cards above. (The rare degraded banner consumes some of that
+        // bottom slack.) The summary metrics now live in the shared header
+        // toolbar, so this page is lanes + activity only.
         grid.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
         grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 228f));
 
@@ -614,6 +816,7 @@ public sealed class ControlCenterForm : Form
             Margin = new Padding(0, 0, 0, 14),
             BackColor = PageBackColor,
             AccessibleName = "Lane cards",
+            MinimumSize = new Size(0, 180),
         };
         lanes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
         lanes.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50f));
@@ -636,7 +839,10 @@ public sealed class ControlCenterForm : Form
 
         grid.Controls.Add(lanes, 0, 0);
         grid.Controls.Add(BuildRecentActivity(), 0, 1);
+        _routingGrid = grid;
         _tabHome.Controls.Add(grid);
+        _tabHome.Resize += (_, _) => BeginUpdateRoutingScroll();
+        UpdateRoutingScroll();
         return _tabHome;
     }
 
@@ -653,12 +859,13 @@ public sealed class ControlCenterForm : Form
         out Label error,
         out LaneStatusBox statusBox)
     {
+        var isGo = string.Equals(title, "GO", StringComparison.Ordinal);
         var card = new LaneCard(title, marker, accent)
         {
             Dock = DockStyle.Fill,
             Margin = margin,
-            MinimumSize = new Size(0, 150),
-            Padding = new Padding(18, 16, 18, 14),
+            MinimumSize = new Size(0, 250),
+            Padding = new Padding(20, 18, 20, 16),
             AccessibleName = $"{title} lane card",
         };
 
@@ -666,7 +873,7 @@ public sealed class ControlCenterForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 7,
+            RowCount = 8,
             BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = $"{title} lane controls",
         };
@@ -675,9 +882,10 @@ public sealed class ControlCenterForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 1 caption
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 2 selector
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 3 hint
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 4 spacer
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 1f));  // 5 separator
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66f));      // 6 status box (title + detail)
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // 4 real lane metrics
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // 5 spacer
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 1f));  // 6 separator
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 66f)); // 7 status box (title + detail)
 
         // Header row: bold lane title + textual lane-surface marker badge,
         // and a right-aligned truthful mode chip (Managed / Attached) that
@@ -705,6 +913,10 @@ public sealed class ControlCenterForm : Form
             FlowDirection = FlowDirection.LeftToRight,
             BackColor = VisualTheme.SurfaceWhite,
         };
+        titleFlow.Controls.Add(new LaneIcon(isGo)
+        {
+            Margin = new Padding(0, 0, 10, 0),
+        });
         titleFlow.Controls.Add(new Label
         {
             Text = title,
@@ -712,6 +924,7 @@ public sealed class ControlCenterForm : Form
             Font = VisualTheme.LaneTitleFont,
             ForeColor = VisualTheme.PrimaryText,
             BackColor = VisualTheme.SurfaceWhite,
+            Margin = new Padding(0, 4, 0, 0),
             AccessibleName = $"{title} lane title",
         });
         titleFlow.Controls.Add(new Label
@@ -806,12 +1019,48 @@ public sealed class ControlCenterForm : Form
             Margin = new Padding(0, 4, 0, 4),
         };
 
+        // Real lane metrics: truthful local derivation from the loaded
+        // journal.recent window (no backend change); em-dashes until data.
+        var metrics = new TableLayoutPanel
+        {
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 3,
+            RowCount = 1,
+            Margin = new Padding(0, 8, 0, 2),
+            BackColor = VisualTheme.SurfaceWhite,
+            AccessibleName = $"{title} lane metrics",
+        };
+        metrics.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33f));
+        metrics.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33f));
+        metrics.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34f));
+        var blockReq = new MetricBlock("Requests (1h)", compact: true);
+        var blockRate = new MetricBlock("Success Rate", compact: true);
+        var blockLatency = new MetricBlock("Avg. Latency", compact: true);
+        if (isGo)
+        {
+            _goReq = blockReq;
+            _goRate = blockRate;
+            _goLatency = blockLatency;
+        }
+        else
+        {
+            _zenReq = blockReq;
+            _zenRate = blockRate;
+            _zenLatency = blockLatency;
+        }
+        metrics.Controls.Add(blockReq, 0, 0);
+        metrics.Controls.Add(blockRate, 1, 0);
+        metrics.Controls.Add(blockLatency, 2, 0);
+
         layout.Controls.Add(header, 0, 0);
         layout.Controls.Add(caption, 0, 1);
         layout.Controls.Add(cmb, 0, 2);
         layout.Controls.Add(switchingHint, 0, 3);
-        layout.Controls.Add(separator, 0, 5);
-        layout.Controls.Add(statusBox, 0, 6);
+        layout.Controls.Add(metrics, 0, 4);
+        layout.Controls.Add(separator, 0, 6);
+        layout.Controls.Add(statusBox, 0, 7);
         card.Controls.Add(layout);
         return card;
     }
@@ -835,7 +1084,7 @@ public sealed class ControlCenterForm : Form
             AccessibleName = "Recent activity view",
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34f)); // header
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize)); // header follows actual font height
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));      // degraded banner (collapses when hidden)
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100f)); // rows
 
@@ -846,6 +1095,8 @@ public sealed class ControlCenterForm : Form
             RowCount = 1,
             BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = "Recent activity header",
+            AutoSize = true,
+            MinimumSize = new Size(0, 34),
         };
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
@@ -855,7 +1106,7 @@ public sealed class ControlCenterForm : Form
         {
             Text = "Recent activity",
             AutoSize = true,
-            Font = VisualTheme.LaneTitleFont,
+            Font = VisualTheme.SectionTitleFont,
             ForeColor = VisualTheme.PrimaryText,
             BackColor = VisualTheme.SurfaceWhite,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -879,7 +1130,7 @@ public sealed class ControlCenterForm : Form
             AutoSize = true,
             FlatStyle = FlatStyle.Flat,
             FlatAppearance = { BorderSize = 0 },
-            ForeColor = VisualTheme.AccentZen,
+            ForeColor = VisualTheme.AccentBlue,
             BackColor = VisualTheme.SurfaceWhite,
             Font = VisualTheme.BodyFont,
             Cursor = Cursors.Hand,
@@ -923,13 +1174,16 @@ public sealed class ControlCenterForm : Form
             TabIndex = 2,
             AccessibleName = "Recent activity rows",
         };
-        _lvActivity.Columns.Add("Time", 110);
+        _lvActivity.Columns.Add("Time", 180);
         _lvActivity.Columns.Add("Lane", 60);
         _lvActivity.Columns.Add("Account", 120);
         _lvActivity.Columns.Add("Family / Method", 200);
-        _lvActivity.Columns.Add("Outcome", 96);
+        // Outcome fits long live names (e.g. upstream_error) untruncated.
+        _lvActivity.Columns.Add("Outcome", 124);
         _lvActivity.Columns.Add("Status", 70);
-        StyleDetailsListView(_lvActivity, alternateRows: true, outcomeColumn: 4, statusColumn: 5);
+        _lvActivity.Columns.Add("Latency", 110);
+        StyleDetailsListView(_lvActivity, alternateRows: true, outcomeColumn: 4, statusColumn: 5, laneColumn: 1);
+        _lvActivity.Resize += (_, _) => FitActivityColumns();
         listHost.Controls.Add(_lvActivity);
 
         // Designed empty state: illustration + note covers the (empty) list.
@@ -1003,7 +1257,7 @@ public sealed class ControlCenterForm : Form
     /// tinting, small fonts, painted column headers. Accessibility is
     /// unaffected — it is still a standard ListView.
     /// </summary>
-    private static void StyleDetailsListView(ListView lv, bool alternateRows, int outcomeColumn = -1, int statusColumn = -1)
+    private static void StyleDetailsListView(ListView lv, bool alternateRows, int outcomeColumn = -1, int statusColumn = -1, int laneColumn = -1)
     {
         lv.BackColor = VisualTheme.SurfaceWhite;
         lv.ForeColor = VisualTheme.PrimaryText;
@@ -1049,9 +1303,27 @@ public sealed class ControlCenterForm : Form
                 : e.ItemIndex % 2 == 1 ? VisualTheme.RowAltBack : VisualTheme.SurfaceWhite;
             using var brush = new SolidBrush(back);
             e.Graphics.FillRectangle(brush, e.Bounds);
-            // Visual slice 4: outcome/status chips as colored text (selected
-            // rows keep dark-on-tint readability — all three state colors
-            // contrast on both row backgrounds).
+            // Vision UX cells: lane renders as a small GO (green/teal) or ZEN
+            // (purple/violet) chip; outcome/status stay colored text (selected
+            // rows keep readability — all state colors contrast on both row
+            // backgrounds). Outcome names are never remapped.
+            if (e.ColumnIndex == laneColumn)
+            {
+                var isGo = string.Equals(e.SubItem?.Text, "GO", StringComparison.OrdinalIgnoreCase);
+                var accent = isGo ? VisualTheme.AccentGo : VisualTheme.AccentZen;
+                var tint = isGo ? VisualTheme.GoSurface : VisualTheme.ZenSurface;
+                var chip = new Rectangle(e.Bounds.X + 2, e.Bounds.Y + 3, e.Bounds.Width - 4, e.Bounds.Height - 6);
+                e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                VisualTheme.FillRounded(e.Graphics, chip, 6, tint);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    e.SubItem?.Text ?? string.Empty,
+                    VisualTheme.TableFont,
+                    chip,
+                    accent,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                return;
+            }
             var fore = VisualTheme.PrimaryText;
             if (e.ColumnIndex == outcomeColumn)
             {
@@ -1071,11 +1343,49 @@ public sealed class ControlCenterForm : Form
         };
     }
 
+    /// <summary>
+    /// Fill-column fits: the absorbent column takes leftover width (bounded
+    /// below) so tables span the card with no unthemed header filler in dark
+    /// mode and no clipped timestamps. No-ops before layout (width 0).
+    /// </summary>
+    private void FitActivityColumns()
+    {
+        var total = _lvActivity.ClientSize.Width;
+        if (total <= 0 || _lvActivity.Columns.Count < 7)
+        {
+            return;
+        }
+        const int fixedOthers = 180 + 60 + 120 + 124 + 70 + 110;
+        _lvActivity.Columns[3].Width = Math.Max(140, total - fixedOthers - VScrollAllowance(_lvActivity) - 4);
+    }
+
+    private void FitJournalColumns()
+    {
+        var total = _lvJournal.ClientSize.Width;
+        if (total <= 0 || _lvJournal.Columns.Count < 9)
+        {
+            return;
+        }
+        const int fixedOthers = 180 + 60 + 120 + 150 + 110 + 118 + 70 + 90;
+        _lvJournal.Columns[8].Width = Math.Max(180, total - fixedOthers - VScrollAllowance(_lvJournal) - 4);
+    }
+
+    private void FitAccountsColumns()
+    {
+        var total = _lvAccounts.ClientSize.Width;
+        if (total <= 0 || _lvAccounts.Columns.Count < 4)
+        {
+            return;
+        }
+        const int fixedOthers = 140 + 220 + 70;
+        _lvAccounts.Columns[3].Width = Math.Max(120, total - fixedOthers - VScrollAllowance(_lvAccounts) - 4);
+    }
+
     private Control BuildFooter()
     {
         _footer = new Panel
         {
-            Dock = DockStyle.Bottom,
+            Dock = DockStyle.Fill,
             Height = 34,
             BackColor = VisualTheme.SurfaceWhite,
             AccessibleName = "Footer status",
@@ -1090,30 +1400,109 @@ public sealed class ControlCenterForm : Form
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            ColumnCount = 3,
             RowCount = 1,
             Padding = new Padding(14, 0, 14, 0),
             BackColor = VisualTheme.SurfaceWhite,
         };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        // Visual slice 7: state display lives in exactly one place (the
-        // header badge). The footer keeps only the local endpoint, still
-        // right-aligned via the percent spacer column.
-        _lblFooter = new Label
+        // Vision UX slim footer: product identity left, local endpoint +
+        // copy right. State display lives in exactly one place (the header
+        // badge); the endpoint text itself is unchanged (actual port).
+        var identity = new Label
         {
             AutoSize = true,
-            Font = VisualTheme.MonoFont,
+            Font = VisualTheme.SmallFont,
             ForeColor = VisualTheme.SecondaryText,
+            BackColor = VisualTheme.SurfaceWhite,
+            Text = "GoRouter Desktop  ·  Local routing control center",
+            TextAlign = ContentAlignment.MiddleLeft,
+            Anchor = AnchorStyles.Left,
+            AccessibleName = "Footer product identity",
+        };
+        _lblFooter = new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Fill,
+            AutoEllipsis = true,
+            Font = VisualTheme.MonoFont,
+            ForeColor = VisualTheme.AccentBlue,
             TextAlign = ContentAlignment.MiddleLeft,
             AccessibleName = "Desktop release and local endpoint",
         };
+        var copy = new Button
+        {
+            Text = "Copy",
+            AutoSize = false,
+            Size = new Size(64, 24),
+            FlatStyle = FlatStyle.Flat,
+            MinimumSize = new Size(64, 24),
+            Margin = new Padding(8, 4, 0, 4),
+            TabIndex = 60,
+            AccessibleName = "Copy local endpoint",
+        };
+        copy.FlatAppearance.BorderSize = 1;
+        copy.FlatAppearance.BorderColor = VisualTheme.CardBorder;
+        copy.BackColor = VisualTheme.SurfaceWhite;
+        copy.ForeColor = VisualTheme.SecondaryText;
+        copy.Font = VisualTheme.SmallFont;
+        copy.Click += (_, _) =>
+        {
+            try
+            {
+                Clipboard.SetText(_lblFooter.Text);
+            }
+            catch
+            {
+                // Clipboard unavailable (RDP/lockdown): endpoint text stays
+                // selectable-readable; no error surface for a convenience.
+            }
+        };
 
+        layout.Controls.Add(identity, 0, 0);
         layout.Controls.Add(_lblFooter, 1, 0);
+        layout.Controls.Add(copy, 2, 0);
         _footer.Controls.Add(layout);
         _footer.Controls.Add(separator); // docked last so it owns the top strip
         return _footer;
+    }
+
+
+    private void BeginUpdateRoutingScroll()
+    {
+        try
+        {
+            if (_tabHome == null || _tabHome.IsDisposed || !_tabHome.IsHandleCreated) { UpdateRoutingScroll(); return; }
+            _tabHome.BeginInvoke(new Action(() => UpdateRoutingScroll()));
+        }
+        catch { }
+    }
+
+    private void UpdateRoutingScroll()
+    {
+        if (_tabHome == null || _routingGrid == null) { return; }
+        if (_tabHome.IsDisposed || _routingGrid.IsDisposed) { return; }
+        if (!_tabHome.IsHandleCreated) { return; }
+        try
+        {
+            int need = _routingGrid.PreferredSize.Height;
+            bool overflow = need > _tabHome.ClientSize.Height;
+            if (overflow && _routingGrid.Dock != DockStyle.Top)
+            {
+                _routingGrid.Dock = DockStyle.Top;
+                _routingGrid.AutoSize = true;
+                _routingGrid.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            }
+            else if (!overflow && _routingGrid.Dock != DockStyle.Fill)
+            {
+                _routingGrid.AutoSize = false;
+                _routingGrid.Dock = DockStyle.Fill;
+            }
+        }
+        catch { }
     }
 
     private TabPage BuildAccountsTab()
@@ -1139,15 +1528,21 @@ public sealed class ControlCenterForm : Form
             FullRowSelect = true,
             MultiSelect = false,
             HideSelection = false,
-            GridLines = true,
+            GridLines = false,
             HeaderStyle = ColumnHeaderStyle.Nonclickable,
+            BorderStyle = BorderStyle.None,
             TabIndex = 0,
             AccessibleName = "Accounts list",
         };
         _lvAccounts.Columns.Add("Alias", 140);
         _lvAccounts.Columns.Add("ID", 220);
         _lvAccounts.Columns.Add("Secret", 70);
-        _lvAccounts.Columns.Add("Used by", 100);
+        _lvAccounts.Columns.Add("Used by", 120);
+        // Vision UX flat table: shared owner-drawn header/rows, no grid
+        // chrome; the last column absorbs leftover width so no unthemed
+        // header filler shows in dark mode.
+        StyleDetailsListView(_lvAccounts, alternateRows: true);
+        _lvAccounts.Resize += (_, _) => FitAccountsColumns();
 
         var buttons = new FlowLayoutPanel
         {
@@ -1274,20 +1669,26 @@ public sealed class ControlCenterForm : Form
             FullRowSelect = true,
             MultiSelect = false,
             HideSelection = false,
-            GridLines = true,
+            GridLines = false,
             HeaderStyle = ColumnHeaderStyle.Nonclickable,
+            BorderStyle = BorderStyle.None,
             TabIndex = 1,
             AccessibleName = "Recent requests",
         };
-        _lvJournal.Columns.Add("Time", 130);
-        _lvJournal.Columns.Add("Lane", 50);
-        _lvJournal.Columns.Add("Account", 110);
-        _lvJournal.Columns.Add("Family", 130);
-        _lvJournal.Columns.Add("Method", 60);
-        _lvJournal.Columns.Add("Outcome", 90);
-        _lvJournal.Columns.Add("Status", 60);
-        _lvJournal.Columns.Add("Duration ms", 80);
+        _lvJournal.Columns.Add("Time", 180);
+        _lvJournal.Columns.Add("Lane", 60);
+        _lvJournal.Columns.Add("Account", 120);
+        _lvJournal.Columns.Add("Family", 150);
+        _lvJournal.Columns.Add("Method", 110);
+        _lvJournal.Columns.Add("Outcome", 118);
+        _lvJournal.Columns.Add("Status", 70);
+        _lvJournal.Columns.Add("Duration ms", 90);
         _lvJournal.Columns.Add("Request ID", 210);
+        // Vision UX flat table: lane chips plus outcome/status coloring via
+        // the shared renderer; Request ID absorbs leftover width so no
+        // unthemed header filler shows in dark mode.
+        StyleDetailsListView(_lvJournal, alternateRows: true, outcomeColumn: 5, statusColumn: 6, laneColumn: 1);
+        _lvJournal.Resize += (_, _) => FitJournalColumns();
 
         _lblJournalEmpty = MakeEmptyState(
             "No requests recorded yet — send traffic to the local endpoint and it will appear here.",
@@ -1910,6 +2311,7 @@ public sealed class ControlCenterForm : Form
                 $"Go \u2192 {(string.IsNullOrEmpty(snapshot.Routes.Go.Alias) ? "\u2014" : snapshot.Routes.Go.Alias)} · Zen \u2192 {(string.IsNullOrEmpty(snapshot.Routes.Zen.Alias) ? "\u2014" : snapshot.Routes.Zen.Alias)}", 44));
             _lblVersion.Text = string.IsNullOrEmpty(PresentationVersion) ? "" : $"v{PresentationVersion}";
             UiText.SetIfChanged(_lblFooter, $"Local: http://127.0.0.1:{snapshot.Settings.Port}");
+            _metricTotal.SetValue(snapshot.Journal.Records.ToString("N0"));
             UpdateLifecycleButtons();
 
             _localCredentialWarning = snapshot.Initialized && !snapshot.LocalCredentialConfigured;
@@ -1943,6 +2345,8 @@ public sealed class ControlCenterForm : Form
             }
 
             _lvAccounts.EndUpdate();
+            // Row count changes scrollbar visibility with no Resize event.
+            FitAccountsColumns();
 
             _lblStateDirValue.Text = string.IsNullOrEmpty(snapshot.StateDir) ? "—" : snapshot.StateDir;
             _lblSecretStoreValue.Text = snapshot.SecretStore == "ok"
@@ -2126,9 +2530,15 @@ public sealed class ControlCenterForm : Form
         feedback.Text = accountId is null ? "Clearing lane…" : "Switching…";
         try
         {
+            // W0: commit the REVIEWED snapshot values (generation + lane version +
+            // target version). A concurrent writer surfaces as conflict; the UI
+            // reverts to the authoritative snapshot and never auto-retries.
+            var watchedRoute = lane == "go" ? _snapshot.Routes.Go : _snapshot.Routes.Zen;
+            var watchedGeneration = _snapshot.StateGeneration;
+            var watchedTargetVersion = _snapshot.Accounts.FirstOrDefault(a => a.Id == accountId)?.Version ?? 1;
             var response = accountId is null
-                ? await _channel.CallAsync("route.clear", new { lane })
-                : await _channel.CallAsync("route.set", new { lane, accountId });
+                ? await _channel.CallAsync("route.clear", new { lane, expectedStateGeneration = watchedGeneration, expectedRouteVersion = watchedRoute.Version })
+                : await _channel.CallAsync("route.set", new { lane, accountId, expectedStateGeneration = watchedGeneration, expectedRouteVersion = watchedRoute.Version, expectedTargetAccountVersion = watchedTargetVersion });
 
             if (response.Ok)
             {
@@ -2223,6 +2633,7 @@ public sealed class ControlCenterForm : Form
     private void ApplyThemeMode(ThemeMode mode)
     {
         VisualTheme.Mode = mode;
+        SyncFlatSurfacesTheme();
         // This form first: the first snapshot can arrive before Show (empty
         // OpenForms), and stored control colors must still re-resolve.
         VisualTheme.ApplyTheme(this);
@@ -2296,7 +2707,7 @@ public sealed class ControlCenterForm : Form
         SetAccountsFeedback("Adding account…", isError: false);
         try
         {
-            var response = await _channel.CallAsync("account.add", new { alias = dialog.Alias, secret = dialog.Secret }, 15_000);
+            var response = await _channel.CallAsync("account.add", new { alias = dialog.Alias, secret = dialog.Secret, expectedStateGeneration = _snapshot.StateGeneration }, 15_000);
             if (response.Ok)
             {
                 SetAccountsFeedback($"Account '{dialog.Alias}' added.", isError: false);
@@ -2330,7 +2741,15 @@ public sealed class ControlCenterForm : Form
         SetAccountsFeedback("Updating credential…", isError: false);
         try
         {
-            var response = await _channel.CallAsync("account.update", new { alias, secret = dialog.Secret }, 15_000);
+            // W0: UI alias selection resolves against the reviewed snapshot, but
+            // the commit carries the immutable ID + versions (never the alias).
+            var watchedUpdate = _snapshot.Accounts.FirstOrDefault(a => a.Alias == alias);
+            if (watchedUpdate is null)
+            {
+                SetAccountsFeedback($"Account '{alias}' is no longer present; refresh and retry.", isError: true);
+                return;
+            }
+            var response = await _channel.CallAsync("account.update", new { accountId = watchedUpdate.Id, secret = dialog.Secret, expectedStateGeneration = _snapshot.StateGeneration, expectedAccountVersion = watchedUpdate.Version }, 15_000);
             if (response.Ok)
             {
                 SetAccountsFeedback($"Credential for '{alias}' updated.", isError: false);
@@ -2364,7 +2783,13 @@ public sealed class ControlCenterForm : Form
         SetAccountsFeedback("Renaming…", isError: false);
         try
         {
-            var response = await _channel.CallAsync("account.rename", new { alias, newAlias = dialog.NewAlias }, 15_000);
+            var watchedRename = _snapshot.Accounts.FirstOrDefault(a => a.Alias == alias);
+            if (watchedRename is null)
+            {
+                SetAccountsFeedback($"Account '{alias}' is no longer present; refresh and retry.", isError: true);
+                return;
+            }
+            var response = await _channel.CallAsync("account.rename", new { accountId = watchedRename.Id, newAlias = dialog.NewAlias, expectedStateGeneration = _snapshot.StateGeneration, expectedAccountVersion = watchedRename.Version }, 15_000);
             if (response.Ok)
             {
                 SetAccountsFeedback($"Account renamed to '{dialog.NewAlias}'.", isError: false);
@@ -2404,14 +2829,19 @@ public sealed class ControlCenterForm : Form
             // an account concurrently routed after the snapshot must refuse,
             // not silently clear the lane.
             var routed = (account?.UsedBy.Count ?? 0) > 0;
-            var response = await _channel.CallAsync("account.remove", new { alias, force = routed }, 15_000);
+            if (account is null)
+            {
+                SetAccountsFeedback($"Account '{alias}' is no longer present; refresh and retry.", isError: true);
+                return;
+            }
+            var response = await _channel.CallAsync("account.remove", new { accountId = account.Id, force = routed, expectedStateGeneration = _snapshot.StateGeneration, expectedAccountVersion = account.Version }, 15_000);
             if (response.Ok)
             {
-                var cleared = response.TryDataAs<RemoveResult>(out var result) ? result?.ClearedLanes ?? Array.Empty<string>() : Array.Empty<string>();
+                var cleared = response.TryDataAs<RemoveResult>(out var result) ? result?.ClearedLanes ?? Array.Empty<ClearedLane>() : Array.Empty<ClearedLane>();
                 var credentialNote = result?.SecretDeleted == false ? " Stored credential was already gone." : "";
                 SetAccountsFeedback(
                     cleared.Count > 0
-                        ? $"Account '{alias}' removed. Lane selection cleared ({string.Join(", ", cleared.Select(l => l.ToUpperInvariant()))}).{credentialNote}"
+                        ? $"Account '{alias}' removed. Lane selection cleared ({string.Join(", ", cleared.Select(l => l.Lane.ToUpperInvariant()))}).{credentialNote}"
                         : $"Account '{alias}' removed.{credentialNote}",
                     isError: false);
             }
@@ -2549,6 +2979,8 @@ public sealed class ControlCenterForm : Form
                 }
 
                 _lvJournal.EndUpdate();
+                // Row count changes scrollbar visibility with no Resize event.
+                FitJournalColumns();
 
                 var degraded = data.Degraded || _snapshot.Journal.Degraded;
                 _lblJournalDegraded.Visible = degraded;
@@ -2629,15 +3061,32 @@ public sealed class ControlCenterForm : Form
         // C2: every RENDERED row keys the fingerprint (id + outcome + status
         // + completion) — a late in-flight→done flip on any visible row must
         // re-render, not hide until an unrelated change.
+        // Metrics derive from the full loaded window (up to 200 rows), so
+        // the fingerprint covers every row — a change beyond the top 5 must
+        // still refresh the success/latency blocks.
         var fingerprint = degraded
             ? "degraded:" + (error ?? "")
-            : string.Join(";", rows.Take(5).Select(r => r.RouterRequestId + "|" + r.TerminalOutcome + "|" + (r.HttpStatus?.ToString() ?? "-") + "|" + (r.CompletedAtUtc ?? "")));
+            : string.Join(";", rows.Select(r => r.RouterRequestId + "|" + r.TerminalOutcome + "|" + (r.HttpStatus?.ToString() ?? "-") + "|" + (r.CompletedAtUtc ?? "")));
         if (fingerprint == _activityFingerprint)
         {
             return;
         }
 
         _activityFingerprint = fingerprint;
+        if (!degraded)
+        {
+            var stats = JournalStats.Compute(rows);
+            _metricSuccess.SetValue(JournalStats.FormatRate(stats.SuccessRate));
+            _metricLatency.SetValue(JournalStats.FormatLatency(stats.AvgLatencyMs));
+            var go = JournalStats.ComputeForLane(rows, "go");
+            _goReq.SetValue(go.WithinHour.ToString("N0"));
+            _goRate.SetValue(JournalStats.FormatRate(go.SuccessRate));
+            _goLatency.SetValue(JournalStats.FormatLatency(go.AvgLatencyMs));
+            var zen = JournalStats.ComputeForLane(rows, "zen");
+            _zenReq.SetValue(zen.WithinHour.ToString("N0"));
+            _zenRate.SetValue(JournalStats.FormatRate(zen.SuccessRate));
+            _zenLatency.SetValue(JournalStats.FormatLatency(zen.AvgLatencyMs));
+        }
         _lvActivity.BeginUpdate();
         _lvActivity.Items.Clear();
         foreach (var row in rows.Take(5))
@@ -2646,6 +3095,8 @@ public sealed class ControlCenterForm : Form
         }
 
         _lvActivity.EndUpdate();
+        // Row count changes scrollbar visibility with no Resize event.
+        FitActivityColumns();
 
         var showList = rows.Count > 0 || degraded;
         _lvActivity.Visible = showList;
@@ -2669,6 +3120,10 @@ public sealed class ControlCenterForm : Form
         item.SubItems.Add(familyMethod);
         item.SubItems.Add(row.TerminalOutcome);
         item.SubItems.Add(row.HttpStatus?.ToString() ?? "—");
+        // Latency column: DurationMs is already in the journal.recent model
+        // (same source as the Journal tab's Duration ms column); in-flight
+        // rows without a duration stay an em-dash, never a guess.
+        item.SubItems.Add(row.DurationMs > 0 ? JournalStats.FormatLatency(row.DurationMs) : "—");
         return item;
     }
 

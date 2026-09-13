@@ -15,7 +15,7 @@ import { newRef } from "../src/secret-store.ts";
 import { storeRegistry } from "../src/models/registry.ts";
 import { MODELS_SCHEMA_VERSION } from "../src/models/types.ts";
 import type { RegistryFile } from "../src/models/types.ts";
-import { memSecrets, authHeaders, readJournalRows, LOCAL_KEY } from "./harness.ts";
+import { memSecrets, authHeaders, sessionHeaders, readJournalRows, LOCAL_KEY } from "./harness.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -78,7 +78,7 @@ describe("GR-006 one immutable cached-model snapshot", () => {
     const server = createServer({ state, journal, paths, startupRefresh: false });
     await server.serve();
     try {
-      const res = await fetch("http://127.0.0.1:" + server.port() + "/go/v1/models", { headers: authHeaders() });
+      const res = await fetch("http://127.0.0.1:" + server.port() + "/go/v1/models", { headers: sessionHeaders() });
       expect(res.status).toBe(200);
       expect(res.headers.get("x-gorouter-models-cache")).toBe("hit");
       expect(calls).toBe(1);

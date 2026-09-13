@@ -28,6 +28,7 @@ import { loadDesktopSettings } from './desktop-settings.ts'
 import { createControlService, type ControlService } from './control-core.ts'
 import { hardenPipeDacl } from './pipe-acl.ts'
 import { serveControlPipe, type ControlTransport } from './transport.ts'
+import { createWebBridge, openInDefaultBrowser } from './web-bridge.ts'
 import { defaultRouterCommand, isPackagedControl, type RouterCommand } from './supervisor.ts'
 import {
   controlError,
@@ -37,6 +38,7 @@ import {
   type ErrorCode,
 } from './protocol.ts'
 import type { Domain } from '../domain.ts'
+import { isDomainConflict } from '../domain.ts'
 
 function repoRoot(): string {
   return resolve(import.meta.dir, '../..')
@@ -87,9 +89,17 @@ export function resolveRouterCommand(opts: { packaged?: boolean } = {}): RouterC
   return defaultRouterCommand()
 }
 
-/** Domain Error -> wire error mapping (duplicate -> conflict, not found -> not_found, else validation). */
-export function mapDomainError(e: unknown): { code: ErrorCode; message: string } {
-  if (e instanceof ControlError) return { code: e.code, message: e.message }
+/** Domain Error -> wire error mapping (W0: DomainConflict maps by stable reason). */
+export function mapDomainError(e: unknown): { code: ErrorCode; message: string; reason?: string } {
+  if (e instanceof ControlError) {
+    const out: { code: ErrorCode; message: string; reason?: string } = { code: e.code, message: e.message };
+    if (e.reason !== undefined) out.reason = e.reason;
+    return out;
+  }
+  if (isDomainConflict(e)) {
+    const conflictCode: ErrorCode = e.reason === 'not_found' ? 'not_found' : 'conflict';
+    return { code: conflictCode, message: e.message, reason: e.reason };
+  }
   const message = e instanceof Error ? e.message : String(e)
   if (/already exists|duplicate/i.test(message)) return { code: 'conflict', message }
   if (/lock timeout/i.test(message)) return { code: 'conflict', message }
@@ -104,13 +114,29 @@ function requireLane(params: Record<string, unknown>): 'go' | 'zen' {
   return params.lane
 }
 
+function requireExpectedVersion(params: Record<string, unknown>, key: string): number {
+  const v = params[key]
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 1) {
+    throw controlError('validation', `${key} is required (positive safe integer)`)
+  }
+  return v
+}
+
+function requireExpectedGeneration(params: Record<string, unknown>): string {
+  const v = params.expectedStateGeneration
+  if (typeof v !== 'string' || v.length === 0) {
+    throw controlError('validation', 'expectedStateGeneration is required')
+  }
+  return v
+}
+
 function requireString(params: Record<string, unknown>, key: string): string {
   const v = params[key]
   if (typeof v !== 'string' || v.length === 0) throw controlError('validation', `${key} is required`)
   return v
 }
 
-/** Scrub an AccountView for the wire (no secretRef). */
+/** Scrub an account for the wire (no secretRef; W0 adds version). */
 function accountData(a: {
   id: string
   alias: string
@@ -118,6 +144,7 @@ function accountData(a: {
   usedBy: string[]
   createdAtUtc: string
   updatedAtUtc: string
+  version: number
 }): {
   id: string
   alias: string
@@ -125,6 +152,7 @@ function accountData(a: {
   usedBy: string[]
   createdAtUtc: string
   updatedAtUtc: string
+  version: number
 } {
   return {
     id: a.id,
@@ -133,6 +161,7 @@ function accountData(a: {
     usedBy: a.usedBy,
     createdAtUtc: a.createdAtUtc,
     updatedAtUtc: a.updatedAtUtc,
+    version: a.version,
   }
 }
 
@@ -141,6 +170,9 @@ export interface OpHandlerDeps {
   domain: Domain
   /** Called by app.exit (stopRouter flag); the entry owns shutdown. */
   onAppExit?: (stopRouter: boolean) => void
+  /** W1 trusted native Web Control activation. Absent on pre-W1 services, where
+   * web.open stays an unknown op (warm launchers report unsupported). */
+  openWeb?: () => Promise<{ opened: boolean }>
 }
 
 export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Record<string, unknown>) => Promise<unknown> {
@@ -148,48 +180,85 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
 
   async function raw(op: string, params: Record<string, unknown>): Promise<unknown> {
     switch (op) {
-      case 'hello':
+      case 'hello': {
+        // W0 version gate (contract 6.4): missing/mismatched protocol is
+        // unsupported BEFORE any capability (snapshot, mutation, journal,
+        // config, router) or event subscription is granted.
+        if (params.protocol !== PROTOCOL_VERSION) {
+          throw controlError(
+            'unsupported',
+            `unsupported control protocol (service speaks protocol ${PROTOCOL_VERSION})`,
+          )
+        }
         return { serviceVersion: SERVICE_VERSION, protocol: PROTOCOL_VERSION }
+      }
 
       case 'snapshot':
         return core.snapshot()
 
       case 'route.set': {
+        // W0: reviewed generation + immutable ID + both expected versions.
         const lane = requireLane(params)
         const accountId = requireString(params, 'accountId')
-        return domain.routeSet(lane, accountId)
+        return domain.routeSetChecked(lane, accountId, {
+          expectedStateGeneration: requireExpectedGeneration(params),
+          expectedRouteVersion: requireExpectedVersion(params, 'expectedRouteVersion'),
+          expectedTargetAccountVersion: requireExpectedVersion(params, 'expectedTargetAccountVersion'),
+        })
       }
 
       case 'route.clear': {
         const lane = requireLane(params)
-        domain.routeClear(lane)
-        return { lane }
+        return domain.routeClearChecked(lane, {
+          expectedStateGeneration: requireExpectedGeneration(params),
+          expectedRouteVersion: requireExpectedVersion(params, 'expectedRouteVersion'),
+        })
       }
 
       case 'account.add': {
+        // W0: reviewed generation gates the add (contract 7.6).
         const alias = requireString(params, 'alias')
         const secret = requireString(params, 'secret')
-        return accountData(domain.accountAdd(alias, secret))
+        const r = domain.accountAddChecked(alias, secret, {
+          expectedStateGeneration: requireExpectedGeneration(params),
+        })
+        return accountData(r.account)
       }
 
       case 'account.update': {
-        const alias = requireString(params, 'alias')
+        // W0: immutable ID + reviewed generation/version.
+        const accountId = requireString(params, 'accountId')
         const secret = requireString(params, 'secret')
-        return accountData(domain.accountUpdate(alias, secret))
+        const r = domain.accountUpdateChecked(accountId, secret, {
+          expectedStateGeneration: requireExpectedGeneration(params),
+          expectedAccountVersion: requireExpectedVersion(params, 'expectedAccountVersion'),
+        })
+        return accountData(r.account)
       }
 
       case 'account.rename': {
-        const alias = requireString(params, 'alias')
+        const accountId = requireString(params, 'accountId')
         const newAlias = requireString(params, 'newAlias')
-        const { renamed, previousAlias } = domain.accountRename(alias, newAlias)
-        return { ...accountData(renamed), previousAlias }
+        const r = domain.accountRenameChecked(accountId, newAlias, {
+          expectedStateGeneration: requireExpectedGeneration(params),
+          expectedAccountVersion: requireExpectedVersion(params, 'expectedAccountVersion'),
+        })
+        return { ...accountData(r.account), previousAlias: r.previousAlias, changed: r.changed }
       }
 
       case 'account.remove': {
-        const alias = requireString(params, 'alias')
+        const accountId = requireString(params, 'accountId')
         const force = params.force === true
-        const { removed, clearedLanes, secretDeleted } = domain.accountRemove(alias, force)
-        return { removed: accountData(removed), clearedLanes, secretDeleted }
+        const r = domain.accountRemoveChecked(accountId, force, {
+          expectedStateGeneration: requireExpectedGeneration(params),
+          expectedAccountVersion: requireExpectedVersion(params, 'expectedAccountVersion'),
+        })
+        return {
+          removedAccountId: r.removedAccountId,
+          removedAccountVersion: r.removedAccountVersion,
+          clearedLanes: r.clearedLanes,
+          secretDeleted: r.secretDeleted,
+        }
       }
 
       case 'account.test': {
@@ -321,6 +390,19 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
         return { exiting: true }
       }
 
+      case 'web.open': {
+        // W1: trusted native activation only. The transport already gates every
+        // non-hello op on a successfully completed hello + the admin token, so
+        // reaching here proves native control authority. The service itself
+        // opens the OS default browser: the raw fragment bootstrap never
+        // crosses the pipe (the response carries only an opened flag, never
+        // the URL/capability) and the launcher holds nothing to leak.
+        if (!deps.openWeb) {
+          throw controlError('unsupported', 'web control is not available from this service')
+        }
+        return deps.openWeb()
+      }
+
       case 'ping':
         return { pong: true }
 
@@ -336,8 +418,32 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
     } catch (e) {
       if (e instanceof ControlError) throw e
       const mapped = mapDomainError(e)
-      throw controlError(mapped.code, mapped.message)
+      throw controlError(mapped.code, mapped.message, mapped.reason)
     }
+  }
+}
+
+/**
+ * W1 web attachment shared by the normal service entry and the dedicated cold
+ * Web Control entrypoint (web-launch.ts). The bridge is created on first
+ * web.open (explicit activation only) and reuses the authoritative core/domain.
+ */
+export interface WebAttachment {
+  openWeb: () => Promise<{ opened: boolean }>
+  closeWeb: () => Promise<void>
+  /** Routing coordinates only (origin/scope/cookie name; never capabilities). */
+  describe: () => { origin: string | null; scopePath: string | null; cookieName: string | null }
+}
+
+export function attachWebBridge(core: ControlService, domain: Domain, openBrowser: (url: string) => void): WebAttachment {
+  const bridge = createWebBridge({ getSnapshot: () => core.snapshot(), domain, openBrowser })
+  return {
+    openWeb: async (): Promise<{ opened: boolean }> => {
+      await bridge.open()
+      return { opened: true }
+    },
+    closeWeb: (): Promise<void> => bridge.close(),
+    describe: () => ({ origin: bridge.origin, scopePath: bridge.scopePath, cookieName: bridge.cookieName }),
   }
 }
 
@@ -356,6 +462,8 @@ async function main(): Promise<void> {
   const desktopSettings = loadDesktopSettings(paths.state)
 
   const core = createControlService({ paths, secrets, domain, pipeName, routerCmd, desktop: desktopSettings })
+  // W1: the web bridge binds only via web.open (explicit native activation).
+  const web = attachWebBridge(core, domain, openInDefaultBrowser)
 
   // Bind the pipe BEFORE starting supervision: a losing duplicate instance
   // (EADDRINUSE) exits here without ever spawning a router child (INV-01).
@@ -363,11 +471,13 @@ async function main(): Promise<void> {
   const handlers = createOpHandlers({
     core,
     domain,
+    openWeb: web.openWeb,
     onAppExit: () => {
       // the handler already stopped the managed child (core.stop); here we
-      // only sequence the process exit so the response flushes first
+      // only sequence the process exit so the response flushes first.
+      // W1: web authority is invalidated before the pipe goes down.
       setTimeout(() => {
-        void transport.close().then(() => process.exit(0))
+        void web.closeWeb().finally(() => transport.close()).then(() => process.exit(0))
       }, 150)
     },
   })
@@ -418,7 +528,10 @@ async function main(): Promise<void> {
     stopping = true
     // GR-012: await the async SIGTERM grace so the managed child is reaped
     // before the service exits (the job object remains the final backstop).
+    // W1: shutdown first stops serving Web Control and invalidates all
+    // bootstrap/session/CSRF authority, then releases listener resources.
     void (async () => {
+      await web.closeWeb()
       await core.stop(true)
       await transport.close()
       process.exit(0)

@@ -23,6 +23,8 @@ import {
   createStateStore,
   defaultState,
   findAccount,
+  findAccountById,
+  findAccountByAlias,
   accountUsedByRoute,
   makeAccount,
   validateAlias,
@@ -30,6 +32,8 @@ import {
   isValidPort,
   isValidJournalMaxRecords,
   isValidRetentionDays,
+  isVersionNumber,
+  newStateGeneration,
   JOURNAL_MAX_RECORDS_MAX,
   JOURNAL_RETENTION_DAYS_MAX,
   LANES,
@@ -37,6 +41,7 @@ import {
   type Lane,
   type AccountRecord,
 } from "./state.ts";
+import { isValidSecretRef } from "./secret-store.ts";
 import { createJournal, type JournalStats } from "./journal.ts";
 import { tryUnlink, redact, log } from "./util.ts";
 import { registryPathFor, loadRegistry, peekRegistry, storeRegistry, registryAgeMs, isFresh, isCooldown, cooldownRemainingMs } from "./models/registry.ts";
@@ -75,6 +80,85 @@ export interface RouteView {
   alias: string | null;
   /** true when a lane points at an account id that no longer exists */
   accountMissing: boolean;
+  /** W0 lane version (committed). */
+  version: number;
+}
+
+/**
+ * W0 machine-readable conflict reasons (contract 7.7). Thrown as
+ * DomainConflict; the control layer maps them beneath wire code 'conflict'
+ * (or not_found for identity misses) with the reason preserved.
+ */
+export type ConflictReason =
+  | "state_generation_mismatch"
+  | "route_version_mismatch"
+  | "account_version_mismatch"
+  | "account_in_use"
+  | "alias_conflict"
+  | "not_found"
+  | "target_not_selectable";
+
+export class DomainConflict extends Error {
+  readonly reason: ConflictReason;
+  constructor(reason: ConflictReason, message: string) {
+    super(message);
+    this.name = "DomainConflict";
+    this.reason = reason;
+  }
+}
+
+export function isDomainConflict(e: unknown): e is DomainConflict {
+  return e instanceof DomainConflict;
+}
+
+/** Expected concurrency inputs for one checked mutation (contract 7). */
+export interface CheckedExpectations {
+  expectedStateGeneration: string;
+}
+
+/** Transaction-specific commit result (contract 7.8): captured from the locked
+ * candidate, never from a post-lock re-read. */
+export interface MutationCommit {
+  changed: boolean;
+  stateGeneration: string;
+}
+
+/** Committed route-selection result (contract 7.8). */
+export interface RouteCommit extends MutationCommit {
+  lane: Lane;
+  routeVersion: number;
+  accountId: string | null;
+  targetAccountId: string | null;
+  targetAccountVersion: number | null;
+}
+
+/** Committed account result (contract 7.8). */
+export interface AccountCommit extends MutationCommit {
+  account: CheckedAccount;
+}
+
+/** Committed rename result (contract 7.8). */
+export interface RenameCommit extends AccountCommit {
+  previousAlias: string;
+}
+
+/** Committed removal result (contract 7.8). */
+export interface RemoveCommit extends MutationCommit {
+  removedAccountId: string;
+  removedAccountVersion: number;
+  clearedLanes: { lane: Lane; routeVersion: number }[];
+  secretDeleted: boolean;
+}
+
+/** Checked account identity returned by committing mutations (no secret material). */
+export interface CheckedAccount {
+  id: string;
+  alias: string;
+  version: number;
+  secretPresent: boolean;
+  usedBy: Lane[];
+  createdAtUtc: string;
+  updatedAtUtc: string;
 }
 
 export interface StatusView {
@@ -83,6 +167,10 @@ export interface StatusView {
   stateCorrupt: boolean;
   /** On-disk schema version when it is not ours (GR-004 gate active). */
   stateUnsupportedVersion: number | null;
+  /** W0: established lineage generation ("" when unestablished). */
+  stateGeneration: string;
+  /** W0: on-disk schema version as loaded (1 = legacy view, 2 = current). */
+  schemaVersion: number;
   routes: RouteView[];
   accounts: AccountView[];
   settings: StateFile["settings"];
@@ -128,6 +216,19 @@ export interface Domain {
   accountTest(alias: string, lanes: Lane[]): Promise<ProbeResult[]>;
   routeSet(lane: Lane, aliasOrId: string): RouteView;
   routeClear(lane: Lane): void;
+  /**
+   * W0 establishment (contract 6.2): durably establish the v2 lineage under
+   * lock and return its generation for the caller to freeze reviewed versions
+   * against. Idempotent on established state.
+   */
+  ensureState(): { stateGeneration: string };
+  /** W0 checked mutations (contract 7): generation-first, in-lock, commit-captured results. */
+  routeSetChecked(lane: Lane, accountId: string, exp: CheckedExpectations & { expectedRouteVersion: number; expectedTargetAccountVersion: number }): RouteCommit;
+  routeClearChecked(lane: Lane, exp: CheckedExpectations & { expectedRouteVersion: number }): RouteCommit;
+  accountAddChecked(alias: string, secret: string, exp: CheckedExpectations): AccountCommit;
+  accountUpdateChecked(accountId: string, secret: string, exp: CheckedExpectations & { expectedAccountVersion: number }): AccountCommit;
+  accountRenameChecked(accountId: string, newAlias: string, exp: CheckedExpectations & { expectedAccountVersion: number }): RenameCommit;
+  accountRemoveChecked(accountId: string, force: boolean, exp: CheckedExpectations & { expectedAccountVersion: number }): RemoveCommit;
   status(): StatusView;
   journalStats(): JournalStats;
   configShow(): StateFile["settings"];
@@ -183,14 +284,16 @@ function viewAccount(state: StateFile, secrets: SecretStore, a: AccountRecord): 
 
 function viewRoutes(state: StateFile): RouteView[] {
   return LANES.map((lane) => {
-    const accountId = state.routes[lane].accountId;
-    if (!accountId) return { lane, accountId: null, alias: null, accountMissing: false };
+    const sel = state.routes[lane];
+    const accountId = sel.accountId;
+    if (!accountId) return { lane, accountId: null, alias: null, accountMissing: false, version: sel.version };
     const account = state.accounts.find((a) => a.id === accountId);
     return {
       lane,
       accountId,
       alias: account ? account.alias : null,
       accountMissing: !account,
+      version: sel.version,
     };
   });
 }
@@ -216,12 +319,71 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
   /** Run a read-modify-write cycle under the cross-process lock (fn applied exactly once). */
   const mutateLocked = <T>(fn: (s: StateFile) => T): T =>
     withFileLock(lockPath, MUTATE_LOCK_TIMEOUT_MS, () => {
+      // W0: every locked cycle first durably establishes the v2 lineage
+      // (absent -> fresh; v1/legacy-v1 -> migrate; v2 -> validate). Lazy
+      // migration preserves data; established files are untouched.
+      state.ensureV2();
       let result!: T;
       state.mutate((s) => {
         result = fn(s);
       });
       return result;
     });
+
+  /**
+   * W0 checked cycle (contract 7): establish, then run fn against a clone of
+   * the established state; persist ONLY when fn commits (no-op mutations must
+   * not rewrite state merely to refresh timestamps, 5.4). fn captures its
+   * commit result from the candidate (7.8).
+   */
+  const checkedMutate = <T>(fn: (s: StateFile) => { result: T; commit: boolean }): T =>
+    withFileLock(lockPath, MUTATE_LOCK_TIMEOUT_MS, () => {
+      state.ensureV2();
+      const established = state.read();
+      const candidate = structuredClone(established);
+      const { result, commit } = fn(candidate);
+      if (commit) state.write(candidate);
+      return result;
+    });
+
+  /** First authoritative in-lock check (contract 7): generation before anything else. */
+  function requireGeneration(s: StateFile, expected: string): void {
+    if (s.stateGeneration === "" || expected !== s.stateGeneration) {
+      throw new DomainConflict("state_generation_mismatch", "state generation mismatch: re-read state and retry the operation");
+    }
+  }
+
+  function requireRouteVersion(s: StateFile, lane: Lane, expected: number): void {
+    if (!isVersionNumber(expected) || s.routes[lane].version !== expected) {
+      throw new DomainConflict("route_version_mismatch", `route version mismatch for lane '${lane}': re-read state and retry the operation`);
+    }
+  }
+
+  function requireAccountVersion(a: AccountRecord, expected: number): void {
+    if (!isVersionNumber(expected) || a.version !== expected) {
+      throw new DomainConflict("account_version_mismatch", `account version mismatch for '${a.alias}': re-read state and retry the operation`);
+    }
+  }
+
+  /** Version-exhaustion guard (contract 5.6): refuse at the safe-integer maximum, never wrap. */
+  function nextVersion(current: number, what: string): number {
+    if (!isVersionNumber(current) || current >= Number.MAX_SAFE_INTEGER) {
+      throw new Error(`${what} version exhausted (safe-integer maximum): refusing mutation`);
+    }
+    return current + 1;
+  }
+
+  function checkedView(s: StateFile, a: AccountRecord): CheckedAccount {
+    return {
+      id: a.id,
+      alias: a.alias,
+      version: a.version,
+      secretPresent: secrets.exists(a.secretRef),
+      usedBy: LANES.filter((l) => s.routes[l].accountId === a.id),
+      createdAtUtc: a.createdAtUtc,
+      updatedAtUtc: a.updatedAtUtc,
+    };
+  }
 
   return {
     setup() {
@@ -311,82 +473,27 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
     },
 
     accountAdd(alias, secret) {
-      const aliasErr = validateAlias(alias);
-      if (aliasErr) throw new Error(aliasErr);
-      if (secret.length === 0 || secret.length > 1024) throw new Error("invalid secret");
-      // Fast-path duplicate check before touching DPAPI (the in-lock check
-      // below stays authoritative for races).
-      if (findAccount(state.read(), alias)) throw new Error(`account '${alias}' already exists`);
-      // DPAPI spawn OUTSIDE the lock (F-08); a duplicate-alias race leaves a
-      // benign orphan blob, never a dangling ref.
-      const ref = newRef();
-      secrets.put(ref, secret);
-      let account: AccountRecord | null = null;
-      try {
-        mutateLocked((s) => {
-          if (findAccount(s, alias)) throw new Error(`account '${alias}' already exists`);
-          account = makeAccount(alias, ref);
-          s.accounts.push(account);
-        });
-      } catch (e) {
-        // The ref is claimed only by the push: a null marker proves no commit
-        // (duplicate race, lock loss) and the blob is a pure orphan — reap.
-        // A non-null marker means the push ran (a later write failure must
-        // keep the blob: the in-memory state references it).
-        if (!account) {
-          try {
-            secrets.delete(ref);
-          } catch { /* best effort */ }
-        }
-        throw e;
-      }
-      return viewAccount(state.read(), secrets, account!);
+      // W0 legacy adapter: same signature/semantics; freezes reviewed values
+      // from one fresh established read, then commits through the checked core
+      // (a concurrent writer surfaces as conflict, never a silent overwrite).
+      const { stateGeneration } = this.ensureState();
+      const r = this.accountAddChecked(alias, secret, { expectedStateGeneration: stateGeneration });
+      const s = state.read();
+      return viewAccount(s, secrets, s.accounts.find((x) => x.id === r.account.id)!);
     },
 
     accountUpdate(alias, secret) {
-      if (secret.length === 0 || secret.length > 1024) throw new Error("invalid secret");
-      // Resolve the ref outside the lock so the DPAPI spawn (F-08) does not
-      // hold it; the id-keyed re-check below stays authoritative for races
-      // (a concurrent removal surfaces as not-found, never a dangling write).
-      const existing = findAccount(state.read(), alias);
+      // W0 legacy adapter: freeze by alias, then commit by immutable ID.
+      const { stateGeneration } = this.ensureState();
+      const frozen = state.read();
+      const existing = findAccount(frozen, alias);
       if (!existing) throw new Error(`account '${alias}' not found`);
-      // GR-001: atomic secret-reference swap. The new secret is stored under
-      // a FRESH ref OUTSIDE the lock (F-08: the DPAPI spawn must not hold
-      // it); the lock only swaps the reference after revalidating the
-      // account by stable id. A commit failure (lock timeout, write refusal)
-      // therefore leaves the OLD credential live, and the staged blob is an
-      // unclaimed orphan — reaped below. A concurrent removal surfaces as
-      // not-found, never a dangling write.
-      const ref = newRef();
-      secrets.put(ref, secret);
-      let updated: AccountRecord | null = null;
-      let replacedRef: string | null = null;
-      try {
-        mutateLocked((s) => {
-          const a = s.accounts.find((x) => x.id === existing.id);
-          if (!a) throw new Error(`account '${alias}' not found`);
-          replacedRef = a.secretRef;
-          a.secretRef = ref;
-          a.updatedAtUtc = new Date().toISOString();
-          updated = a;
-        });
-      } catch (e) {
-        // The swap never committed: nobody references the staged blob.
-        try {
-          secrets.delete(ref);
-        } catch { /* best effort */ }
-        throw e;
-      }
-      // Committed: the previous blob is now unreferenced — remove it so a
-      // stale credential cannot linger (best effort; an orphan is benign).
-      if (replacedRef !== null && replacedRef !== ref) {
-        try {
-          secrets.delete(replacedRef);
-        } catch (e) {
-          log.warn(`stale account credential blob cleanup failed (harmless orphan): ${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      return viewAccount(state.read(), secrets, updated!);
+      this.accountUpdateChecked(existing.id, secret, {
+        expectedStateGeneration: stateGeneration,
+        expectedAccountVersion: existing.version,
+      });
+      const s = state.read();
+      return viewAccount(s, secrets, s.accounts.find((x) => x.id === existing.id)!);
     },
 
     accountList() {
@@ -395,53 +502,38 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
     },
 
     accountRename(alias, newAlias) {
-      const aliasErr = validateAlias(newAlias);
-      if (aliasErr) throw new Error(aliasErr);
-      let renamed: AccountRecord | null = null;
-      let previousAlias = '';
-      mutateLocked((s) => {
-        const account = findAccount(s, alias);
-        if (!account) throw new Error(`account '${alias}' not found`);
-        if (findAccount(s, newAlias)) throw new Error(`account '${newAlias}' already exists`);
-        const a = s.accounts.find((x) => x.id === account.id)!;
-        previousAlias = a.alias;
-        a.alias = newAlias;
-        a.updatedAtUtc = new Date().toISOString();
-        renamed = a;
+      // W0 legacy adapter: freeze by alias, then commit by immutable ID.
+      const { stateGeneration } = this.ensureState();
+      const frozen = state.read();
+      const existing = findAccount(frozen, alias);
+      if (!existing) throw new Error(`account '${alias}' not found`);
+      const r = this.accountRenameChecked(existing.id, newAlias, {
+        expectedStateGeneration: stateGeneration,
+        expectedAccountVersion: existing.version,
       });
-      return { renamed: viewAccount(state.read(), secrets, renamed!), previousAlias };
+      const s = state.read();
+      return { renamed: viewAccount(s, secrets, s.accounts.find((x) => x.id === existing.id)!), previousAlias: r.previousAlias };
     },
 
     accountRemove(alias, force) {
-      let removed: AccountRecord | null = null;
-      const clearedLanes: Lane[] = [];
-      let secretRef: string | null = null;
-      mutateLocked((s) => {
-        const account = findAccount(s, alias);
-        if (!account) throw new Error(`account '${alias}' not found`);
-        const lane = accountUsedByRoute(s, account.id);
-        if (lane && !force) {
-          throw new Error(
-            `account '${account.alias}' is the selected ${lane.toUpperCase()} account; remove with --force to clear the selection`,
-          );
-        }
-        s.accounts = s.accounts.filter((x) => x.id !== account.id);
-        if (force) {
-          for (const l of LANES) {
-            if (s.routes[l].accountId === account.id) {
-              s.routes[l].accountId = null;
-              clearedLanes.push(l);
-            }
-          }
-        }
-        removed = account;
-        secretRef = account.secretRef;
+      // W0 legacy adapter: freeze by alias, then commit by immutable ID.
+      const { stateGeneration } = this.ensureState();
+      const frozen = state.read();
+      const existing = findAccount(frozen, alias);
+      if (!existing) throw new Error(`account '${alias}' not found`);
+      const r = this.accountRemoveChecked(existing.id, force, {
+        expectedStateGeneration: stateGeneration,
+        expectedAccountVersion: existing.version,
       });
-      // F-26: report whether the blob was actually removed (it may have
-      // vanished out-of-band; the account removal itself still succeeded).
-      const secretDeleted = secretRef ? secrets.delete(secretRef) : false;
       // post-removal view: usedBy is empty and secretPresent false by construction
-      return { removed: viewAccount(state.read(), secrets, removed!), clearedLanes, secretDeleted };
+      // post-removal view from the frozen record against fresh routes:
+      // usedBy is empty by construction; secretPresent reflects the store.
+      const s = state.read();
+      return {
+        removed: viewAccount(s, secrets, existing),
+        clearedLanes: r.clearedLanes.map((c) => c.lane),
+        secretDeleted: r.secretDeleted,
+      };
     },
 
     async accountTest(alias, lanes) {
@@ -459,18 +551,212 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
 
     /** Select the lane's account by alias OR stable account id (findAccount semantics). */
     routeSet(lane, aliasOrId) {
-      mutateLocked((s) => {
-        const account = findAccount(s, aliasOrId);
-        if (!account) throw new Error(`account '${aliasOrId}' not found`);
-        s.routes[lane].accountId = account.id;
+      // W0 legacy adapter: freeze by alias-or-ID, then commit by immutable ID.
+      const { stateGeneration } = this.ensureState();
+      const frozen = state.read();
+      const target = findAccount(frozen, aliasOrId);
+      if (!target) throw new Error(`account '${aliasOrId}' not found`);
+      this.routeSetChecked(lane, target.id, {
+        expectedStateGeneration: stateGeneration,
+        expectedRouteVersion: frozen.routes[lane].version,
+        expectedTargetAccountVersion: target.version,
       });
       return viewRoutes(state.read()).find((r) => r.lane === lane)!;
     },
 
     routeClear(lane) {
-      mutateLocked((s) => {
-        s.routes[lane].accountId = null;
+      // W0 legacy adapter: freeze, then commit through the checked core.
+      const { stateGeneration } = this.ensureState();
+      const frozen = state.read();
+      this.routeClearChecked(lane, {
+        expectedStateGeneration: stateGeneration,
+        expectedRouteVersion: frozen.routes[lane].version,
       });
+    },
+
+    ensureState() {
+      return withFileLock(lockPath, MUTATE_LOCK_TIMEOUT_MS, () => {
+        const established = state.ensureV2();
+        return { stateGeneration: established.stateGeneration };
+      });
+    },
+
+    routeSetChecked(lane, accountId, exp) {
+      return checkedMutate<RouteCommit>((s) => {
+        requireGeneration(s, exp.expectedStateGeneration);
+        requireRouteVersion(s, lane, exp.expectedRouteVersion);
+        const target = findAccountById(s, accountId);
+        if (!target) throw new DomainConflict("not_found", `account id '${accountId}' not found`);
+        requireAccountVersion(target, exp.expectedTargetAccountVersion);
+        if (!isValidSecretRef(target.secretRef) || !secrets.exists(target.secretRef)) {
+          throw new DomainConflict("target_not_selectable", `account '${target.alias}' is not selectable (stored credential missing)`);
+        }
+        const cur = s.routes[lane];
+        const base = {
+          stateGeneration: s.stateGeneration,
+          lane,
+          targetAccountId: target.id,
+          targetAccountVersion: target.version,
+        };
+        if (cur.accountId === target.id) {
+          return { result: { changed: false, ...base, routeVersion: cur.version, accountId: cur.accountId }, commit: false };
+        }
+        cur.accountId = target.id;
+        cur.version = nextVersion(cur.version, `route ${lane}`);
+        return { result: { changed: true, ...base, routeVersion: cur.version, accountId: cur.accountId }, commit: true };
+      });
+    },
+
+    routeClearChecked(lane, exp) {
+      return checkedMutate<RouteCommit>((s) => {
+        requireGeneration(s, exp.expectedStateGeneration);
+        requireRouteVersion(s, lane, exp.expectedRouteVersion);
+        const cur = s.routes[lane];
+        const base = {
+          stateGeneration: s.stateGeneration,
+          lane,
+          targetAccountId: null as string | null,
+          targetAccountVersion: null as number | null,
+        };
+        if (cur.accountId === null) {
+          return { result: { changed: false, ...base, routeVersion: cur.version, accountId: null as string | null }, commit: false };
+        }
+        cur.accountId = null;
+        cur.version = nextVersion(cur.version, `route ${lane}`);
+        return { result: { changed: true, ...base, routeVersion: cur.version, accountId: null as string | null }, commit: true };
+      });
+    },
+
+    accountAddChecked(alias, secret, exp) {
+      const aliasErr = validateAlias(alias);
+      if (aliasErr) throw new Error(aliasErr);
+      if (secret.length === 0 || secret.length > 1024) throw new Error("invalid secret");
+      const ref = newRef();
+      secrets.put(ref, secret);
+      let committed = false;
+      try {
+        return checkedMutate<AccountCommit>((s) => {
+          requireGeneration(s, exp.expectedStateGeneration);
+          if (findAccountByAlias(s.accounts, alias)) {
+            throw new DomainConflict("alias_conflict", `account '${alias}' already exists`);
+          }
+          const account = makeAccount(alias, ref);
+          s.accounts.push(account);
+          committed = true;
+          return { result: { changed: true, stateGeneration: s.stateGeneration, account: checkedView(s, account) }, commit: true };
+        });
+      } catch (e) {
+        // Pre-commit failure (stale generation, alias race): the ref is
+        // unclaimed — reap (contract 10 item 39). A write failure after the
+        // push keeps the benign-orphan precedent (nothing references it, but
+        // the failure is already fatal to the caller).
+        if (!committed) {
+          try { secrets.delete(ref); } catch { /* best effort */ }
+        }
+        throw e;
+      }
+    },
+
+    accountUpdateChecked(accountId, secret, exp) {
+      if (secret.length === 0 || secret.length > 1024) throw new Error("invalid secret");
+      const ref = newRef();
+      secrets.put(ref, secret);
+      let committed = false;
+      let replacedRef: string | null = null;
+      try {
+        const out = checkedMutate<AccountCommit>((s) => {
+          requireGeneration(s, exp.expectedStateGeneration);
+          const a = findAccountById(s, accountId);
+          if (!a) throw new DomainConflict("not_found", `account id '${accountId}' not found`);
+          requireAccountVersion(a, exp.expectedAccountVersion);
+          replacedRef = a.secretRef;
+          a.secretRef = ref;
+          a.updatedAtUtc = new Date().toISOString();
+          a.version = nextVersion(a.version, `account '${a.alias}'`);
+          committed = true;
+          return { result: { changed: true, stateGeneration: s.stateGeneration, account: checkedView(s, a) }, commit: true };
+        });
+        if (replacedRef !== null && replacedRef !== ref) {
+          try { secrets.delete(replacedRef); } catch (e) {
+            log.warn(`stale account credential blob cleanup failed (harmless orphan): ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        return out;
+      } catch (e) {
+        if (!committed) {
+          try { secrets.delete(ref); } catch { /* best effort */ }
+        }
+        throw e;
+      }
+    },
+
+    accountRenameChecked(accountId, newAlias, exp) {
+      const aliasErr = validateAlias(newAlias);
+      if (aliasErr) throw new Error(aliasErr);
+      return checkedMutate<RenameCommit>((s) => {
+        requireGeneration(s, exp.expectedStateGeneration);
+        const a = findAccountById(s, accountId);
+        if (!a) throw new DomainConflict("not_found", `account id '${accountId}' not found`);
+        requireAccountVersion(a, exp.expectedAccountVersion);
+        if (a.alias === newAlias) {
+          return {
+            result: { changed: false, stateGeneration: s.stateGeneration, account: checkedView(s, a), previousAlias: a.alias },
+            commit: false,
+          };
+        }
+        const other = findAccountByAlias(s.accounts, newAlias);
+        if (other && other.id !== a.id) {
+          throw new DomainConflict("alias_conflict", `account '${newAlias}' already exists`);
+        }
+        const previousAlias = a.alias;
+        a.alias = newAlias;
+        a.updatedAtUtc = new Date().toISOString();
+        a.version = nextVersion(a.version, `account '${previousAlias}'`);
+        return {
+          result: { changed: true, stateGeneration: s.stateGeneration, account: checkedView(s, a), previousAlias },
+          commit: true,
+        };
+      });
+    },
+
+    accountRemoveChecked(accountId, force, exp) {
+      let secretRef: string | null = null;
+      const out = checkedMutate<RemoveCommit>((s) => {
+        requireGeneration(s, exp.expectedStateGeneration);
+        const account = findAccountById(s, accountId);
+        if (!account) throw new DomainConflict("not_found", `account id '${accountId}' not found`);
+        requireAccountVersion(account, exp.expectedAccountVersion);
+        const inUse: Lane[] = LANES.filter((l) => s.routes[l].accountId === account.id);
+        if (inUse.length > 0 && !force) {
+          throw new DomainConflict("account_in_use", `account '${account.alias}' is the selected ${inUse.join(",").toUpperCase()} account; remove with force to clear the selection`);
+        }
+        const clearedLanes: { lane: Lane; routeVersion: number }[] = [];
+        if (force) {
+          for (const l of LANES) {
+            if (s.routes[l].accountId === account.id) {
+              s.routes[l].accountId = null;
+              s.routes[l].version = nextVersion(s.routes[l].version, `route ${l}`);
+              clearedLanes.push({ lane: l, routeVersion: s.routes[l].version });
+            }
+          }
+        }
+        s.accounts = s.accounts.filter((x) => x.id !== account.id);
+        secretRef = account.secretRef;
+        return {
+          result: {
+            changed: true,
+            stateGeneration: s.stateGeneration,
+            removedAccountId: account.id,
+            removedAccountVersion: account.version,
+            clearedLanes,
+            secretDeleted: false,
+          },
+          commit: true,
+        };
+      });
+      const secretDeleted = secretRef ? secrets.delete(secretRef) : false;
+      out.secretDeleted = secretDeleted;
+      return out;
     },
 
     status() {
@@ -480,6 +766,8 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         localCredentialConfigured: s.localCredentialRef !== null && secrets.exists(s.localCredentialRef),
         stateCorrupt: state.health().corrupt,
         stateUnsupportedVersion: state.health().unsupportedSchemaVersion,
+        stateGeneration: s.stateGeneration,
+        schemaVersion: s.schemaVersion,
         routes: viewRoutes(s),
         accounts: s.accounts.map((a) => viewAccount(s, secrets, a)),
         settings: { ...s.settings },
@@ -549,6 +837,9 @@ export function createDomain(paths: Paths, secrets: SecretStore): Domain {
         x.accounts = fresh.accounts;
         x.routes = fresh.routes;
         x.localCredentialRef = null;
+        // W0 reset boundary (contract 6.5): a new lineage so pre-reset
+        // requests fail even if version numbers are numerically reused.
+        x.stateGeneration = newStateGeneration();
       });
       for (const r of refs) secrets.delete(r);
       // Slice A: reset also removes persisted registry (clean slate)

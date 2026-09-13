@@ -22,6 +22,7 @@ public sealed class ControlResponse
     public JsonElement? Data { get; init; }
     public string? ErrorCode { get; init; }
     public string? ErrorMessage { get; init; }
+    public string? ErrorReason { get; init; }
 
     public static ControlResponse FromJson(JsonElement root)
     {
@@ -40,6 +41,7 @@ public sealed class ControlResponse
 
         string? errorCode = null;
         string? errorMessage = null;
+        string? errorReason = null;
         if (root.TryGetProperty("error", out var errorProp) && errorProp.ValueKind == JsonValueKind.Object)
         {
             if (errorProp.TryGetProperty("code", out var codeProp) && codeProp.ValueKind == JsonValueKind.String)
@@ -51,6 +53,11 @@ public sealed class ControlResponse
             {
                 errorMessage = messageProp.GetString();
             }
+
+            if (errorProp.TryGetProperty("reason", out var reasonProp) && reasonProp.ValueKind == JsonValueKind.String)
+            {
+                errorReason = reasonProp.GetString();
+            }
         }
 
         return new ControlResponse
@@ -60,6 +67,7 @@ public sealed class ControlResponse
             Data = data,
             ErrorCode = errorCode,
             ErrorMessage = errorMessage,
+            ErrorReason = errorReason,
         };
     }
 
@@ -270,7 +278,7 @@ public sealed class ControlClient : IControlChannel
         try
         {
             // hello must be the first message; the server replies and then pushes the initial snapshot event.
-            var hello = await CallCoreAsync(pipe, "hello", new { app = "GoRouterDesktop", version = "1.5.0" }, TimeSpan.FromSeconds(5))
+            var hello = await CallCoreAsync(pipe, "hello", new { app = "GoRouterDesktop", version = "1.5.0", protocol = 2 }, TimeSpan.FromSeconds(5))
                 .ConfigureAwait(false);
             if (!hello.Ok)
             {
@@ -397,6 +405,19 @@ public sealed class ControlClient : IControlChannel
         }
 
         return await CallCoreAsync(pipe, op, parameters, TimeSpan.FromMilliseconds(timeoutMs), ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// W1 warm Web Control activation. Requires the already-authenticated pipe
+    /// (hello completed): the service binds its loopback listener, mints a
+    /// fragment-only bootstrap, and opens the OS default browser itself. The
+    /// raw bootstrap URL never crosses the pipe — the response carries only an
+    /// opened flag — so there is nothing here to log, persist, or leak. A
+    /// pre-W1 service answers unknown-op; callers report that as unsupported.
+    /// </summary>
+    public async Task<ControlResponse> WebOpenAsync(int timeoutMs = 60_000, CancellationToken ct = default)
+    {
+        return await CallAsync("web.open", null, timeoutMs, ct).ConfigureAwait(false);
     }
 
     /// <summary>Marks the connection unusable with an actionable auth-style error.</summary>

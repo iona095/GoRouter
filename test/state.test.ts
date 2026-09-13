@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore, isTransientReadError, readWithTransientRetry } from "../src/state.ts";
+import { lockPathFor, withFileLock } from "../src/lock.ts";
 import { memSecrets } from "./harness.ts";
 
 const dirs: string[] = [];
@@ -75,6 +76,9 @@ describe("corrupt state quarantine (F-19)", () => {
     expect(store.health()).toEqual({ corrupt: true, unsupportedSchemaVersion: null });
     store.acknowledgeCorruptRepair();
     expect(store.health()).toEqual({ corrupt: false, unsupportedSchemaVersion: null });
+    // W0 (Amendment A3): establish the v2 lineage before the first raw write,
+    // mirroring production setup — a raw mutate cannot mint a lineage.
+    withFileLock(lockPathFor(paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => { s.settings.port = 9999; });
     expect(existsSync(stateJson)).toBe(true);
     expect(store.read().settings.port).toBe(9999);
@@ -101,6 +105,8 @@ describe("corrupt state quarantine (F-19)", () => {
     const { dir, stateJson } = freshStateDir();
     const paths = resolvePaths(dir);
     const store = createStateStore(paths, memSecrets());
+    // W0 (Amendment A3): establish first; the unestablished default is not committable.
+    withFileLock(lockPathFor(paths.state), 10_000, () => store.ensureV2());
     store.mutate((s) => {
       s.settings.port = 8787;
     });

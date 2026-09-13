@@ -14,7 +14,9 @@ import { atomicWriteJson, log, quarantineCorruptFile } from "./util.ts";
 import { isValidSecretRef, type SecretStore } from "./secret-store.ts";
 import type { Paths } from "./paths.ts";
 
-export const STATE_SCHEMA_VERSION = 1;
+export const STATE_SCHEMA_VERSION = 2;
+/** Last migratable predecessor: numeric v1 migrates under lock (contract \u00a76.1). */
+export const STATE_MIGRATABLE_VERSION = 1;
 
 /** F-13: bounded attempts for a single state.json read. */
 export const STATE_READ_ATTEMPTS = 3;
@@ -64,15 +66,26 @@ export interface AccountRecord {
   secretRef: string;
   createdAtUtc: string;
   updatedAtUtc: string;
+  /** W0 optimistic-concurrency version: positive safe integer, starts at 1. */
+  version: number;
 }
 
 export interface RouteSelection {
   /** Account id, or null when no account is selected for the lane. */
   accountId: string | null;
+  /** W0 lane version: positive safe integer, starts at 1. */
+  version: number;
 }
 
 export interface StateFile {
   schemaVersion: number;
+  /**
+   * W0 persisted lineage token (UUIDv4): created once per new/migrated state
+   * lineage, preserved across ordinary restart, replaced only on explicit
+   * reset/reinitialization. Empty string marks an UNESTABLISHED in-memory
+   * default (absent file) that no checked mutation may commit against.
+   */
+  stateGeneration: string;
   accounts: AccountRecord[];
   routes: Record<Lane, RouteSelection>;
   settings: {
@@ -169,11 +182,88 @@ export function validateUpstreamUrl(
   };
 }
 
+/**
+ * W0 concurrency-metadata validators (contract \u00a75.1/\u00a75.5). Versions are
+ * positive safe integers only — never 0, negative, fractional, NaN, infinite,
+ * or beyond the safe-integer range. Missing/malformed metadata fails closed;
+ * it is never silently defaulted to 1.
+ */
+export function isVersionNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 1;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export function isStateGeneration(v: unknown): v is string {
+  return typeof v === "string" && UUID_RE.test(v);
+}
+
+/** Mint one fresh lineage token (concurrency metadata, not a secret). */
+export function newStateGeneration(): string {
+  return randomUUID();
+}
+
+/**
+ * Raw on-disk classification (contract \u00a76.1). Pure function of parsed JSON:
+ * - 'v2': current schema (strict validation happens in normalizeV2).
+ * - 'v1': numeric v1, migratable predecessor.
+ * - 'legacy-v1': missing/non-numeric schema metadata that still satisfies the
+ *   v1 structural/identity invariants (explicit migration class, never a
+ *   bypass and never normalized directly as v2).
+ * - 'legacy-invalid': missing/non-numeric metadata that fails v1 invariants
+ *   (refuse migration rather than guess).
+ * - 'unsupported': any other numeric version (fail closed).
+ * - 'corrupt': not a JSON object at all.
+ */
+export type RawStateClass = "v2" | "v1" | "legacy-v1" | "legacy-invalid" | "unsupported" | "corrupt";
+export function classifyRawState(parsed: unknown): RawStateClass {
+  if (typeof parsed !== "object" || parsed === null) return "corrupt";
+  const raw = parsed as Record<string, unknown>;
+  const v = raw.schemaVersion;
+  if (v === STATE_SCHEMA_VERSION) return "v2";
+  if (v === STATE_MIGRATABLE_VERSION) return "v1";
+  if (typeof v === "number") return "unsupported";
+  return satisfiesV1Identity(raw) ? "legacy-v1" : "legacy-invalid";
+}
+
+/** v1 structural/identity invariants a legacy file must satisfy to migrate. */
+function satisfiesV1Identity(raw: Record<string, unknown>): boolean {
+  if (!Array.isArray(raw.accounts)) return false;
+  const ids = new Set<string>();
+  const aliases = new Set<string>();
+  for (const entry of raw.accounts) {
+    if (typeof entry !== "object" || entry === null) return false;
+    const a = entry as Record<string, unknown>;
+    if (typeof a.id !== "string" || a.id.length === 0) return false;
+    if (typeof a.alias !== "string" || a.alias.length === 0) return false;
+    if (!isValidSecretRef(a.secretRef)) return false;
+    if (ids.has(a.id)) return false;
+    ids.add(a.id);
+    const folded = a.alias.toLowerCase();
+    if (aliases.has(folded)) return false;
+    aliases.add(folded);
+  }
+  if (raw.routes !== undefined) {
+    if (typeof raw.routes !== "object" || raw.routes === null) return false;
+    const r = raw.routes as Record<string, unknown>;
+    for (const lane of LANES) {
+      const sel = r[lane];
+      if (sel === undefined) continue;
+      if (typeof sel !== "object" || sel === null) return false;
+      const id = (sel as { accountId?: unknown }).accountId;
+      if (id !== null && id !== undefined && typeof id !== "string") return false;
+    }
+  }
+  return true;
+}
+
 export function defaultState(): StateFile {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
+    // UNESTABLISHED marker: no checked mutation may commit against "" (D3).
+    // establishV2 replaces it with one fresh persisted lineage under lock.
+    stateGeneration: "",
     accounts: [],
-    routes: { go: { accountId: null }, zen: { accountId: null } },
+    routes: { go: { accountId: null, version: 1 }, zen: { accountId: null, version: 1 } },
     settings: {
       port: 8787,
       host: "127.0.0.1",
@@ -209,6 +299,16 @@ export interface StateStore {
    * write is refused until the operator restores a supported version.
    */
   health(): { corrupt: boolean; unsupportedSchemaVersion: number | null };
+  /**
+   * W0 establishment (contract \u00a76.1/\u00a76.2): classify the CURRENT
+   * on-disk bytes (re-read AFTER the caller acquires the mutation lock) and
+   * durably establish exactly one v2 lineage: absent \u2192 fresh v2;
+   * v1/legacy-v1 \u2192 migrate (one fresh generation, versions 1, full
+   * preservation); v2 \u2192 validate (idempotent, no new generation);
+   * anything else \u2192 throw fail-closed. Returns the established state.
+   * MUST be called with the cross-process mutation lock held.
+   */
+  ensureV2(): StateFile;
 }
 
 export function createStateStore(paths: Paths, secrets: SecretStore, opts: { quarantine?: typeof quarantineCorruptFile; writeJson?: typeof atomicWriteJson } = {}): StateStore {
@@ -324,22 +424,52 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       log.error(`state.json corrupt; evidence quarantined, serving defaults (path=${p})`);
       return defaultState();
     }
-    // GR-004: a numeric version that is not ours is a compatibility gate,
-    // not metadata. Serve defaults and refuse every write — never normalize
-    // (which would drop unknown fields) and never overwrite. A missing or
-    // non-numeric version keeps the legacy tolerance (treated as v1).
-    const onDiskVersion = (parsed as { schemaVersion?: unknown }).schemaVersion;
-    if (typeof onDiskVersion === "number" && onDiskVersion !== STATE_SCHEMA_VERSION) {
-      unsupportedSchema = onDiskVersion;
+    // W0 loader policy (contract \u00a76.1): numeric v1 is the migratable
+    // predecessor (served as a legacy view until establishV2 migrates it under
+    // lock); source-compatible missing/non-numeric metadata is the explicit
+    // legacy-v1 class; v2 is strictly validated; every other numeric version
+    // is an unsupported compatibility gate (never normalized, never
+    // overwritten); anything else fails closed through the corrupt path.
+    const cls = classifyRawState(parsed);
+    if (cls === "unsupported") {
+      const onDiskVersion = (parsed as { schemaVersion?: unknown }).schemaVersion;
+      unsupportedSchema = onDiskVersion as number;
       corrupt = false;
       cache = null;
       log.error(`state.json has unsupported schema version ${onDiskVersion} (this binary supports v${STATE_SCHEMA_VERSION}); serving defaults, writes refused`);
       return defaultState();
     }
-    const state = normalizeState(parsed);
+    if (cls === "corrupt" || cls === "legacy-invalid") {
+      corrupt = true;
+      quarantine(p);
+      cache = null;
+      log.error(`state.json failed structural validation; evidence quarantined, serving defaults (path=${p})`);
+      return defaultState();
+    }
+    if (cls === "v2") {
+      const state = normalizeV2(parsed);
+      if (!state) {
+        // Concurrency-integrity failure (\u00a75.5): quarantine + latch, same
+        // policy as corrupt JSON. Never default the metadata to look valid.
+        corrupt = true;
+        quarantine(p);
+        cache = null;
+        log.error(`state.json v2 concurrency metadata invalid; evidence quarantined, serving defaults (path=${p})`);
+        return defaultState();
+      }
+      corrupt = false;
+      unsupportedSchema = null; // healed: a supported version supersedes the gate
+      lastQuarantine = null; // healed: prior evidence is superseded, never name it again
+      cache = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, state };
+      return state;
+    }
+    // v1 / legacy-v1: legacy tolerance view. Versions/generation here are
+    // placeholders (generation \"\" = UNESTABLISHED); no W0 metadata is
+    // exposed as committable until establishV2 migrates under lock (\u00a76.2).
+    const state = normalizeV1Legacy(parsed);
     corrupt = false;
-    unsupportedSchema = null; // healed: a supported version supersedes the gate
-    lastQuarantine = null; // healed: prior evidence is superseded, never name it again
+    unsupportedSchema = null;
+    lastQuarantine = null;
     cache = { mtimeMs: st.mtimeMs, size: st.size, ino: st.ino, state };
     return state;
   }
@@ -351,10 +481,16 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
     cache = null; // force a fresh read next time
   }
 
-  return {
+  const api: StateStore = {
     read: load,
     write,
     mutate(fn) {
+      // W0 (contract 6.2): establish the v2 lineage as part of every locked
+      // mutation cycle, so no caller can persist an unestablished husk or
+      // bypass migration. Idempotent on established state. Production callers
+      // hold the cross-process mutation lock here (domain mutateLocked); the
+      // classify+migrate+write sequence is atomic only under it.
+      api.ensureV2();
       // R4-001 (SS-01): clone-on-mutate. The cached object must never be
       // the mutation target: if the write throws, the live cache still
       // holds the old state and a later write cannot persist the phantom.
@@ -401,6 +537,85 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       if (!state.localCredentialRef) throw new Error("local client credential not configured; run `gorouter setup`");
       return secrets.get(state.localCredentialRef);
     },
+    ensureV2() {
+      // Re-read raw bytes NOW (post-lock acquisition): two racing migrators
+      // serialize here; the loser observes the winner's v2 and converges
+      // without minting a second generation (\u00a710 item 15).
+      // NOTE: paths.stateJson is used explicitly (the load-local `p` is not
+      // in scope here).
+      const statePath = paths.stateJson;
+      let raw: string | null = null;
+      if (existsSync(statePath)) {
+        try {
+          raw = readWithTransientRetry(() => readFileSync(statePath, "utf8"));
+        } catch (e) {
+          corrupt = true;
+          quarantine(statePath);
+          cache = null;
+          throw new Error(
+            `cannot establish state schema: state.json unreadable (${(e as { code?: unknown }).code ?? "unknown"}); evidence quarantined`,
+          );
+        }
+      }
+      if (raw === null) {
+        // Absent/uninitialized: metadata-only v2 lineage, no credentials.
+        // Gate parity with load(): deleting the unsupported file is the
+        // documented repair, so a stale gate clears here. The corrupt latch
+        // is NOT implicitly healed (R4-003: explicit repair required).
+        if (unsupportedSchema !== null) {
+          log.warn(`state.json absent; clearing unsupported-schema gate (was v${unsupportedSchema}); repair via setup allowed`);
+          unsupportedSchema = null;
+          cache = null;
+        }
+        const fresh = defaultState();
+        fresh.stateGeneration = newStateGeneration();
+        refuseIfCorrupt();
+        writeJson(statePath, fresh);
+        cache = null;
+        return load();
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        corrupt = true;
+        quarantine(statePath);
+        cache = null;
+        // Same refusal vocabulary as refuseIfCorrupt (a failed quarantine
+        // leaves the only copy in place; the mutation must refuse, never wipe).
+        throw new Error(
+          `refusing to write: state.json is corrupt${lastQuarantine ? ` (evidence at ${lastQuarantine})` : ""}; ` +
+          `restore a backup or delete state.json and re-run setup`,
+        );
+      }
+      const cls = classifyRawState(parsed);
+      if (cls === "v2") return load(); // idempotent: validate, keep generation
+      if (cls === "unsupported") {
+        unsupportedSchema = (parsed as { schemaVersion?: unknown }).schemaVersion as number;
+        cache = null;
+        throw new Error(
+          `cannot establish state schema: unsupported schema version ${unsupportedSchema} (this binary supports v${STATE_SCHEMA_VERSION})`,
+        );
+      }
+      if (cls === "corrupt" || cls === "legacy-invalid") {
+        corrupt = true;
+        quarantine(statePath);
+        cache = null;
+        throw new Error("cannot establish state schema: state failed v1 structural/identity invariants; evidence quarantined");
+      }
+      // v1 / legacy-v1: migrate under this lock, atomically, preserving every
+      // stable field and selection; versions initialize to 1; exactly one
+      // fresh generation for the migration commit (\u00a76.1). Valid restorable
+      // content heals stale latches exactly as load() does (an operator-
+      // restored backup must be committable, not latched forever).
+      corrupt = false;
+      unsupportedSchema = null;
+      lastQuarantine = null;
+      const migrated = migrateV1ToV2(parsed);
+      writeJson(statePath, migrated);
+      cache = null;
+      return load();
+    },
     acknowledgeCorruptRepair() {
       // Explicit operator recovery (R4-003 option B). Absent file: the
       // quarantined/deleted copy is gone, so clear the latch and allow
@@ -420,18 +635,23 @@ export function createStateStore(paths: Paths, secrets: SecretStore, opts: { qua
       return { corrupt, unsupportedSchemaVersion: unsupportedSchema };
     },
   };
+  return api;
 }
 
-function normalizeState(parsed: unknown): StateFile {
+/**
+ * Legacy v1 tolerance view (contract \u00a76.1): preserves the pre-W0
+ * normalizeState semantics exactly (v1 structural data + safe-settings
+ * fail-closed defaults), stamped schemaVersion 1 with UNESTABLISHED
+ * placeholders. Never a commit source until establishV2 migrates it.
+ */
+function normalizeV1Legacy(parsed: unknown): StateFile {
   const base = defaultState();
   if (typeof parsed !== "object" || parsed === null) return base;
   const raw = parsed as Record<string, unknown>;
   const out: StateFile = base;
-  // GR-004: only our own version number is preserved (load() gates anything
-  // else before normalizeState ever runs; this is defense in depth).
-  if (raw.schemaVersion === STATE_SCHEMA_VERSION) out.schemaVersion = raw.schemaVersion;
+  out.schemaVersion = STATE_MIGRATABLE_VERSION;
   if (Array.isArray(raw.accounts)) {
-    out.accounts = raw.accounts.filter(isAccountRecord).map((a) => ({ ...a }));
+    out.accounts = raw.accounts.filter(isAccountRecord).map((a) => ({ ...a, version: 1 }));
   }
   if (typeof raw.routes === "object" && raw.routes !== null) {
     const r = raw.routes as Record<string, unknown>;
@@ -439,10 +659,74 @@ function normalizeState(parsed: unknown): StateFile {
       const sel = r[lane];
       if (sel && typeof sel === "object" && "accountId" in sel) {
         const v = (sel as { accountId?: unknown }).accountId;
-        out.routes[lane] = { accountId: typeof v === "string" ? v : null };
+        out.routes[lane] = { accountId: typeof v === "string" ? v : null, version: 1 };
       }
     }
   }
+  applySafeSettings(raw, out);
+  return out;
+}
+
+/**
+ * Strict v2 normalization (contract \u00a75.1/\u00a75.5): returns null on ANY
+ * invalid concurrency metadata or identity violation. Never defaults versions
+ * to 1 and never discards invalid entries — failure quarantines via load().
+ */
+function normalizeV2(parsed: unknown): StateFile | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const raw = parsed as Record<string, unknown>;
+  if (raw.schemaVersion !== STATE_SCHEMA_VERSION) return null;
+  if (!isStateGeneration(raw.stateGeneration)) return null;
+  if (!Array.isArray(raw.accounts)) return null;
+  const out: StateFile = defaultState();
+  out.schemaVersion = STATE_SCHEMA_VERSION;
+  out.stateGeneration = raw.stateGeneration;
+  const ids = new Set<string>();
+  const aliases = new Set<string>();
+  const accounts: AccountRecord[] = [];
+  for (const entry of raw.accounts) {
+    if (!isAccountRecord(entry)) return null;
+    const rec = entry as unknown as Record<string, unknown>;
+    if (!isVersionNumber(rec.version)) return null;
+    const id = entry.id;
+    const folded = entry.alias.toLowerCase();
+    if (id.length === 0 || ids.has(id)) return null;
+    if (aliases.has(folded)) return null;
+    ids.add(id);
+    aliases.add(folded);
+    accounts.push({ ...entry, version: rec.version as number });
+  }
+  out.accounts = accounts;
+  if (typeof raw.routes !== "object" || raw.routes === null) return null;
+  const r = raw.routes as Record<string, unknown>;
+  for (const lane of LANES) {
+    const sel = r[lane];
+    if (!sel || typeof sel !== "object") return null;
+    const rec = sel as { accountId?: unknown; version?: unknown };
+    if (rec.accountId !== null && typeof rec.accountId !== "string") return null;
+    if (!isVersionNumber(rec.version)) return null;
+    out.routes[lane] = { accountId: rec.accountId, version: rec.version };
+  }
+  applySafeSettings(raw, out);
+  return out;
+}
+
+/**
+ * v1/legacy-v1 \u2192 v2 migration commit builder (contract \u00a76.1): preserves every stable
+ * field, selection, setting, and credential reference; initializes all versions
+ * to 1; mints exactly one fresh generation for the migration commit. Pure
+ * (no I/O); the caller persists atomically under lock.
+ */
+export function migrateV1ToV2(parsed: unknown): StateFile {
+  const legacy = normalizeV1Legacy(parsed);
+  legacy.schemaVersion = STATE_SCHEMA_VERSION;
+  legacy.stateGeneration = newStateGeneration();
+  return legacy;
+}
+
+/** Pre-existing safe-settings/localCredential fail-closed defaults (unchanged). */
+function applySafeSettings(raw: Record<string, unknown>, out: StateFile): void {
+  const base = defaultState();
   if (typeof raw.settings === "object" && raw.settings !== null) {
     const s = raw.settings as Record<string, unknown>;
     // CURRENT-012: fractional/out-of-range persisted ports fail closed to
@@ -488,7 +772,6 @@ function normalizeState(parsed: unknown): StateFile {
   // CURRENT-001 layer 2: a malformed local credential ref fails closed to
   // unconfigured (operator must re-run setup) rather than flowing to the store.
   if (isValidSecretRef(raw.localCredentialRef)) out.localCredentialRef = raw.localCredentialRef;
-  return out;
 }
 
 function isAccountRecord(v: unknown): v is AccountRecord {
@@ -513,6 +796,25 @@ export function findAccount(state: StateFile, aliasOrId: string): AccountRecord 
   return state.accounts.find((a) => a.alias.toLowerCase() === needle || a.id === needle);
 }
 
+/**
+ * W0 exact immutable-ID lookup (contract \u00a77): opaque exact match only.
+ * MUST be used for every checked account mutation — never an alias-capable
+ * resolver — so an alias equal to another account's ID cannot redirect intent.
+ */
+export function findAccountById(state: StateFile, id: string): AccountRecord | undefined {
+  return state.accounts.find((a) => a.id === id);
+}
+
+/**
+ * W0 alias-only CLI resolution (contract \u00a78.3): case-insensitive alias
+ * match only. An argument equal to some account's immutable ID resolves to the
+ * alias-owned account (or nothing), never to the ID-owned account.
+ */
+export function findAccountByAlias(accounts: AccountRecord[], alias: string): AccountRecord | undefined {
+  const needle = alias.toLowerCase();
+  return accounts.find((a) => a.alias.toLowerCase() === needle);
+}
+
 export function accountUsedByRoute(state: StateFile, accountId: string): Lane | null {
   for (const lane of LANES) {
     if (state.routes[lane].accountId === accountId) return lane;
@@ -522,7 +824,7 @@ export function accountUsedByRoute(state: StateFile, accountId: string): Lane | 
 
 export function makeAccount(alias: string, secretRef: string): AccountRecord {
   const now = new Date().toISOString();
-  return { id: `acct_${randomUUID()}`, alias, secretRef, createdAtUtc: now, updatedAtUtc: now };
+  return { id: `acct_${randomUUID()}`, alias, secretRef, createdAtUtc: now, updatedAtUtc: now, version: 1 };
 }
 
 export const ALIAS_RE = /^[A-Za-z0-9._-]{1,64}$/;

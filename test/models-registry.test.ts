@@ -17,7 +17,7 @@ import { resolvePaths, ensureStateDirs } from "../src/paths.ts";
 import { createStateStore, makeAccount } from "../src/state.ts";
 import { createJournal } from "../src/journal.ts";
 import { createServer } from "../src/server.ts";
-import { memSecrets, LOCAL_KEY, authHeaders, startMockUpstream } from "./harness.ts";
+import { memSecrets, LOCAL_KEY, authHeaders, sessionHeaders, startMockUpstream } from "./harness.ts";
 import { createDomain } from "../src/domain.ts";
 import { createSecretStore, newRef } from "../src/secret-store.ts";
 import {
@@ -1182,7 +1182,7 @@ describe("server /models cache and auth", () => {
     // Ensure no registry file
     expect(existsSync(join(paths.state, "models-registry.json"))).toBe(false);
 
-    const resModels = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
+    const resModels = await fetch(baseUrl + "/go/v1/models", { headers: sessionHeaders() });
     expect(resModels.status).toBe(200);
     const body = (await resModels.json()) as { data: Array<{ id: string }> };
     // No registry: server should proxy (upstream-model) OR serve cache if t4 landed with empty cache fallback
@@ -1192,7 +1192,7 @@ describe("server /models cache and auth", () => {
     // Inference path still proxied (regression guard)
     const resChat = await fetch(baseUrl + "/go/v1/chat/completions", {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: sessionHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ model: "x", messages: [] }),
     });
     expect(resChat.status).toBe(200);
@@ -1245,7 +1245,7 @@ describe("server /models cache and auth", () => {
     expect(upstream.requests.length).toBe(0);
 
     // Valid auth should succeed (either from cache or proxy); upstream should see injected account key if proxied
-    const resOk = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
+    const resOk = await fetch(baseUrl + "/go/v1/models", { headers: sessionHeaders() });
     expect(resOk.status).toBe(200);
 
     stopServer(server, journal);
@@ -1287,7 +1287,7 @@ describe("server /models cache and auth", () => {
     const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
-    const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
+    const res = await fetch(baseUrl + "/go/v1/models", { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     expect(res.headers.get("x-gorouter-models-cache")).toBe("hit");
     const body = (await res.json()) as { object: string; data: Array<{ id: string }> };
@@ -1295,7 +1295,7 @@ describe("server /models cache and auth", () => {
     expect(body.object).toBe("list");
     expect(upstream.requests.length).toBe(0);
 
-    const resZen = await fetch(baseUrl + "/zen/v1/models", { headers: authHeaders() });
+    const resZen = await fetch(baseUrl + "/zen/v1/models", { headers: sessionHeaders() });
     expect(resZen.status).toBe(200);
     expect(resZen.headers.get("x-gorouter-models-cache")).toBe("hit");
     const bodyZen = (await resZen.json()) as { object: string; data: Array<{ id: string }> };
@@ -1307,9 +1307,14 @@ describe("server /models cache and auth", () => {
   });
 
   test("stale registry: /models serves stale and triggers background refresh (stale-while-revalidate)", async () => {
-    const upstream = await startMockUpstream(() =>
-      Response.json({ object: "list", data: [{ id: "new-upstream-model" }] }, { status: 200 }),
-    );
+    // Deterministic ordering: the background revalidation fetch is delayed past
+    // the stale assertion, so the test never races refresh completion (the race
+    // outcome otherwise depends on sub-ms loopback scheduling and differs
+    // structurally between Windows and container loopback). Mock timing only.
+    const upstream = await startMockUpstream(async () => {
+      await Bun.sleep(1000);
+      return Response.json({ object: "list", data: [{ id: "new-upstream-model" }] }, { status: 200 });
+    });
     const stateDir = mkdtempSync(join(tmpdir(), "gorouter-models-stale-"));
     dirs.push(stateDir);
     const paths = resolvePaths(stateDir);
@@ -1342,7 +1347,7 @@ describe("server /models cache and auth", () => {
     const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
-    const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
+    const res = await fetch(baseUrl + "/go/v1/models", { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     expect(res.headers.get("x-gorouter-models-cache")).toBe("stale");
     const body = (await res.json()) as { object: string; data: Array<{ id: string }> };
@@ -1403,7 +1408,7 @@ describe("server /models cache and auth", () => {
     for (const suffix of ["/chat/completions", "/responses", "/messages"] as const) {
       const res = await fetch(baseUrl + "/go/v1" + suffix, {
         method: "POST",
-        headers: authHeaders({ "content-type": "application/json" }),
+        headers: sessionHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ model: "x", messages: [] }),
       });
       expect(res.status).toBe(200);
@@ -1412,7 +1417,7 @@ describe("server /models cache and auth", () => {
     // /models subpath with extra segment should not be cache-intercepted (e.g. per-model generateContent)
     const resOther = await fetch(baseUrl + "/go/v1/models/dummy:generateContent", {
       method: "POST",
-      headers: authHeaders({ "content-type": "application/json" }),
+      headers: sessionHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({}),
     });
     expect(resOther.headers.get("x-gorouter-models-cache")).toBeNull();
@@ -1462,7 +1467,7 @@ describe("server /models cache and auth", () => {
     const server = await startTestServerWithState(paths, state, journal);
     const baseUrl = "http://127.0.0.1:" + server.port();
 
-    const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
+    const res = await fetch(baseUrl + "/go/v1/models", { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     expect(res.headers.get("x-gorouter-models-cache")).toBe("stale");
     await new Promise((r) => setTimeout(r, 150));
@@ -1778,7 +1783,10 @@ describe("CLI subcommands", () => {
     expect(s.counts.go).toBe(1);
   });
 
-  test("CLI models subcommand spawns via bun src/cli.ts (integration)", async () => {
+  // Spawns the real CLI (DPAPI-backed secret store): Windows-only, like the
+  // established CLI-spawn gates.
+  const testWinCli = process.platform === "win32" ? test : test.skip;
+  testWinCli("CLI models subcommand spawns via bun src/cli.ts (integration)", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "gorouter-cli-spawn-"));
     dirs.push(stateDir);
     const BUN_BIN = process.execPath;
@@ -2123,7 +2131,7 @@ describe("CHALLENGE 5 — bootstrap, Windows atomic, journal", () => {
     const baseUrl = "http://127.0.0.1:" + server.port();
 
     const before = journal.stats().records;
-    const res = await fetch(baseUrl + "/go/v1/models", { headers: authHeaders() });
+    const res = await fetch(baseUrl + "/go/v1/models", { headers: sessionHeaders() });
     expect(res.status).toBe(200);
     const after = journal.stats().records;
     expect(after).toBe(before + 1);

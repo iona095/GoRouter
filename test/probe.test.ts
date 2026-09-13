@@ -40,11 +40,11 @@ describe("probe classification", () => {
     expect(r.workspaceHint).toBe("wrk_x");
   });
 
-  test("400 server_error (model unavailable) -> AUTH_PASS_UPSTREAM_STATE", async () => {
+  test("400 server_error (model unavailable) -> UNKNOWN (H0 narrow: 400-class validation failures are never credential evidence)", async () => {
     const r = await probeWith(() =>
       Response.json({ error: { type: "server_error", message: "Error from provider (Console Go): Model is unavailable." } }, { status: 400 }),
     );
-    expect(r.verdict).toBe("AUTH_PASS_UPSTREAM_STATE");
+    expect(r.verdict).toBe("UNKNOWN");
   });
 
   test("404 with structured error type -> UNKNOWN (routing failure, not key evidence; D-10)", async () => {

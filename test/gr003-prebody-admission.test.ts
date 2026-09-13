@@ -182,7 +182,8 @@ describe("GR-003 pre-body authentication and admission", () => {
     try {
       const res = await fetch(router.baseUrl + "/go/v1/chat/completions", {
         method: "POST",
-        headers: { authorization: "Bearer local-test-credential-0123456789abcdef", "content-type": "application/json" },
+        // W0 (Amendment A5/A7): admitted traffic carries a session.
+        headers: { authorization: "Bearer local-test-credential-0123456789abcdef", "content-type": "application/json", "x-opencode-session": "conv-w0-test-01" },
         body: JSON.stringify({ model: "m", messages: [] }),
       });
       expect(res.status).toBe(200);

@@ -63,6 +63,9 @@ async function rawGet(
         port +
         "\r\nAuthorization: Bearer " +
         LOCAL_KEY +
+        // W0 (Amendment A5/A7): success-path dispatches carry a session; refusal
+        // gates (path-namespace, framing) fire before session validation.
+        "\r\nX-OpenCode-Session: conv-w0-test-01" +
         "\r\nConnection: close\r\n\r\n",
     );
   });

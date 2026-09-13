@@ -254,11 +254,13 @@ export function validateCorrelationId(value: string | null): string | undefined 
 export const OPENCODE_SESSION_HEADER = "x-opencode-session";
 
 /**
- * Resolve the upstream OpenCode session id for one proxied request.
- * A valid inbound client value is forwarded untouched so DSH/OMP
- * conversations keep their stable grouping id; otherwise the validated
- * router correlation id is reused; otherwise a fresh UUID is generated
- * so upstream never sees a missing header.
+ * LEGACY presence-guarantee fallback (NOT conversation-stable).
+ * A valid inbound client value is forwarded untouched; otherwise the validated
+ * router correlation id is reused; otherwise a fresh per-request UUID is
+ * generated so upstream never sees a missing header. The correlation/UUID
+ * fallbacks carry no conversation identity. Lane dispatch uses
+ * resolveUpstreamSessionIdStrict instead; this function is retained for
+ * compatibility only.
  */
 /**
  * Shared id grammar for session and correlation ids forwarded upstream:
@@ -278,7 +280,10 @@ export function resolveUpstreamSessionId(
 }
 
 /**
- * Credential-safe wrapper around resolveUpstreamSessionId.
+ * LEGACY credential-safe wrapper around resolveUpstreamSessionId.
+ * (Replacement with a fresh UUID preserves header presence, not conversation
+ * continuity — lane dispatch refuses contaminated values instead; see
+ * resolveUpstreamSessionIdStrict. Retained for compatibility only.)
  * The resolved value is subject to the same containment rule as every other
  * forwarded header: it must never carry the local client credential upstream
  * (the raw inbound value must not be re-introduced after stripping). On a
@@ -312,6 +317,55 @@ export function resolveUpstreamSessionIdSafe(
     }
   }
   return { sessionId, replaced: false };
+}
+
+/** Local request-contract failure for OpenCode session identity (H0 contract section 5). */
+export type SessionRefusalReason = "missing" | "malformed" | "contaminated";
+export interface SessionContractRefusal {
+  type: "GoRouterSessionError";
+  status: 400;
+  reason: SessionRefusalReason;
+  /** Sanitized fixed message — never contains the rejected raw value. */
+  message: string;
+}
+export type SessionResolution =
+  | { kind: "forward"; sessionId: string }
+  | { kind: "refuse"; error: SessionContractRefusal };
+/** Bound for an explicit session value (matches the historical forward grammar). */
+export const SESSION_ID_MAX_LENGTH = 256;
+function refuseSession(reason: SessionRefusalReason): SessionResolution {
+  const message = reason === "missing" ? "missing x-opencode-session" : "invalid x-opencode-session";
+  return { kind: "refuse", error: { type: "GoRouterSessionError", status: 400, reason, message } };
+}
+/**
+ * H0 strict explicit-first session contract (section 5.2).
+ * The ONLY forward case is a syntactically valid, credential-clean explicit
+ * x-opencode-session, forwarded byte-for-byte. Missing, overlong, off-grammar
+ * (including multi-value/comma-joined), or credential-contaminated explicit
+ * values are refused locally — never rewritten to a correlation id or UUID,
+ * because neither fallback carries conversation identity. Session identity
+ * takes no part in account selection, so a GO/ZEN switch cannot rewrite it.
+ */
+export function resolveUpstreamSessionIdStrict(
+  inbound: string | null | undefined,
+  opts: { localCred: string; extraSecrets?: string[] },
+): SessionResolution {
+  const raw = inbound ?? "";
+  const v = raw.trim();
+  if (v.length === 0) return refuseSession("missing");
+  if (v.length > SESSION_ID_MAX_LENGTH) return refuseSession("malformed");
+  if (!FORWARDED_ID_PATTERN.test(v)) return refuseSession("malformed");
+  const candidates = [opts.localCred, ...(opts.extraSecrets ?? [])];
+  for (const secret of candidates) {
+    if (secret.length === 0) continue;
+    // Exact equality always refuses (even for short/test credentials);
+    // only the SUBSTRING scan is gated on the entropy floor (same rule as
+    // the legacy wrapper, but the outcome here is refusal, not replacement).
+    if (v === secret || (secret.length >= MIN_SUBSTRING_SECRET_LENGTH && v.includes(secret))) {
+      return refuseSession("contaminated");
+    }
+  }
+  return { kind: "forward", sessionId: v };
 }
 
 /** Narrow allowlist of upstream response headers archived as request ids. */

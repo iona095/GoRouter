@@ -22,6 +22,7 @@
  *   config show                   effective settings (no secrets)
  *   config set <key> <value>      change a setting (port/host/upstreams/retention)
  *   serve                         run the router in the foreground
+ *   web-control                   open Web Control (cold native entrypoint; router auto-start suppressed)
  *   reset --yes                   remove accounts, secrets and the local credential
  *   models status [--json]          registry state (age, TTL, attempts, retry, counts, diff summary)
  *   models list <go|zen> [--json]   list models for a lane (also: --lane go|zen, or no lane for both)
@@ -35,7 +36,8 @@
  */
 import { resolvePaths, ensureStateDirs } from "./paths.ts";
 import { createSecretStore } from "./secret-store.ts";
-import { createDomain } from "./domain.ts";
+import { createDomain, isDomainConflict } from "./domain.ts";
+import { findAccountByAlias } from "./state.ts";
 import { createJournal } from "./journal.ts";
 import { createServer } from "./server.ts";
 import { createStateStore, validateUpstreamUrl, isValidPort, LANES, type Lane } from "./state.ts";
@@ -46,7 +48,7 @@ Commands:
   setup | local-cred | rotate-local-cred
   account add|update|list|rename|remove|test ...
   route [go|zen <alias>] | route clear <go|zen>
-  status | journal stats | config show | config set <key> <value> | serve | reset --yes
+  status | journal stats | config show | config set <key> <value> | serve | web-control | reset --yes
   models status|list|refresh|diff [--json]  (list: gorouter models list <go|zen> [--json] or --lane)
   models approvals status|list [--json]
   models approvals approve|revoke --lane <go|zen> <model-id> [--json]
@@ -91,6 +93,16 @@ async function main(argv: string[]): Promise<number> {
   const secrets = createSecretStore(paths.secretsDir);
   const domain = createDomain(paths, secrets);
 
+  // W0 (contract 8.3): freeze reviewed snapshot values through ALIAS-ONLY
+  // resolution (never the alias-or-ID resolver) for one checked commit. A
+  // concurrent writer surfaces as conflict; the operator reruns explicitly.
+  function freezeAccount(alias: string): { stateGeneration: string; id: string; version: number } {
+    const { stateGeneration } = domain.ensureState();
+    const found = findAccountByAlias(domain.accountList(), alias);
+    if (!found) throw new Error(`account '${alias}' not found`);
+    return { stateGeneration, id: found.id, version: found.version };
+  }
+
   switch (cmd) {
     case "setup": {
       const { created, credential } = domain.setup();
@@ -134,8 +146,12 @@ async function main(argv: string[]): Promise<number> {
         case "update": {
           if (rest.length !== 1) throw new Error("usage: gorouter account update <alias>");
           const secret = await readSecretFromStdin();
-          const account = domain.accountUpdate(rest[0]!, secret);
-          console.log(`account '${account.alias}' credential updated`);
+          const frozenUpdate = freezeAccount(rest[0]!);
+          const account = domain.accountUpdateChecked(frozenUpdate.id, secret, {
+            expectedStateGeneration: frozenUpdate.stateGeneration,
+            expectedAccountVersion: frozenUpdate.version,
+          });
+          console.log(`account '${account.account.alias}' credential updated`);
           return 0;
         }
         case "list": {
@@ -151,15 +167,24 @@ async function main(argv: string[]): Promise<number> {
         }
         case "rename": {
           if (rest.length !== 2) throw new Error("usage: gorouter account rename <old> <new>");
-          const { renamed, previousAlias } = domain.accountRename(rest[0]!, rest[1]!);
-          console.log(`account renamed '${previousAlias}' -> '${renamed.alias}' (stable id preserved)`);
+          const frozenRename = freezeAccount(rest[0]!);
+          const { previousAlias, account: renamedAccount } = domain.accountRenameChecked(frozenRename.id, rest[1]!, {
+            expectedStateGeneration: frozenRename.stateGeneration,
+            expectedAccountVersion: frozenRename.version,
+          });
+          console.log(`account renamed '${previousAlias}' -> '${renamedAccount.alias}' (stable id preserved)`);
           return 0;
         }
         case "remove": {
           const force = rest.includes("--force");
           const name = rest.find((x) => x !== "--force");
           if (!name) throw new Error("usage: gorouter account remove <alias> [--force]");
-          const { removed, secretDeleted } = domain.accountRemove(name, force);
+          const frozenRemove = freezeAccount(name);
+          const { secretDeleted } = domain.accountRemoveChecked(frozenRemove.id, force, {
+            expectedStateGeneration: frozenRemove.stateGeneration,
+            expectedAccountVersion: frozenRemove.version,
+          });
+          const removed = { alias: name };
           // F-26: never claim "secret blob deleted" when nothing was there.
           console.log(`account '${removed.alias}' removed` + (secretDeleted ? " (secret blob deleted)" : " (no secret blob was present — nothing left behind)"));
           return 0;
@@ -210,7 +235,12 @@ async function main(argv: string[]): Promise<number> {
       if (args[0] === "clear") {
         const lane = args[1]?.toLowerCase();
         if (lane !== "go" && lane !== "zen") throw new Error("usage: gorouter route clear <go|zen>");
-        domain.routeClear(lane);
+        const frozenClear = domain.ensureState();
+        const stClear = domain.status();
+        domain.routeClearChecked(lane, {
+          expectedStateGeneration: frozenClear.stateGeneration,
+          expectedRouteVersion: stClear.routes.find((r) => r.lane === lane)!.version,
+        });
         console.log(`route ${lane.toUpperCase()} cleared`);
         return 0;
       }
@@ -219,7 +249,15 @@ async function main(argv: string[]): Promise<number> {
       if ((lane !== "go" && lane !== "zen") || !alias) {
         throw new Error("usage: gorouter route <go|zen> <alias>");
       }
-      domain.routeSet(lane, alias);
+      const frozenSet = domain.ensureState();
+      const stFrozen = domain.status();
+      const target = findAccountByAlias(stFrozen.accounts, alias);
+      if (!target) throw new Error(`account '${alias}' not found`);
+      domain.routeSetChecked(lane, target.id, {
+        expectedStateGeneration: frozenSet.stateGeneration,
+        expectedRouteVersion: stFrozen.routes.find((r) => r.lane === lane)!.version,
+        expectedTargetAccountVersion: target.version,
+      });
       const st = domain.status();
       printStatus({ routes: Object.fromEntries(st.routes.map((r) => [r.lane, { accountId: r.accountId }])) as Record<Lane, { accountId: string | null }>, accounts: st.accounts });
       return 0;
@@ -230,7 +268,7 @@ async function main(argv: string[]): Promise<number> {
       // R3-004: never show defaults silently — an unsupported schema reads
       // as defaults with writes refused, so say so explicitly.
       if (st.stateUnsupportedVersion !== null) {
-        console.log(`  INCOMPATIBLE state schema v${st.stateUnsupportedVersion} (this binary supports v1): showing defaults; setup/config refused until a supported state.json is restored`);
+        console.log(`  INCOMPATIBLE state schema v${st.stateUnsupportedVersion} (this binary supports v2, migrates v1): showing defaults; setup/config refused until a supported state.json is restored`);
       }
       // status is read-only: don't create journal DB if absent
       if (!st.journalExists) {
@@ -345,6 +383,27 @@ async function main(argv: string[]): Promise<number> {
         server.stop();
         journal.close();
         process.exit(0);
+      };
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
+      await new Promise(() => {});
+      return 0;
+    }
+    case "web-control": {
+      if (args.length > 0) throw new Error("usage: gorouter web-control");
+      // W1 cold native Web Control entrypoint (dedicated; never an unknown-flag
+      // gamble — capability is proven inside startColdWebControl before any
+      // provider-capable service process is launched, and pre-W1 binaries fail
+      // closed). The bootstrap URL is handed to the OS default browser only;
+      // it is never printed, persisted, or logged here.
+      const { startColdWebControl } = await import("./desktop/web-launch.ts");
+      const { resolveBrowserOpener } = await import("./desktop/web-bridge.ts");
+      const { isPackagedControl } = await import("./desktop/supervisor.ts");
+      const opener = resolveBrowserOpener({ packaged: isPackagedControl(), captureFile: process.env.GOROUTER_WEB_CONTROL_CAPTURE });
+      const handle = await startColdWebControl({ browserOpener: opener });
+      console.log(`Web Control listening on ${handle.origin} (router auto-start suppressed for this process).`);
+      const shutdown = () => {
+        void handle.close().then(() => process.exit(0));
       };
       process.on("SIGINT", shutdown);
       process.on("SIGTERM", shutdown);
@@ -699,6 +758,12 @@ async function main(argv: string[]): Promise<number> {
 main(Bun.argv.slice(2))
   .then((code) => process.exit(code))
   .catch((e) => {
-    console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
+    // W0: stale writers report the stable machine-readable reason so scripts
+    // and operators can distinguish conflicts without parsing prose.
+    if (isDomainConflict(e)) {
+      console.error(`error: conflict [${e.reason}]: ${e.message}`);
+    } else {
+      console.error(`error: ${e instanceof Error ? e.message : String(e)}`);
+    }
     process.exit(1);
   });
