@@ -34,8 +34,8 @@ const FROZEN_OUTPUTS = {
 }
 
 const PROTECTED_FILES: Record<string, string> = {
-  'src/desktop/web-bridge.ts': '4c92b05eaebc8fc73346fd5c0818769ba8ad8111ebf3aaa061884f26861ac499',
-  'src/desktop/web-launch.ts': '67f705bfc25ece4b1f063c2c4c851015ebccf5994828d881e134e9fc812c3391',
+  'src/desktop/web-bridge.ts': '0e7124571e1c198cf643c0fa76d2e7a5c4b9222ec4920af2435b2059fdc86fe6',
+  'src/desktop/web-launch.ts': 'f70c5139e74bf3b18f92839618cb62921dd0c0fdbcea0596b6ac883c4e5fb7e9',
   'src/desktop/control-service.ts': 'c93a2723d69f564ac256d3309733ba0dfc1b312ae01262275c74291bcd9466f4',
   'src/desktop/control-core.ts': '1cc38cb5aa1290b0d3c2d77c5ae52e14c1a0bbcd3222124e1501267f2d93cc09',
   'src/desktop/protocol.ts': '44885141af183aa8490abdc5a84770585ede034e4b9de403d68cd0b179d38db5',
