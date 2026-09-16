@@ -89,8 +89,11 @@ public sealed class SnapshotSettings
     [JsonPropertyName("port")]
     public int Port { get; init; } = 8787;
 
+    // Wire: protocol `number` (GR-007 fractional days allowed, e.g. 1.5).
+    // System.Text.Json maps both integer (30) and fractional (1.5) JSON
+    // numbers into double without loss; int would throw on fractions.
     [JsonPropertyName("journalRetentionDays")]
-    public int JournalRetentionDays { get; init; } = 30;
+    public double JournalRetentionDays { get; init; } = 30;
 
     [JsonPropertyName("journalMaxRecords")]
     public int JournalMaxRecords { get; init; } = 100_000;
@@ -149,8 +152,11 @@ public sealed class SnapshotRouter
     [JsonPropertyName("mode")]
     public string Mode { get; init; } = "none";
 
+    // Wire: protocol `number | null` (null when stopped/attached).
+    // Non-nullable int throws JsonException on null and silently discards
+    // the entire authoritative snapshot in ControlClient (live defect).
     [JsonPropertyName("pid")]
-    public int Pid { get; init; }
+    public int? Pid { get; init; }
 
     [JsonPropertyName("port")]
     public int Port { get; init; } = 8787;
@@ -179,8 +185,9 @@ public sealed class SnapshotJournal
     [JsonPropertyName("lastError")]
     public string? LastError { get; init; }
 
+    // Wire: protocol `number` (mirrors settings fractional retention).
     [JsonPropertyName("retentionDays")]
-    public int RetentionDays { get; init; } = 30;
+    public double RetentionDays { get; init; } = 30;
 
     [JsonPropertyName("maxRecords")]
     public int MaxRecords { get; init; } = 100_000;
@@ -213,8 +220,10 @@ public sealed class JournalRow
     [JsonPropertyName("completedAtUtc")]
     public string? CompletedAtUtc { get; init; }
 
+    // Wire: protocol `number | null` (null for in-flight rows).
+    // Non-nullable int throws JsonException on null.
     [JsonPropertyName("durationMs")]
-    public int DurationMs { get; init; }
+    public int? DurationMs { get; init; }
 
     [JsonPropertyName("lane")]
     public string Lane { get; init; } = "";

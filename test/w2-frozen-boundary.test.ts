@@ -33,11 +33,18 @@ const FROZEN_OUTPUTS = {
   renderIndexHtml: '4875b2bd82a3b4b58ac2f9a0d553d8b4b0f408c0cfcbce9af4ebe4ae0160bd39',
 }
 
+// Historical pins (pre-remediation, preserved as evidence; do not delete):
+//   'src/desktop/control-service.ts': 'c93a2723d69f564ac256d3309733ba0dfc1b312ae01262275c74291bcd9466f4'
+//   'src/desktop/control-core.ts': '1cc38cb5aa1290b0d3c2d77c5ae52e14c1a0bbcd3222124e1501267f2d93cc09'
+// Additive ratification (Desktop snapshot-contract/coherence remediation):
+// control-service.ts + control-core.ts repinned to the independently
+// re-hashed remediation bytes below. package.json is intentionally NOT
+// repinned here (pre-existing drift, explicitly out of scope).
 const PROTECTED_FILES: Record<string, string> = {
   'src/desktop/web-bridge.ts': '0e7124571e1c198cf643c0fa76d2e7a5c4b9222ec4920af2435b2059fdc86fe6',
   'src/desktop/web-launch.ts': 'f70c5139e74bf3b18f92839618cb62921dd0c0fdbcea0596b6ac883c4e5fb7e9',
-  'src/desktop/control-service.ts': 'c93a2723d69f564ac256d3309733ba0dfc1b312ae01262275c74291bcd9466f4',
-  'src/desktop/control-core.ts': '1cc38cb5aa1290b0d3c2d77c5ae52e14c1a0bbcd3222124e1501267f2d93cc09',
+  'src/desktop/control-service.ts': '4429793a43f77b49acf2858a8c65938930d903d7ff359ca402e7837e1ba704d6',
+  'src/desktop/control-core.ts': '95fe5ec0f70b912d5d1d7626bd0ecd963888d3dcb26793ddd55f867c00fb88fd',
   'src/desktop/protocol.ts': '44885141af183aa8490abdc5a84770585ede034e4b9de403d68cd0b179d38db5',
   'src/domain.ts': '4e7d8222f2a43b2196af7eee178cdcb965c77d21d887f0b6847c4a4988660d55',
   'src/state.ts': '7af62441746eef1a9f669a578dd1689f9d7972bce4438e484cea4dd02c4b3624',

@@ -586,7 +586,8 @@ internal static class JournalStats
         var withinHour = 0;
         foreach (var row in rows)
         {
-            var hasLatency = row.DurationMs > 0;
+            // DurationMs is nullable on the wire (null for in-flight rows).
+            var hasLatency = row.DurationMs.HasValue && row.DurationMs.Value > 0;
             var done = !string.IsNullOrEmpty(row.CompletedAtUtc) || hasLatency;
             if (done)
             {
@@ -597,7 +598,7 @@ internal static class JournalStats
                 }
                 if (hasLatency)
                 {
-                    latencySum += row.DurationMs;
+                    latencySum += row.DurationMs!.Value;
                     latencyCount++;
                 }
             }

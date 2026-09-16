@@ -463,6 +463,31 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     }
   }
 
+  /** Synchronous baseline capture (first-poll race fix): records current
+   * filesystem signatures without emitting, so the first scheduled poll
+   * detects any external CLI mutation that landed after start(). */
+  function captureBaseline(): void {
+    const sj = statSafe(paths.stateJson)
+    // Absent file is itself a baseline (sentinel): a later creation differs
+    // and emits on the first tick instead of becoming a silent baseline.
+    stateBaseline = true
+    if (sj) {
+      lastStateMtime = sj.mtimeMs
+      lastStateSize = sj.size
+      lastStateIno = sj.ino
+    } else {
+      lastStateMtime = 0
+      lastStateSize = -1
+      lastStateIno = -1
+    }
+    for (const p of [paths.journalDb, `${paths.journalDb}-wal`, `${paths.journalDb}-shm`]) {
+      const jd = statSafe(p)
+      if (!jd) continue
+      lastJournalSig.set(p, `${jd.mtimeMs}:${jd.size}:${jd.ino}`)
+    }
+    journalBaseline = true
+  }
+
   function poll(): void {
     const sj = statSafe(paths.stateJson)
     if (sj) {
@@ -591,6 +616,11 @@ export function createControlService(opts: ControlServiceOptions): ControlServic
     // auto-start-suppressed for its process lifetime (explicit native
     // router.start is unaffected).
     if (!webSafeLatch && !firstRunNow() && !desktop.corrupt() && gate.stateUnsupportedVersion === null && desktop.unsupportedVersion() === null && gate.stateCorrupt !== true) supervisor.start()
+    // First-poll race fix: establish the filesystem baseline synchronously
+    // here (after setup/supervisor start, before the interval). An external
+    // CLI mutation after this point differs from the baseline and emits on
+    // the first tick; state that already existed at startup is the baseline.
+    captureBaseline()
     if (pollTimer === null) {
       pollTimer = setInterval(poll, opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS)
     }

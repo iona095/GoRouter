@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -53,6 +54,10 @@ public sealed class ControlCenterForm : Form
     private bool _onboardingPending;
     private bool _localCredentialWarning;
     private string? _compatibilityWarning;
+    // Malformed-snapshot fail-safe: set on ProtocolError, cleared on the next
+    // authoritative SnapshotReceived. While set the banner stays visible so
+    // Empty/default is never silently presented as current truth.
+    private string? _protocolWarning;
     private Button _btnRetry = null!;
     private Button _btnResetCredential = null!;
     private Button _btnResumeOnboarding = null!;
@@ -144,6 +149,7 @@ public sealed class ControlCenterForm : Form
         _channel = channel;
         _channel.StateChanged += OnChannelStateChanged;
         _channel.SnapshotReceived += OnChannelSnapshot;
+        _channel.ProtocolError += OnChannelProtocolError;
 
         // Framework DPI scaling (completes the PerMonitorV2 process mode):
         // without this, layout stays in 96dpi-logical units while GDI text
@@ -2031,7 +2037,56 @@ public sealed class ControlCenterForm : Form
             return;
         }
 
+        // A fresh authoritative snapshot retires the protocol warning:
+        // the next failure re-arms it. Clearing here (not in ApplySnapshot)
+        // keeps direct ApplySnapshot test injection honest.
+        _protocolWarning = null;
         ApplySnapshot(snapshot);
+    }
+
+    internal string? ProtocolWarning => _protocolWarning;
+
+    internal bool IsProtocolBannerVisible => _banner.Visible && _protocolWarning is not null;
+
+    private void OnChannelProtocolError(string message)
+    {
+        if (IsDisposed || Disposing)
+        {
+            return;
+        }
+
+        if (InvokeRequired)
+        {
+            try
+            {
+                BeginInvoke(new Action<string>(OnChannelProtocolError), message);
+            }
+            catch (InvalidOperationException)
+            {
+                // form is closing
+            }
+
+            return;
+        }
+
+        // Sanitized diagnostic only (channel never forwards raw frames).
+        _protocolWarning = string.IsNullOrWhiteSpace(message)
+            ? "Control snapshot rejected (protocol error) — waiting for authoritative state."
+            : UiText.Truncate(message, 240);
+        RefreshBanner();
+    }
+
+    /// <summary>Test-only direct protocol-error injection (no channel).</summary>
+    internal void SetProtocolWarningForTest(string message)
+    {
+        _protocolWarning = UiText.Truncate(message, 240);
+        RefreshBanner();
+    }
+
+    internal void ClearProtocolWarningForTest()
+    {
+        _protocolWarning = null;
+        RefreshBanner();
     }
 
     public void SetClientState(ClientState state)
@@ -2125,6 +2180,17 @@ public sealed class ControlCenterForm : Form
 
     /// <summary>Rendered state badge text (used by the selftest settle-check).</summary>
     internal string StateBadgeText => _lblStateBadge.Text;
+
+    /// <summary>Deterministic rendering hooks for the snapshot-contract selftest (no secrets).</summary>
+    internal int AccountRowCountForTest => _lvAccounts.Items.Count;
+    internal IReadOnlyList<string> AccountAliasesForTest => _lvAccounts.Items.Cast<ListViewItem>().Select(i => i.Text).ToList();
+    internal IReadOnlyList<string> GoOptionAliasesForTest => _cmbGo.Items.Cast<AccountOption>().Select(o => o.Alias).ToList();
+    internal IReadOnlyList<string> ZenOptionAliasesForTest => _cmbZen.Items.Cast<AccountOption>().Select(o => o.Alias).ToList();
+    internal string? GoSelectedAliasForTest => (_cmbGo.SelectedItem as AccountOption)?.Alias;
+    internal string? ZenSelectedAliasForTest => (_cmbZen.SelectedItem as AccountOption)?.Alias;
+    internal string RouterInfoForTest => _lblRouterInfoValue.Text;
+    internal string RetentionTextboxForTest => _txtRetentionDays.Text;
+    internal string JournalInfoForTest => _lblJournalInfoValue.Text;
 
     /// <summary>
     /// Test-only helper for offline visual selftest evidence: assigns the
@@ -2229,6 +2295,16 @@ public sealed class ControlCenterForm : Form
             _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
             _lblBannerText.Text = UiText.Truncate(_compatibilityWarning, 240);
             _btnRetry.Visible = false;
+            _btnResetCredential.Visible = false;
+            _btnResumeOnboarding.Visible = false;
+        }
+        else if (_protocolWarning is not null)
+        {
+            _banner.Visible = true;
+            _banner.BackColor = VisualTheme.ErrorBoxBack;
+            _lblBannerText.ForeColor = VisualTheme.ErrorBoxText;
+            _lblBannerText.Text = UiText.Truncate(_protocolWarning, 240);
+            _btnRetry.Visible = true;
             _btnResetCredential.Visible = false;
             _btnResumeOnboarding.Visible = false;
         }
@@ -2352,12 +2428,12 @@ public sealed class ControlCenterForm : Form
             _lblSecretStoreValue.Text = snapshot.SecretStore == "ok"
                 ? "ok"
                 : "unavailable — restart the desktop app or check the state directory";
-            UiText.SetIfChanged(_lblJournalInfoValue, $"{snapshot.Journal.Records} records · retention {snapshot.Journal.RetentionDays}d · max {snapshot.Journal.MaxRecords}");
-            UiText.SetIfChanged(_lblRouterInfoValue, UiText.Truncate($"{snapshot.Router.State} · {snapshot.Router.Mode} · pid {(snapshot.Router.Pid > 0 ? snapshot.Router.Pid.ToString() : "—")} · restarts {snapshot.Router.RestartCount}", 128));
+            UiText.SetIfChanged(_lblJournalInfoValue, $"{snapshot.Journal.Records} records · retention {snapshot.Journal.RetentionDays.ToString(CultureInfo.InvariantCulture)}d · max {snapshot.Journal.MaxRecords}");
+            UiText.SetIfChanged(_lblRouterInfoValue, UiText.Truncate($"{snapshot.Router.State} · {snapshot.Router.Mode} · pid {(snapshot.Router.Pid.HasValue && snapshot.Router.Pid.Value > 0 ? snapshot.Router.Pid.Value.ToString(CultureInfo.InvariantCulture) : "—")} · restarts {snapshot.Router.RestartCount}", 128));
 
-            _txtPort.Text = snapshot.Settings.Port.ToString();
-            _txtRetentionDays.Text = snapshot.Settings.JournalRetentionDays.ToString();
-            _txtMaxRecords.Text = snapshot.Settings.JournalMaxRecords.ToString();
+            _txtPort.Text = snapshot.Settings.Port.ToString(CultureInfo.InvariantCulture);
+            _txtRetentionDays.Text = snapshot.Settings.JournalRetentionDays.ToString(CultureInfo.InvariantCulture);
+            _txtMaxRecords.Text = snapshot.Settings.JournalMaxRecords.ToString(CultureInfo.InvariantCulture);
             _chkStartAtLogin.Checked = snapshot.Desktop.StartAtLogin;
             _chkMinimizeToTray.Checked = snapshot.Desktop.MinimizeToTray;
         }
@@ -3023,7 +3099,7 @@ public sealed class ControlCenterForm : Form
         var journal = _snapshot.Journal;
         var oldest = string.IsNullOrEmpty(journal.OldestRecordAtUtc) ? "—" : FormatTime(journal.OldestRecordAtUtc);
         var newest = string.IsNullOrEmpty(journal.NewestRecordAtUtc) ? "—" : FormatTime(journal.NewestRecordAtUtc);
-        UiText.SetIfChanged(_lblJournalStats, $"records {journal.Records} · oldest {oldest} · newest {newest} · retention {journal.RetentionDays} days · max {journal.MaxRecords}");
+        UiText.SetIfChanged(_lblJournalStats, $"records {journal.Records} · oldest {oldest} · newest {newest} · retention {journal.RetentionDays.ToString(CultureInfo.InvariantCulture)} days · max {journal.MaxRecords}");
     }
 
     private static ListViewItem MakeJournalItem(JournalRow row)
@@ -3035,7 +3111,7 @@ public sealed class ControlCenterForm : Form
         item.SubItems.Add(row.Method);
         item.SubItems.Add(row.TerminalOutcome);
         item.SubItems.Add(row.HttpStatus?.ToString() ?? "—");
-        item.SubItems.Add(row.DurationMs + " ms");
+        item.SubItems.Add(row.DurationMs.HasValue ? row.DurationMs.Value.ToString(CultureInfo.InvariantCulture) + " ms" : "—");
         item.SubItems.Add(row.RouterRequestId);
         // Visual slice 4: the journal grid is not owner-drawn, so outcome /
         // status color rides per-subitem fore colors (index 5/6 above).
@@ -3123,7 +3199,7 @@ public sealed class ControlCenterForm : Form
         // Latency column: DurationMs is already in the journal.recent model
         // (same source as the Journal tab's Duration ms column); in-flight
         // rows without a duration stay an em-dash, never a guess.
-        item.SubItems.Add(row.DurationMs > 0 ? JournalStats.FormatLatency(row.DurationMs) : "—");
+        item.SubItems.Add(row.DurationMs.HasValue && row.DurationMs.Value > 0 ? JournalStats.FormatLatency(row.DurationMs.Value) : "—");
         return item;
     }
 
@@ -3179,9 +3255,11 @@ public sealed class ControlCenterForm : Form
 
     private async void OnApplyRetentionClicked(object? sender, EventArgs e)
     {
-        if (!int.TryParse(_txtRetentionDays.Text.Trim(), out var days) || days <= 0)
+        // Wire: journalRetentionDays is a fractional-positive number (GR-007).
+        // Accept invariant-culture doubles; domain validates (0, 3650].
+        if (!double.TryParse(_txtRetentionDays.Text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var days) || !double.IsFinite(days) || days <= 0 || days > 3650)
         {
-            _lblRetentionError.Text = "Retention days must be a positive integer.";
+            _lblRetentionError.Text = "Retention days must be a positive number (up to 3650).";
             return;
         }
 
@@ -3197,7 +3275,7 @@ public sealed class ControlCenterForm : Form
         _btnApplyRetention.Text = "Applying…";
         try
         {
-            var response = await _channel.CallAsync("config.set", new { key = "journalRetentionDays", value = days.ToString() }, 15_000);
+            var response = await _channel.CallAsync("config.set", new { key = "journalRetentionDays", value = days.ToString(CultureInfo.InvariantCulture) }, 15_000);
             if (!response.Ok)
             {
                 _lblRetentionError.Text = UiText.Truncate(response.ErrorMessage ?? "Retention change refused.");
@@ -3254,15 +3332,15 @@ public sealed class ControlCenterForm : Form
         sb.AppendLine($"stateUnsupportedVersion: {snapshot.StateUnsupportedVersion?.ToString() ?? "(none)"}");
         sb.AppendLine($"desktopUnsupportedVersion: {snapshot.DesktopUnsupportedVersion?.ToString() ?? "(none)"}");
         sb.AppendLine($"secretStore: {snapshot.SecretStore}");
-        sb.AppendLine($"settings: port={snapshot.Settings.Port} journalRetentionDays={snapshot.Settings.JournalRetentionDays} journalMaxRecords={snapshot.Settings.JournalMaxRecords}");
-        sb.AppendLine($"router: state={snapshot.Router.State} mode={snapshot.Router.Mode} pid={snapshot.Router.Pid} restartCount={snapshot.Router.RestartCount}");
+        sb.AppendLine($"settings: port={snapshot.Settings.Port} journalRetentionDays={snapshot.Settings.JournalRetentionDays.ToString(CultureInfo.InvariantCulture)} journalMaxRecords={snapshot.Settings.JournalMaxRecords}");
+        sb.AppendLine($"router: state={snapshot.Router.State} mode={snapshot.Router.Mode} pid={(snapshot.Router.Pid.HasValue ? snapshot.Router.Pid.Value.ToString(CultureInfo.InvariantCulture) : "(none)")} restartCount={snapshot.Router.RestartCount}");
         sb.AppendLine($"routes: go={DescribeRoute(snapshot.Routes.Go)} zen={DescribeRoute(snapshot.Routes.Zen)}");
         foreach (var account in snapshot.Accounts)
         {
             sb.AppendLine($"account: alias={account.Alias} id={account.Id} secretPresent={account.SecretPresent} usedBy={string.Join(",", account.UsedBy)}");
         }
 
-        sb.AppendLine($"journal: records={snapshot.Journal.Records} degraded={snapshot.Journal.Degraded} lastError={snapshot.Journal.LastError ?? ""} retentionDays={snapshot.Journal.RetentionDays} maxRecords={snapshot.Journal.MaxRecords}");
+        sb.AppendLine($"journal: records={snapshot.Journal.Records} degraded={snapshot.Journal.Degraded} lastError={snapshot.Journal.LastError ?? ""} retentionDays={snapshot.Journal.RetentionDays.ToString(CultureInfo.InvariantCulture)} maxRecords={snapshot.Journal.MaxRecords}");
         sb.AppendLine($"desktop: startAtLogin={snapshot.Desktop.StartAtLogin} minimizeToTray={snapshot.Desktop.MinimizeToTray}");
         sb.AppendLine($"localCredentialConfigured: {snapshot.LocalCredentialConfigured}");
         return sb.ToString();
@@ -3415,6 +3493,7 @@ public sealed class ControlCenterForm : Form
         {
             _channel.StateChanged -= OnChannelStateChanged;
             _channel.SnapshotReceived -= OnChannelSnapshot;
+            _channel.ProtocolError -= OnChannelProtocolError;
         }
 
         base.Dispose(disposing);

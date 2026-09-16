@@ -178,6 +178,11 @@ export interface OpHandlerDeps {
 export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Record<string, unknown>) => Promise<unknown> {
   const { core, domain } = deps
 
+  /** Coherence helper: notify exactly when a committed mutation changed state. */
+  function notifyIfChanged(commit: { changed: boolean }): void {
+    if (commit.changed) core.noteChange()
+  }
+
   async function raw(op: string, params: Record<string, unknown>): Promise<unknown> {
     switch (op) {
       case 'hello': {
@@ -200,19 +205,23 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
         // W0: reviewed generation + immutable ID + both expected versions.
         const lane = requireLane(params)
         const accountId = requireString(params, 'accountId')
-        return domain.routeSetChecked(lane, accountId, {
+        const commit = domain.routeSetChecked(lane, accountId, {
           expectedStateGeneration: requireExpectedGeneration(params),
           expectedRouteVersion: requireExpectedVersion(params, 'expectedRouteVersion'),
           expectedTargetAccountVersion: requireExpectedVersion(params, 'expectedTargetAccountVersion'),
         })
+        notifyIfChanged(commit)
+        return commit
       }
 
       case 'route.clear': {
         const lane = requireLane(params)
-        return domain.routeClearChecked(lane, {
+        const commit = domain.routeClearChecked(lane, {
           expectedStateGeneration: requireExpectedGeneration(params),
           expectedRouteVersion: requireExpectedVersion(params, 'expectedRouteVersion'),
         })
+        notifyIfChanged(commit)
+        return commit
       }
 
       case 'account.add': {
@@ -222,6 +231,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
         const r = domain.accountAddChecked(alias, secret, {
           expectedStateGeneration: requireExpectedGeneration(params),
         })
+        notifyIfChanged(r)
         return accountData(r.account)
       }
 
@@ -233,6 +243,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
           expectedStateGeneration: requireExpectedGeneration(params),
           expectedAccountVersion: requireExpectedVersion(params, 'expectedAccountVersion'),
         })
+        notifyIfChanged(r)
         return accountData(r.account)
       }
 
@@ -243,6 +254,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
           expectedStateGeneration: requireExpectedGeneration(params),
           expectedAccountVersion: requireExpectedVersion(params, 'expectedAccountVersion'),
         })
+        notifyIfChanged(r)
         return { ...accountData(r.account), previousAlias: r.previousAlias, changed: r.changed }
       }
 
@@ -253,6 +265,7 @@ export function createOpHandlers(deps: OpHandlerDeps): (op: string, params: Reco
           expectedStateGeneration: requireExpectedGeneration(params),
           expectedAccountVersion: requireExpectedVersion(params, 'expectedAccountVersion'),
         })
+        notifyIfChanged(r)
         return {
           removedAccountId: r.removedAccountId,
           removedAccountVersion: r.removedAccountVersion,

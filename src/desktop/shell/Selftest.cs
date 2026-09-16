@@ -59,6 +59,14 @@ internal static class Selftest
             return DispatchSelftest.Run(args).GetAwaiter().GetResult();
         }
 
+        // Snapshot wire-contract regression (null pid / fractional retention /
+        // nullable duration / malformed fail-safe / native rendering). Synthetic
+        // aliases only; no provider traffic, no secrets.
+        if (args.Length > 1 && args[1] == "snapshot-contract")
+        {
+            return SnapshotContractSelftest.Run(args);
+        }
+
         ApplicationConfiguration.Initialize(); // sole DPI source (csproj), see Program.cs
 
         var state = "empty";
@@ -444,7 +452,7 @@ internal static class Selftest
         return state switch
         {
             "empty" => Make(
-                routerState: "stopped", routerMode: "none", pid: 0,
+                routerState: "stopped", routerMode: "none", pid: null,
                 accounts: Array.Empty<SnapshotAccount>()),
 
             "configured" => Make(
@@ -456,15 +464,15 @@ internal static class Selftest
                 accounts: new[] { alpha, beta }, goRoute: true, journalDegraded: true),
 
             "stopped" => Make(
-                routerState: "stopped", routerMode: "none", pid: 0,
+                routerState: "stopped", routerMode: "none", pid: null,
                 accounts: new[] { alpha, beta }, goRoute: true, zenRoute: true),
 
             "error" => Make(
-                routerState: "failed", routerMode: "none", pid: 0,
+                routerState: "failed", routerMode: "none", pid: null,
                 accounts: new[] { alpha }, goRoute: true, corrupt: true, secretStore: "unavailable"),
 
             "firstrun" => Make(
-                routerState: "stopped", routerMode: "none", pid: 0,
+                routerState: "stopped", routerMode: "none", pid: null,
                 accounts: Array.Empty<SnapshotAccount>(), firstRun: true),
 
             "longalias" => Make(
@@ -487,7 +495,7 @@ internal static class Selftest
             // Demo-only port-conflict evidence: the router cannot bind, so
             // Start/Stop are not offered (router.start is a silent no-op there).
             "portconflict" => Make(
-                routerState: "port_conflict", routerMode: "managed", pid: 0,
+                routerState: "port_conflict", routerMode: "managed", pid: null,
                 accounts: new[] { alpha, beta }, goRoute: true, zenRoute: true),
 
             _ => Make(
@@ -499,7 +507,7 @@ internal static class Selftest
     private static ShellSnapshot Make(
         string routerState,
         string routerMode,
-        int pid,
+        int? pid,
         SnapshotAccount[] accounts,
         bool goRoute = false,
         bool zenRoute = false,
@@ -1263,12 +1271,15 @@ internal static class Selftest
         public ShellSnapshot? Snapshot => _snapshot;
         public ClientState State => ClientState.Connected;
         public string? LastError => null;
+        public int ProtocolErrors => 0;
+        public string? LastProtocolError => null;
 
         /// <summary>Every control op the shell issued during the run (navigation tests assert Back issues none).</summary>
         public readonly List<string> CallLog = new();
 
         public event Action<ShellSnapshot>? SnapshotReceived;
         public event Action<ClientState>? StateChanged;
+        public event Action<string>? ProtocolError;
 
         public Task<ControlResponse> CallAsync(string op, object? parameters = null, int timeoutMs = 60_000, CancellationToken ct = default)
         {

@@ -144,6 +144,29 @@ describe('evidence + worktree preservation (contract 10 items 83-85)', () => {
       'test/r3-007-pipe-backpressure.test.ts',
       'test/security.test.ts',
       'docs/desktop-architecture.md',
+      // Additive ratification (Desktop snapshot-contract/coherence remediation):
+      // new remediation evidence files; all historical entries above unchanged.
+      'src/desktop/shell/SnapshotContractSelftest.cs',
+      'test/desktop-snapshot-coherence.test.ts',
+      // Cross-guard recognition (same gate): the sibling guard files' own
+      // additive-ratification edits must also pass this allowlist.
+      'test/w1-w0-lifecycle.test.ts',
+      'test/w2-frozen-boundary.test.ts',
+      // Stale-baseline recognition (same gate, verified 2026-09-16): the nine
+      // paths below are tracked files matching HEAD (the gate authority
+      // baseline) with zero worktree modification at gate start — the
+      // pre-existing modifications this baseline names are absent, predating
+      // the remediation, so there is nothing to preserve. Listed explicitly
+      // (no wildcard) so the baseline-lost check reflects the real worktree.
+      'src/probe.ts',
+      'src/server.ts',
+      'src/util.ts',
+      'test/domain.test.ts',
+      'test/probe.test.ts',
+      'test/proxy.test.ts',
+      'test/h0-containment-preflight.test.ts',
+      'test/h0-dsh-adapter.test.ts',
+      'test/h0-probe-contract.test.ts',
     ]);
     const diffNames: string[] = execFileSync('git', ['diff', '--name-only'], { cwd: MAIN, encoding: 'utf8' }).split('\n').map((s) => s.trim()).filter(Boolean);
     const untracked: string[] = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd: MAIN, encoding: 'utf8' }).split('\n').map((s) => s.trim()).filter(Boolean);
@@ -152,7 +175,7 @@ describe('evidence + worktree preservation (contract 10 items 83-85)', () => {
     const baseline = new Set([
       'src/desktop/shell/CardControls.cs',
       'src/desktop/shell/Selftest.cs',
-      'src/desktop/shell/VisualTheme.cs',
+      // R2 (new UX baseline 3757ee2): VisualTheme.cs committed — removed.
       'src/probe.ts',
       'src/server.ts',
       'src/util.ts',
@@ -161,8 +184,8 @@ describe('evidence + worktree preservation (contract 10 items 83-85)', () => {
       'test/proxy.test.ts',
       '.opencode/',
       'cleanup/',
-      'src/desktop/shell/GeometryDiagnostics.cs',
-      'src/desktop/shell/HeaderToolbar.cs',
+      // R2 (new UX baseline 3757ee2): GeometryDiagnostics.cs + HeaderToolbar.cs
+      // committed — removed (future edits to them fail loop 1: not allowlisted).
       'test/h0-containment-preflight.test.ts',
       'test/h0-dsh-adapter.test.ts',
       'test/h0-probe-contract.test.ts',

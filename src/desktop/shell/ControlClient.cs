@@ -106,8 +106,13 @@ public interface IControlChannel : IDisposable
     ShellSnapshot? Snapshot { get; }
     ClientState State { get; }
     string? LastError { get; }
+    /// <summary>Malformed snapshot frames rejected since construction (never includes raw frames).</summary>
+    int ProtocolErrors { get; }
+    /// <summary>Last protocol-error diagnostic (sanitized, no frame payload).</summary>
+    string? LastProtocolError { get; }
     event Action<ShellSnapshot>? SnapshotReceived;
     event Action<ClientState>? StateChanged;
+    event Action<string>? ProtocolError;
 
     Task<ControlResponse> CallAsync(string op, object? parameters = null, int timeoutMs = 60_000, CancellationToken ct = default);
 }
@@ -156,9 +161,14 @@ public sealed class ControlClient : IControlChannel
     public ClientState State => _state;
     /// <summary>F-08: isolated subscriber failures since construction.</summary>
     public int SubscriberErrors { get; private set; }
+    /// <summary>Malformed authoritative-snapshot frames rejected (bounded, no reconnect).</summary>
+    public int ProtocolErrors { get; private set; }
+    /// <summary>Last sanitized protocol-error diagnostic (never a raw frame).</summary>
+    public string? LastProtocolError { get; private set; }
 
     public event Action<ShellSnapshot>? SnapshotReceived;
     public event Action<ClientState>? StateChanged;
+    public event Action<string>? ProtocolError;
 
     // F-08: UI context captured at construction (DesktopApp builds the
     // client on the STA thread after ApplicationConfiguration.Initialize).
@@ -509,7 +519,28 @@ public sealed class ControlClient : IControlChannel
         }
     }
 
-    private void HandleLine(string line)
+    /// <summary>
+    /// Bounded fail-safe for malformed authoritative snapshots: a rejected
+    /// frame increments <see cref="ProtocolErrors"/>, records a sanitized
+    /// diagnostic (never the raw frame), and emits <see cref="ProtocolError"/>
+    /// so the UI stops presenting Empty/default as truth. The transport stays
+    /// connected (no reconnect storm); unknown future fields are ignored by
+    /// System.Text.Json and do NOT count as errors.
+    /// </summary>
+    private void ReportProtocolError(string detail)
+    {
+        string sanitized;
+        try { sanitized = UiText.Truncate(detail); }
+        catch { sanitized = "Control snapshot rejected (protocol error)."; }
+        lock (_gate)
+        {
+            ProtocolErrors++;
+            LastProtocolError = sanitized;
+        }
+        Emit(ProtocolError, sanitized);
+    }
+
+    internal void HandleLine(string line)
     {
         using var document = JsonDocument.Parse(line);
         var root = document.RootElement;
@@ -518,16 +549,30 @@ public sealed class ControlClient : IControlChannel
             eventProp.ValueKind == JsonValueKind.String &&
             eventProp.GetString() == "snapshot")
         {
-            if (root.TryGetProperty("data", out var dataProp) && dataProp.ValueKind == JsonValueKind.Object)
+            if (!(root.TryGetProperty("data", out var dataProp) && dataProp.ValueKind == JsonValueKind.Object))
             {
-                var snapshot = dataProp.Deserialize<ShellSnapshot>(JsonDefaults.Options);
-                if (snapshot is not null)
-                {
-                    Snapshot = snapshot;
-                    Emit(SnapshotReceived, snapshot);
-                }
+                ReportProtocolError("Control snapshot rejected (missing data) — waiting for authoritative state.");
+                return;
             }
-
+            ShellSnapshot? snapshot;
+            try
+            {
+                snapshot = dataProp.Deserialize<ShellSnapshot>(JsonDefaults.Options);
+            }
+            catch (JsonException)
+            {
+                // Wire mismatch (e.g. null pid into non-nullable int pre-fix):
+                // never crash, never log the frame, never emit a false snapshot.
+                ReportProtocolError("Control snapshot rejected (protocol error) — waiting for authoritative state.");
+                return;
+            }
+            if (snapshot is null)
+            {
+                ReportProtocolError("Control snapshot rejected (protocol error) — waiting for authoritative state.");
+                return;
+            }
+            Snapshot = snapshot;
+            Emit(SnapshotReceived, snapshot);
             return;
         }
 
@@ -631,7 +676,10 @@ public sealed class ControlClient : IControlChannel
                 }
                 catch (JsonException)
                 {
-                    // Malformed server frame: ignore and keep reading.
+                    // Malformed non-snapshot frame (bad JSON envelope): bounded
+                    // protocol-error accounting, no crash, no frame logging,
+                    // transport stays connected for the next frame.
+                    ReportProtocolError("Control frame rejected (protocol error) — waiting for authoritative state.");
                 }
             }
         }
