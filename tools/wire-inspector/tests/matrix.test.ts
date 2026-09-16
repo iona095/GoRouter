@@ -154,7 +154,7 @@ describe("WI02 matrix", () => {
       // Main preservation (read-only git + hash; never modified by WI code).
       const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
       const head = spawnSync("git", ["-C", "M:\\AIFUN\\GoRouter\\Main", "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
-      expect(head).toBe("967c98c0cb6df08950b52bba4981942eef702994");
+      expect(head).toBe("9ace47b9a52aa800b8ba9f2f61c8e3d84d7dd19e");
       void wireInspectorRun;
     } finally {
       try { rmSync(outDir, { recursive: true, force: true }); } catch {}

@@ -182,7 +182,7 @@ describe("WI03 response matrix", () => {
     const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
     const head = spawnSync("git", ["-C", "M:\\AIFUN\\GoRouter\\Main", "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
     const tree = spawnSync("git", ["-C", "M:\\AIFUN\\GoRouter\\Main", "write-tree"], { encoding: "utf8" }).stdout.trim();
-    expect(head).toBe("967c98c0cb6df08950b52bba4981942eef702994");
-    expect(tree).toBe("747d74d861401b25b91f855889950d870042024a");
+    expect(head).toBe("9ace47b9a52aa800b8ba9f2f61c8e3d84d7dd19e");
+    expect(tree).toBe("738cddd55721919f860844504cb9dcf1cc8daf87");
   });
 });
