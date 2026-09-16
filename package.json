@@ -10,6 +10,8 @@
     "typecheck": "tsc --noEmit",
     "desktop": "bun src/desktop/control-service.ts",
     "desktop:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
+    "test:wire-inspector": "bun test tools/wire-inspector",
+    "build:wire-inspector": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-wire-inspector.ps1",
     "desktop:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/desktop-dev.ps1"
   },
   "devDependencies": {

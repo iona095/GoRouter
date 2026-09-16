@@ -1,0 +1,24 @@
+{
+  "scenario": "chat-completions-stream",
+  "description": "Deterministic WI01 first scenario: POST chat/completions stream=true (synthetic only; no credential literals stored here)",
+  "method": "POST",
+  "lanePath": "/go/v1/chat/completions",
+  "query": "",
+  "headers": {
+    "content-type": "application/json",
+    "accept": "application/json",
+    "authorization": "Bearer <WI01 synthetic local key at runtime; retained outputs store Bearer <REDACTED> only>",
+    "x-opencode-session": "WI01-SESSION-001",
+    "user-agent": "WI01-Synthetic-Client/1.0"
+  },
+  "body": {
+    "model": "wi01-synthetic-model",
+    "messages": [
+      {
+        "role": "user",
+        "content": "wire inspector test"
+      }
+    ],
+    "stream": true
+  }
+}

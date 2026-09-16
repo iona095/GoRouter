@@ -26,6 +26,7 @@ accounts are supported; the immediate scenario uses two.
 | `src/probe.ts` | smallest-safe live account/lane probe with quota-aware classification |
 | `src/util.ts` | redaction, logging, atomic writes, header sanitization, endpoint-family classification |
 | `src/paths.ts` | state directory resolution (`%LOCALAPPDATA%\GoRouter` or `GOROUTER_STATE_DIR`) |
+| `tools/wire-inspector` | companion synthetic wire diagnostics (separate `gorouter-wire-inspector.exe`; loopback-only, redacted; never production authority — see `tools/wire-inspector/README.md`) |
 
 ## Request lifecycle (server)
 
